@@ -1,0 +1,36 @@
+﻿# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.whl
+
+# 虚拟环境
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# 数据/日志
+*.log
+*.pkl
+*.pt
+*.pth
+*.ckpt
+.DS_Store
+Thumbs.db
+
+# 环境变量
+.env
+.local
