@@ -39,13 +39,6 @@ LLM-SteadyInfer/
 └── .gitignore
 ```
 
-## 后续计划（未完待续）
-
-- 支持更多模型架构（如 DeepSeek、Mistral 等）
-- 引入 Flash Attention / PagedAttention 优化
-- 支持 FP16 / BF16 精度及更细粒度量化
-- 多 GPU 并行推理支持
-- 完善 Python API 与生态集成
 
 ## 致谢
 
