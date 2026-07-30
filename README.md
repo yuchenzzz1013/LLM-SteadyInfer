@@ -45,5 +45,3 @@ LLM-SteadyInfer/
 本项目在设计与实现过程中参考了 [KuiperLLama](https://github.com/zjhellofss/KuiperLLama)，特此致谢！
 
 ---
-
-如果觉得“后续计划”过于琐碎，也可只保留项目状态中的“远未结束”一句，其他部分不动。当前版本已清楚表明项目是 ongoing 状态。
