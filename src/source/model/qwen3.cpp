@@ -232,8 +232,8 @@ void Qwen3Model::create_param_layers() {
 
   // key
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto wk = std::make_shared<op::MatmulLayer>(device_type_, hidden_dim, kv_dim, false);
-    wk->set_weight(0, {hidden_dim, kv_dim}, this->raw_model_data_->weight(pos), cpu_device_type);
+    auto wk = std::make_shared<op::MatmulLayer>(device_type_, kv_dim, hidden_dim, false);
+    wk->set_weight(0, {kv_dim, hidden_dim}, this->raw_model_data_->weight(pos), cpu_device_type);
     qwen_layers_->wk_layers_.push_back(wk);
     pos = pos + hidden_dim * kv_dim;
   }
@@ -250,8 +250,8 @@ void Qwen3Model::create_param_layers() {
 
   // value
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto wv = std::make_shared<op::MatmulLayer>(device_type_, hidden_dim, kv_dim, false);
-    wv->set_weight(0, {hidden_dim, kv_dim}, this->raw_model_data_->weight(pos), cpu_device_type);
+    auto wv = std::make_shared<op::MatmulLayer>(device_type_, kv_dim, hidden_dim, false);
+    wv->set_weight(0, {kv_dim, hidden_dim}, this->raw_model_data_->weight(pos), cpu_device_type);
     qwen_layers_->wv_layers_.push_back(wv);
     pos += kv_dim * hidden_dim;
   }
