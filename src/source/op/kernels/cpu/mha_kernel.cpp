@@ -3,11 +3,12 @@
 #include "../kernels_interface.h"
 namespace kernel {
 void mha_kernel(int32_t pos, int32_t head_num, int32_t layer_index, int32_t seq_len, int32_t kv_dim,
-                int32_t kv_mul, int32_t head_size, const tensor::Tensor& mha_out,
+                int32_t kv_head_num, int32_t head_size, const tensor::Tensor& mha_out,
                 const tensor::Tensor& query_tensor, const tensor::Tensor& score_tensor,
                 const tensor::Tensor& key_cache_tensor, const tensor::Tensor& value_cache_tensor,
                 base::DeviceType device_type, CudaConfig* config) {
-  int32_t layer_offset = layer_index * seq_len * kv_dim;
+  // int64: large external caches (num_slots * max_seq_len) can overflow int32.
+  int64_t layer_offset = static_cast<int64_t>(layer_index) * seq_len * kv_dim;
   float scale = 1.f / std::sqrt(static_cast<float>(head_size));
 
   std::shared_ptr<base::DeviceAllocator> allocator;
@@ -20,17 +21,20 @@ void mha_kernel(int32_t pos, int32_t head_num, int32_t layer_index, int32_t seq_
     float* score_head_addr = const_cast<float*>(score_tensor.ptr<float>() + h * seq_len);
     float* query_head_addr = const_cast<float*>(query_tensor.ptr<float>() + h * head_size);
 
-    
+
     tensor::Tensor query_mat(base::DataType::kDataTypeFp32, head_size, false, nullptr,
                                query_head_addr);
     query_mat.set_device_type(device_type);
-    
+
+    // GQA KV head mapping: h * kv_head_num / head_num handles uneven splits
+    // (e.g. 36 heads / 8 KV heads) correctly and stays within kv_dim.
+    int32_t head_offset = (h * kv_head_num / head_num) * head_size;
     for (int32_t t = 0; t <= pos; t++) {
-      int32_t cache_offset = t * kv_dim + (h / kv_mul) * head_size;
+      int32_t cache_offset = t * kv_dim + head_offset;
       const float* key_head_addr = key_cache_tensor.ptr<float>() + layer_offset + cache_offset;
       tensor::Tensor key_mat(base::DataType::kDataTypeFp32, 1, head_size, false, nullptr,
                              const_cast<float*>(key_head_addr));
-      
+
       tensor::Tensor score_mat(base::DataType::kDataTypeFp32, 1, false, nullptr,
                                score_head_addr + t);
       key_mat.set_device_type(device_type);
@@ -50,7 +54,7 @@ void mha_kernel(int32_t pos, int32_t head_num, int32_t layer_index, int32_t seq_
                                  output_head_ptr);
     output_tensor.set_device_type(device_type);
 
-    int32_t cache_offset = (h / kv_mul) * head_size;
+    int32_t cache_offset = head_offset;
     float* value_head_addr =
         const_cast<float*>(value_cache_tensor.ptr<float>()) + layer_offset + cache_offset;
     tensor::Tensor value_tensor(base::DataType::kDataTypeFp32, head_size, false, nullptr,

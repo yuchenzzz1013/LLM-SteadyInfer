@@ -11,7 +11,7 @@ find_package(re2 REQUIRED)
 find_package(nlohmann_json REQUIRED)
 
 # ----------------------------------------------
-# LLaMA3 基准
+# LLaMA3 基准 (支持 --batch 多批次 continuous batching 模式)
 if (LLAMA3_SUPPORT)
     message(STATUS "Building LLaMA3 benchmark")
     add_executable(benchmark_llama benchmark_llama.cpp)

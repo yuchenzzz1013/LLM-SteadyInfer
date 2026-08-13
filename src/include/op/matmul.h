@@ -21,9 +21,13 @@ class MatmulLayer : public LayerParam {
 
   void to_cuda() override;
 
+  void set_batch_size(int32_t batch) { batch_size_ = batch; }
+  int32_t batch_size() const { return batch_size_; }
+
  private:
   int32_t dim0_ = 0;
   int32_t dim1_ = 0;
+  int32_t batch_size_ = 1;
   bool has_bias_ = false;
   std::vector<tensor::Tensor> bias_;
 };

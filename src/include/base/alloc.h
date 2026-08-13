@@ -59,6 +59,9 @@ class CUDADeviceAllocator : public DeviceAllocator {
 
   void release(void* ptr) const override;
 
+  // Free all idle (non-busy) buffers back to the GPU
+  void free_idle() const;
+
  private:
   mutable std::map<int, size_t> no_busy_cnt_;
   mutable std::map<int, std::vector<CudaMemoryBuffer>> big_buffers_map_;

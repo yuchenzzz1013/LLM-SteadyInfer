@@ -23,10 +23,14 @@ class EmbeddingLayer : public LayerParam {
 
   base::Status forward() override;
 
+  void set_batch_size(int32_t batch) { batch_size_ = batch; }
+  int32_t batch_size() const { return batch_size_; }
+
  private:
   int32_t dim_ = 0;
   int32_t seq_len_ = 0;
   int32_t vocab_size_ = 0;
+  int32_t batch_size_ = 1;
 };
 }  // namespace op
 #endif

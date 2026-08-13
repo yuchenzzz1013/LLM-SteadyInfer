@@ -9,9 +9,8 @@ struct ModelConfig {
   int32_t kv_head_num = 0;
   int32_t vocab_size = 0;
   int32_t seq_len = 0;
-#ifdef QWEN3_SUPPORT
-  int32_t immediate_dim_ = 0;
-#endif
+  int32_t immediate_dim_ = 0;  // Qwen3 intermediate FFN dimension (always present for ABI stability)
+  float rope_theta_ = 1000000.0f;  // RoPE base frequency (1e6 for Qwen, 5e5 for Llama)
 };
 
 struct TransformerConfig {
@@ -27,9 +26,8 @@ struct TransformerConfig {
   int32_t kv_head_num_ = 0;
   int32_t seq_len_ = 0;
   bool is_shared_weight_ = false;
-#ifdef QWEN3_SUPPORT
-  int32_t immediate_dim_ = 0;
-#endif
+  int32_t immediate_dim_ = 0;  // Qwen3 intermediate FFN dimension (always present for ABI stability)
+  float rope_theta_ = 1000000.0f;  // RoPE base frequency (1e6 for Qwen, 5e5 for Llama)
 };
 }  // namespace model
 #endif  

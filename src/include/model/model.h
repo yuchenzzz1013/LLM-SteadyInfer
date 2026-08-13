@@ -25,7 +25,29 @@ class Model {
   virtual base::Status forward(const tensor::Tensor& input, const tensor::Tensor& pos_tensor,
                                int& next) const = 0;
 
+  // ========== Continuous Batching Interface ==========
+  // Batched forward: each row is one token with its own position and KV slot,
+  // so the same call serves both decode (1 token per sequence) and chunked
+  // prefill (many prompt tokens per sequence, need_logits=false skips the
+  // final RMSNorm + LM head).
+  virtual base::Status forward_batch(
+      const tensor::Tensor& input_ids,
+      const tensor::Tensor& positions,
+      const tensor::Tensor& kv_offsets,
+      tensor::Tensor& key_cache,
+      tensor::Tensor& value_cache,
+      tensor::Tensor& logits,
+      bool need_logits = true) const = 0;
+
   base::ModelType model_type() const;
+
+  base::DeviceType device_type() const { return device_type_; }
+
+  int32_t layer_num() const { return config_ ? config_->layer_num_ : 0; }
+  int32_t kv_dim() const { return config_ ? config_->kv_dim_ : 0; }
+  int32_t hidden_dim() const { return config_ ? config_->dim_ : 0; }
+  int32_t vocab_size() const { return config_ ? config_->vocab_size_ : 0; }
+  int32_t seq_len() const { return config_ ? config_->seq_len_ : 0; }
 
   const std::string& token_path() const;
 
@@ -53,6 +75,28 @@ class Model {
   virtual tensor::Tensor fill_input(const tensor::Tensor& pos_tensor,
                                     const op::EmbeddingOutput& embedding_output,
                                     bool is_prompt) const;
+
+  // Batch post-processing: argmax sample next token per sequence
+  virtual std::vector<int32_t> post_processing_batch(const tensor::Tensor& logits) const;
+
+  // Free large internal KV cache and re-allocate at a smaller size.
+  // The internal cache is only used during single-sequence prefill; its
+  // sequence-length dimension can be reduced to the longest prompt the
+  // caller expects to process, reclaiming hundreds of MB on GPU.
+  void resize_internal_kv_cache(int32_t max_seq_len);
+
+  // Point the internal KV buffers at one slot of an external KV cache
+  // (e.g. KVManager) so prefill writes land directly in the external cache
+  // and no internal->external copy is needed.
+  base::Status bind_external_kv_cache(const tensor::Tensor& key_cache,
+                                      const tensor::Tensor& value_cache,
+                                      int32_t slot_id);
+
+  // Restore the model's own internal KV buffers (no-op if not bound).
+  void unbind_external_kv_cache();
+
+  // Synchronize the model's CUDA stream (no-op on CPU or when no stream is set).
+  virtual void sync_stream() const {}
 
  protected:
   virtual base::Status insert_buffer(ModelBufferType buffer_idx, const tensor::Tensor& tensor);
@@ -87,6 +131,9 @@ class Model {
   std::string model_path_;
   std::unique_ptr<op::EncodeLayerBase> encode_layer_;
   std::map<ModelBufferType, tensor::Tensor> buffers_;
+  bool kv_bound_ = false;
+  tensor::Tensor kv_key_backup_;
+  tensor::Tensor kv_value_backup_;
   std::unique_ptr<sampler::Sampler> sampler_;
   std::shared_ptr<RawModelData> raw_model_data_;
   base::DeviceType device_type_ = base::DeviceType::kDeviceUnknown;

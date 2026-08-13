@@ -1,6 +1,7 @@
 #include "../kernels_interface.h"
 #include "argmax_kernel.cuh"
 #include "tensor/tensor.h"
+#include <cfloat>
 namespace kernel {
 __forceinline__ __device__ void warp_reduce_argmax(float& val, size_t& ptr) {
   float tmp_val;
@@ -50,12 +51,12 @@ __global__ void argmax_kernel_fp32(const float* input_ptr, size_t size, size_t* 
   __shared__ size_t shared_max_ptr[32];
   __shared__ float shared_max_value[32];
   uint32_t tid = threadIdx.x;
-  if (tid >= size) {
-    return;
-  }
-
+  // Do NOT early-return: block_reduce_argmax uses a full-mask __ballot_sync,
+  // which requires every thread in the block to participate. Guard the reads
+  // instead so the kernel is correct for any `size` (incl. size < blockDim).
+  bool valid = tid < size;
   size_t max_index = threadIdx.x;
-  float max_value = input_ptr[max_index];
+  float max_value = valid ? input_ptr[max_index] : -FLT_MAX;
   for (size_t i = tid; i < size; i += blockDim.x) {
     if (input_ptr[i] > max_value) {
       max_index = i;
@@ -82,7 +83,57 @@ size_t argmax_kernel_cu(const float* input_ptr, size_t size, void* stream) {
     cudaStream_t stream_ = static_cast<cudaStream_t>(stream);
     argmax_kernel_fp32<<<1, 512, 0, stream_>>>(input_ptr, size, index);
     cudaMemcpyAsync(&output_index, index, sizeof(size_t), cudaMemcpyDeviceToHost, stream_);
+    // The async copy is still in flight when this function returns the host
+    // value; sync before reading output_index.
+    cudaStreamSynchronize(stream_);
   }
   return output_index;
+}
+
+__global__ void argmax_kernel_batch_fp32(const float* input_ptr, size_t row_stride, size_t size,
+                                         int32_t* output_idx) {
+  __shared__ size_t shared_max_ptr[32];
+  __shared__ float shared_max_value[32];
+  uint32_t tid = threadIdx.x;
+  // Same rule as argmax_kernel_fp32: no early return (full-mask ballot),
+  // guard the reads instead.
+  const float* row = input_ptr + blockIdx.x * row_stride;
+  bool valid = tid < size;
+  size_t max_index = threadIdx.x;
+  float max_value = valid ? row[max_index] : -FLT_MAX;
+  for (size_t i = tid; i < size; i += blockDim.x) {
+    if (row[i] > max_value) {
+      max_index = i;
+      max_value = row[i];
+    }
+  }
+
+  block_reduce_argmax(max_value, max_index, shared_max_value, shared_max_ptr);
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    // Token indices are int32 in this codebase; max_index < size <= 2^31.
+    output_idx[blockIdx.x] = static_cast<int32_t>(max_index);
+  }
+}
+
+void argmax_kernel_cu_batch(const float* input_ptr, size_t row_stride, size_t size,
+                            int32_t batch, int32_t* out_tokens, void* stream) {
+  std::shared_ptr<base::DeviceAllocator> alloc_cu =
+      base::CUDADeviceAllocatorFactory::get_instance();
+  int32_t* dev_idx =
+      static_cast<int32_t*>(alloc_cu->allocate(static_cast<size_t>(batch) * sizeof(int32_t)));
+  CHECK(dev_idx != nullptr) << "Failed to allocate device argmax index buffer";
+
+  if (stream) {
+    cudaStream_t stream_ = static_cast<cudaStream_t>(stream);
+    argmax_kernel_batch_fp32<<<batch, 512, 0, stream_>>>(input_ptr, row_stride, size, dev_idx);
+    cudaMemcpyAsync(out_tokens, dev_idx, static_cast<size_t>(batch) * sizeof(int32_t),
+                    cudaMemcpyDeviceToHost, stream_);
+    cudaStreamSynchronize(stream_);
+  } else {
+    argmax_kernel_batch_fp32<<<batch, 512>>>(input_ptr, row_stride, size, dev_idx);
+    cudaMemcpy(out_tokens, dev_idx, static_cast<size_t>(batch) * sizeof(int32_t),
+               cudaMemcpyDeviceToHost);
+  }
 }
 }  // namespace kernel

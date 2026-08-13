@@ -16,13 +16,22 @@ EmbeddingLayer::EmbeddingLayer(base::DeviceType device_type, int32_t dim, int32_
 
 base::Status EmbeddingLayer::check() const {
   const auto& input_tensor = get_input(0);
-  const auto& token_size = get_input(1).size();
-  if (token_size > input_tensor.size()) {
+  const int32_t total_tokens = get_input(1).size();
+  if (total_tokens > input_tensor.size()) {
     return base::error::InvalidArgument("The number of input tensor is greater than seq len.");
   }
 
-  base::Status status = check_tensor_with_dim(input_tensor, base::DeviceType::kDeviceCPU,
-                                              base::DataType::kDataTypeInt32, token_size);
+  // Auto-detect batch from input dimensions
+  int input_dims = input_tensor.dims_size();
+  base::Status status;
+  if (input_dims == 2) {
+    status = check_tensor_with_dim(input_tensor, base::DeviceType::kDeviceCPU,
+                                    base::DataType::kDataTypeInt32,
+                                    input_tensor.get_dim(0), input_tensor.get_dim(1));
+  } else {
+    status = check_tensor_with_dim(input_tensor, base::DeviceType::kDeviceCPU,
+                                    base::DataType::kDataTypeInt32, total_tokens);
+  }
   if (!status) {
     LOG(ERROR) << "The input tensor error in the embedding layer.";
     return status;
@@ -34,7 +43,14 @@ base::Status EmbeddingLayer::check() const {
     return status;
   }
 
-  status = check_tensor_with_dim(get_output(0), device_type_, data_type_, token_size, dim_);
+  // Output check: match input shape + dim_
+  const auto& output = get_output(0);
+  if (input_dims == 2) {
+    status = check_tensor_with_dim(output, device_type_, data_type_,
+                                    input_tensor.get_dim(0), input_tensor.get_dim(1), dim_);
+  } else {
+    status = check_tensor_with_dim(output, device_type_, data_type_, total_tokens, dim_);
+  }
   if (!status) {
     LOG(ERROR) << "The output tensor error in the embedding layer.";
     return status;

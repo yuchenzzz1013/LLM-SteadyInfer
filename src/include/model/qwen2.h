@@ -1,5 +1,5 @@
-#ifndef SRC_INCLUDE_MODEL_LLAMA_H_
-#define SRC_INCLUDE_MODEL_LLAMA_H_
+#ifndef SRC_INCLUDE_MODEL_QWEN2_H_
+#define SRC_INCLUDE_MODEL_QWEN2_H_
 #include <base/cuda_config.h>
 #include "model.h"
 #include "op/add.h"
@@ -43,7 +43,18 @@ class Qwen2Model : public Model {
   base::Status forward(const tensor::Tensor& input, const tensor::Tensor& pos_tensor,
                        int& next) const override;
 
+  base::Status forward_batch(
+      const tensor::Tensor& input_ids,
+      const tensor::Tensor& positions,
+      const tensor::Tensor& kv_offsets,
+      tensor::Tensor& key_cache,
+      tensor::Tensor& value_cache,
+      tensor::Tensor& logits,
+      bool need_logits = true) const override;
+
   op::EmbeddingOutput embedding(const std::vector<int>& tokens) const override;
+
+  void sync_stream() const override;
 
  private:
   void init_mem() override;

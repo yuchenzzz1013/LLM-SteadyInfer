@@ -13,14 +13,18 @@ base::Status SwiGLULayer::check() const {
   base::Status status;
   const int32_t input_tensor_num = 2;
   for (int32_t i = 0; i < input_tensor_num; ++i) {
-    status = check_tensor_with_dim(get_input(0), device_type_, data_type_, hidden_dim_);
+    status = check_tensor(get_input(i), device_type_, data_type_);
     if (!status) {
       LOG(ERROR) << "The input tensor " << std::to_string(i) << " error in the swiglu layer.";
       return status;
     }
   }
-
-  status = check_tensor_with_dim(get_output(0), device_type_, data_type_, hidden_dim_);
+  // Verify same total size across all tensors
+  if (get_input(0).size() != get_input(1).size() ||
+      get_input(0).size() != get_output(0).size()) {
+    return base::error::InvalidArgument("The tensor sizes mismatch in the swiglu layer.");
+  }
+  status = check_tensor(get_output(0), device_type_, data_type_);
   if (!status) {
     LOG(ERROR) << "The output tensor error in the swiglu layer.";
     return status;

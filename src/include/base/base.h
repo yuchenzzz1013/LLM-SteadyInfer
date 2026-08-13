@@ -29,6 +29,19 @@ enum class ModelBufferType {
 
   kSinCache = 17,
   kCosCache = 18,
+  // Batch-mode buffers
+  kBatchInputTokens = 19,
+  kBatchEmbeddings = 20,
+  kBatchRMSNormOutput = 21,
+  kBatchQuery = 22,
+  kBatchMHAOutput = 23,
+  kBatchAttnOutput = 24,
+  kBatchFFNRMSNorm = 25,
+  kBatchW1Output = 26,
+  kBatchW2Output = 27,
+  kBatchW3Output = 28,
+  kBatchScoreStorage = 29,
+  kBatchKVCache = 30,
 };
 }
 

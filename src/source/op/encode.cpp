@@ -1,14 +1,13 @@
 #include "op/encode.h"
 #include <glog/logging.h>
+#include <absl/strings/str_join.h>
+#include <absl/strings/str_replace.h>
+#include <absl/strings/str_split.h>
+#include <nlohmann/json.hpp>
+#include "base/tiktoken.h"
 #include "base/unicode.h"
+#include "base/unordered_dense.h"
 namespace op {
-
-// EncodeLayer::EncodeLayer(
-//     base::DeviceType device_type,std::string token_model_path, bool has_bos, bool has_eos,
-//     : Layer(device_type, LayerType::kLayerEncode, "Encode"),
-//       has_bos_(has_bos),
-//       has_eos_(has_eos),
-//       spe(std::move(sentence_piece_processor)) {}
 
 std::string SpeEncodeLayer::decode(int32_t token_id) const {
   CHECK(spe != nullptr);
@@ -55,7 +54,6 @@ int32_t SpeEncodeLayer::vocab_size() const {
   return spe->GetPieceSize();
 }
 
-#if defined(LLAMA3_SUPPORT) || defined(QWEN2_SUPPORT) || defined(QWEN3_SUPPORT)
 static const std::string PAT_STR =
     R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?:$|[^\S])|\s+)";
 
@@ -179,5 +177,4 @@ QwenEncodeLayer::QwenEncodeLayer(std::string token_model_path, bool has_bos, boo
   tiktoken_ = std::make_unique<tiktoken::tiktoken>(encoder, special_tokens, PAT_STR);
 }
 
-#endif
 }  // namespace op

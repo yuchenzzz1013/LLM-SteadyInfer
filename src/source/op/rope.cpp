@@ -35,23 +35,26 @@ base::Status RoPELayer::forward() {
 }
 
 base::Status RoPELayer::check() const {
-  // pos tensor
-  auto status = check_tensor_with_dim(get_input(2), base::DeviceType::kDeviceCPU,
-                                      base::DataType::kDataTypeInt32, 1);
+  // Allow positions to be [batch] or [1]
+  const auto& pos_tensor = get_input(2);
+  auto status = check_tensor(get_input(2), base::DeviceType::kDeviceCPU,
+                              base::DataType::kDataTypeInt32);
   if (!status) {
-    LOG(ERROR) << "The input tensor 2 error in the add layer.";
+    LOG(ERROR) << "The input tensor 2 (pos) error in the rope layer.";
     return status;
   }
 
-  status = check_tensor_with_dim(get_input(1), device_type_, data_type_, kv_dim_);
+  // Q tensor: [kv_dim] or [batch, kv_dim]
+  status = check_tensor(get_input(0), device_type_, data_type_);
   if (!status) {
-    LOG(ERROR) << "The input tensor 1 error in the add layer.";
+    LOG(ERROR) << "The input tensor 0 (Q) error in the rope layer.";
     return status;
   }
 
-  status = check_tensor_with_dim(get_input(0), device_type_, data_type_, dim_);
+  // K tensor: [kv_dim] or [batch, kv_dim]
+  status = check_tensor(get_input(1), device_type_, data_type_);
   if (!status) {
-    LOG(ERROR) << "The input tensor 0 error in the add layer.";
+    LOG(ERROR) << "The input tensor 1 (K) error in the rope layer.";
     return status;
   }
   return base::error::Success();

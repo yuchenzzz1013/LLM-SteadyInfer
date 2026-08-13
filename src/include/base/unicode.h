@@ -4,8 +4,6 @@
 #include <string>
 #include <vector>
 
-// TODO: prefix all symbols with "llama_"
-
 struct codepoint_flags {
     enum {
         UNDEFINED       = 0x0001,

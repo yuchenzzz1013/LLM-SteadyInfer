@@ -11,20 +11,27 @@ base::Status VecAddLayer::check() const {
   tensor::Tensor input1 = this->get_input(0);
   tensor::Tensor input2 = this->get_input(1);
   int32_t size = input1.size();
-  base::Status status;
-  status = check_tensor_with_dim(input1, device_type_, data_type_, size);
+  if (size == 0) {
+    return base::error::InvalidArgument("The input tensor 1 is empty.");
+  }
+  if (input2.size() != size) {
+    return base::error::InvalidArgument("The input tensor 2 has a different size.");
+  }
+  if (get_output(0).size() != size) {
+    return base::error::InvalidArgument("The output tensor has a different size.");
+  }
+  // Check device and dtype only (dimension-agnostic)
+  auto status = check_tensor(input1, device_type_, data_type_);
   if (!status) {
     LOG(ERROR) << "The input tensor 1 error in the add layer.";
     return status;
   }
-
-  status = check_tensor_with_dim(input2, device_type_, data_type_, size);
+  status = check_tensor(input2, device_type_, data_type_);
   if (!status) {
     LOG(ERROR) << "The input tensor 2 error in the add layer.";
     return status;
   }
-
-  status = check_tensor_with_dim(get_output(0), device_type_, data_type_, size);
+  status = check_tensor(get_output(0), device_type_, data_type_);
   if (!status) {
     LOG(ERROR) << "The output tensor error in the add layer.";
     return status;

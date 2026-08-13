@@ -1,4 +1,3 @@
-#ifdef QWEN3_SUPPORT
 #include "model/qwen3.h"
 #include <cuda_runtime_api.h>
 #include <glog/logging.h>
@@ -6,8 +5,10 @@
 #include <op/mha.h>
 #include <op/rmsnorm.h>
 #include <sentencepiece_processor.h>
+#include <algorithm>
 #include <utility>
 #include "../op/kernels/cpu/rope_kernel.h"
+#include "../op/kernels/cuda/mha_kernel.cuh"
 #include "../op/kernels/cuda/rope_kernel.cuh"
 #include "base/tick.h"
 namespace model {
@@ -133,12 +134,14 @@ base::Status Qwen3Model::init(base::DeviceType device_type) {
   if (device_type_ == base::DeviceType::kDeviceCPU) {
     kernel::sin_cos_cache_calc_cpu(config_->head_size_, config_->seq_len_,
                                    get_buffer(ModelBufferType::kSinCache).ptr<float>(),
-                                   get_buffer(ModelBufferType::kCosCache).ptr<float>());
+                                   get_buffer(ModelBufferType::kCosCache).ptr<float>(),
+                                   config_->rope_theta_);
   } else {
     CHECK_NE(cuda_config_, nullptr);
     kernel::sin_cos_cache_calc_cu(config_->head_size_, config_->seq_len_,
                                   get_buffer(ModelBufferType::kSinCache),
-                                  get_buffer(ModelBufferType::kCosCache), cuda_config_->stream);
+                                  get_buffer(ModelBufferType::kCosCache), cuda_config_->stream,
+                                  config_->rope_theta_);
   }
 
   sampler_ = std::make_unique<sampler::ArgmaxSampler>(device_type_);
@@ -163,7 +166,9 @@ base::Status Qwen3Model::forward(const tensor::Tensor& input, const tensor::Tens
     // feed forward
     feed_forward(layer_idx, input);
   }
-  cls_logits(input);
+  // Logits are only needed for the token that feeds sampling (the last
+  // prompt token); computing them for every intermediate prompt token cost
+  // a full-vocab GEMV per token. predict() calls cls_logits() explicitly.
   return base::error::Success();
 }
 
@@ -173,8 +178,8 @@ void Qwen3Model::create_nonparam_layers() {
       device_type_, config_->dim_, config_->kv_dim_, config_->head_size_);
 
   qwen_layers_->mha_layer_ = std::make_shared<op::MultiHeadAttention>(
-      device_type_, 0, config_->kv_mul_, config_->kv_dim_, config_->seq_len_, config_->head_num_,
-      config_->head_size_);
+      device_type_, 0, config_->kv_head_num_, config_->kv_dim_, config_->seq_len_,
+      config_->head_num_, config_->head_size_);
 
   qwen_layers_->add_layer_ = std::make_shared<op::VecAddLayer>(device_type_);
 
@@ -519,7 +524,13 @@ base::Status Qwen3Model::predict(const tensor::Tensor& input, const tensor::Tens
   if (!status) {
     return status;
   }
-  next = post_processing(pos_tensor, is_prompt);
+  if (!is_prompt) {
+    // Only the token that feeds sampling needs logits.
+    cls_logits(input);
+    next = post_processing(pos_tensor, is_prompt);
+  } else {
+    next = -1;
+  }
   return base::error::Success();
 }
 
@@ -634,12 +645,316 @@ int32_t Qwen3Model::post_processing(const tensor::Tensor& pos, bool is_prompt) c
   if (is_prompt) {
     next = -1;
   } else {
-    next = static_cast<int32_t>(sampler_->sample(forward_logits, forward_output.size(),
-                                                 cuda_config_ ? cuda_config_->stream : nullptr));
+    // Restrict sampling to the tokenizer's vocab range (see
+    // post_processing_batch): header vocab may be larger than the tokenizer's.
+    size_t sample_size = static_cast<size_t>(forward_output.size());
+    if (encode_layer_ && encode_layer_->vocab_size() > 0) {
+      sample_size = std::min(sample_size, static_cast<size_t>(encode_layer_->vocab_size()));
+    }
+    next = static_cast<int32_t>(sampler_->sample(
+        forward_logits, sample_size, cuda_config_ ? cuda_config_->stream : nullptr));
   }
   return next;
 }
 
-}  // namespace model
+void Qwen3Model::sync_stream() const {
+  if (device_type_ == base::DeviceType::kDeviceCUDA && cuda_config_ &&
+      cuda_config_->stream) {
+    cudaStreamSynchronize(cuda_config_->stream);
+  }
+}
 
-#endif
+// ========== Continuous Batching forward ==========
+base::Status Qwen3Model::forward_batch(
+    const tensor::Tensor& input_ids,
+    const tensor::Tensor& positions,
+    const tensor::Tensor& kv_offsets,
+    tensor::Tensor& key_cache,
+    tensor::Tensor& value_cache,
+    tensor::Tensor& logits,
+    bool need_logits) const {
+  if (input_ids.is_empty()) {
+    return base::error::InvalidArgument("The input_ids tensor is empty.");
+  }
+
+  int32_t batch = input_ids.get_dim(0);
+  int32_t hidden_dim = config_->hidden_dim_;
+  int32_t dim = config_->dim_;
+  int32_t kv_dim = config_->kv_dim_;
+  int32_t max_seq_len = key_cache.get_dim(2);
+  int32_t num_slots = key_cache.get_dim(1);
+
+  std::shared_ptr<base::DeviceAllocator> alloc;
+  if (device_type_ == base::DeviceType::kDeviceCPU) {
+    alloc = base::CPUDeviceAllocatorFactory::get_instance();
+  } else {
+    alloc = base::CUDADeviceAllocatorFactory::get_instance();
+  }
+  auto alloc_cpu = base::CPUDeviceAllocatorFactory::get_instance();
+
+  tensor::Tensor hidden(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
+
+  // 1. Embedding
+  {
+    const auto& emb_layer = qwen_layers_->embedding_layer_;
+    tensor::Tensor input_token_num(base::DataType::kDataTypeInt32, batch);
+    std::dynamic_pointer_cast<op::EmbeddingLayer>(emb_layer)->set_batch_size(batch);
+    tensor::Tensor tokens_cpu = input_ids;
+    if (tokens_cpu.device_type() != base::DeviceType::kDeviceCPU) {
+      tokens_cpu = input_ids.clone();
+    }
+    STATUS_CHECK(emb_layer->forward(tokens_cpu, input_token_num, hidden));
+  }
+
+  // 2. Per-layer processing
+  // Pre-allocate reusable tensors outside the layer loop to avoid accumulating
+  // per-layer temporary buffers.
+  tensor::Tensor rms_out(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
+  tensor::Tensor q_batch(base::DataType::kDataTypeFp32, batch, dim, true, alloc);
+  tensor::Tensor mha_out_batch(base::DataType::kDataTypeFp32, batch, dim, true, alloc);
+  tensor::Tensor attn_out(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
+  tensor::Tensor ffn_norm_out(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
+  tensor::Tensor w1_out(base::DataType::kDataTypeFp32, batch, config_->immediate_dim_, true, alloc);
+  tensor::Tensor w3_out(base::DataType::kDataTypeFp32, batch, config_->immediate_dim_, true, alloc);
+  tensor::Tensor w2_out(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
+
+  // Batched K/V intermediates, MHA score scratch and device copies of
+  // positions/kv_offsets for the CUDA decode path.
+  tensor::Tensor key_batch;
+  tensor::Tensor val_batch;
+  tensor::Tensor score_batch;
+  tensor::Tensor positions_cu;
+  tensor::Tensor kv_offsets_cu;
+  if (device_type_ == base::DeviceType::kDeviceCUDA) {
+    key_batch = tensor::Tensor(base::DataType::kDataTypeFp32, batch, kv_dim, true, alloc);
+    val_batch = tensor::Tensor(base::DataType::kDataTypeFp32, batch, kv_dim, true, alloc);
+    score_batch = tensor::Tensor(base::DataType::kDataTypeFp32, batch * config_->head_num_,
+                                 max_seq_len, true, alloc);
+    positions_cu = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc);
+    kv_offsets_cu = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc);
+    // positions/kv_offsets live on the host; the batched kernels read device copies.
+    cudaMemcpyAsync(const_cast<int32_t*>(positions_cu.ptr<int32_t>()),
+                    positions.ptr<int32_t>(), batch * sizeof(int32_t), cudaMemcpyHostToDevice,
+                    cuda_config_->stream);
+    cudaMemcpyAsync(const_cast<int32_t*>(kv_offsets_cu.ptr<int32_t>()),
+                    kv_offsets.ptr<int32_t>(), batch * sizeof(int32_t), cudaMemcpyHostToDevice,
+                    cuda_config_->stream);
+  }
+
+  // Bounds check once for the whole batch (was repeated per layer).
+  for (int32_t b = 0; b < batch; ++b) {
+    if (positions.ptr<int32_t>()[b] >= max_seq_len) {
+      LOG(ERROR) << "forward_batch: position " << positions.ptr<int32_t>()[b]
+                 << " exceeds max_seq_len " << max_seq_len
+                 << " for slot " << kv_offsets.ptr<int32_t>()[b];
+      return base::error::InvalidArgument(
+          "Position exceeds KV cache capacity. Increase max_seq_len.");
+    }
+  }
+
+  for (int32_t layer_idx = 0; layer_idx < config_->layer_num_; ++layer_idx) {
+    // a. RMSNorm
+    {
+      auto& rmsnorm = qwen_layers_->rmsnorm_layers_.at(layer_idx);
+      STATUS_CHECK(rmsnorm->forward(hidden, rms_out));
+    }
+
+    // b. Q projection: [batch, hidden_dim] -> [batch, dim]
+    {
+      auto& wq = qwen_layers_->wq_layers_.at(layer_idx);
+      std::dynamic_pointer_cast<op::MatmulLayer>(wq)->set_batch_size(batch);
+      STATUS_CHECK(wq->forward(rms_out, q_batch));
+    }
+
+    // Q norm (Qwen3 specific): per-head RMSNorm
+    {
+      auto& q_norm = qwen_layers_->rmsnorm_layers_.at(2 * config_->layer_num_ + 1 + layer_idx);
+      q_batch.reshape({batch * config_->head_num_, config_->head_size_});
+      STATUS_CHECK(q_norm->forward(q_batch, q_batch));
+      q_batch.reshape({batch, dim});
+    }
+
+    // c/d/e: K, V projections + RoPE + cache write
+    if (device_type_ == base::DeviceType::kDeviceCUDA) {
+      // Batched K projection: [batch, hidden_dim] -> [batch, kv_dim]
+      {
+        auto& wk = qwen_layers_->wk_layers_.at(layer_idx);
+        std::dynamic_pointer_cast<op::MatmulLayer>(wk)->set_batch_size(batch);
+        STATUS_CHECK(wk->forward(rms_out, key_batch));
+      }
+
+      // K norm (Qwen3 specific) — per-head RMSNorm over the whole batch
+      {
+        int32_t kv_head_num = config_->kv_head_num_;
+        key_batch.reshape({batch * kv_head_num, config_->head_size_});
+        auto& k_norm = qwen_layers_->rmsnorm_layers_.at(3 * config_->layer_num_ + 1 + layer_idx);
+        STATUS_CHECK(k_norm->forward(key_batch, key_batch));
+        key_batch.reshape({batch, kv_dim});
+      }
+
+      // Batched V projection
+      {
+        auto& wv = qwen_layers_->wv_layers_.at(layer_idx);
+        std::dynamic_pointer_cast<op::MatmulLayer>(wv)->set_batch_size(batch);
+        STATUS_CHECK(wv->forward(rms_out, val_batch));
+      }
+
+      // RoPE over the whole batch (single kernel, in place on q_batch/key_batch)
+      kernel::rope_kernel_cu_batch(dim, kv_dim, config_->head_size_, q_batch, key_batch,
+                                   positions_cu, get_buffer(ModelBufferType::kSinCache),
+                                   get_buffer(ModelBufferType::kCosCache),
+                                   cuda_config_->stream);
+
+      // Write this layer's K/V rows into each sequence's KV cache slot
+      kernel::kv_scatter_cu(key_batch, key_cache, kv_offsets_cu, positions_cu, kv_dim, num_slots,
+                            max_seq_len, layer_idx, cuda_config_->stream);
+      kernel::kv_scatter_cu(val_batch, value_cache, kv_offsets_cu, positions_cu, kv_dim, num_slots,
+                            max_seq_len, layer_idx, cuda_config_->stream);
+
+      // f. MHA: one launch per layer for the whole batch
+      kernel::mha_kernel_cu_batch(config_->head_num_, layer_idx, num_slots, max_seq_len, kv_dim,
+                                  config_->kv_head_num_, config_->head_size_, positions_cu,
+                                  kv_offsets_cu, q_batch, score_batch, mha_out_batch, key_cache,
+                                  value_cache, cuda_config_.get());
+    } else {
+      // CPU path: per-sequence K/V projection + RoPE, writing directly into
+      // each sequence's KV cache slot.
+      for (int32_t b = 0; b < batch; ++b) {
+        int32_t pos = positions.ptr<int32_t>()[b];
+        int32_t slot = kv_offsets.ptr<int32_t>()[b];
+
+        int32_t slot_offset = layer_idx * num_slots * max_seq_len * kv_dim +
+                              slot * max_seq_len * kv_dim + pos * kv_dim;
+
+        float* key_cache_ptr = const_cast<float*>(key_cache.ptr<float>(slot_offset));
+        float* value_cache_ptr = const_cast<float*>(value_cache.ptr<float>(slot_offset));
+
+        tensor::Tensor key_slot(base::DataType::kDataTypeFp32, kv_dim, false, nullptr, key_cache_ptr);
+        tensor::Tensor val_slot(base::DataType::kDataTypeFp32, kv_dim, false, nullptr, value_cache_ptr);
+        key_slot.set_device_type(device_type_);
+        val_slot.set_device_type(device_type_);
+
+        tensor::Tensor rms_view(base::DataType::kDataTypeFp32, hidden_dim, false, nullptr,
+                                rms_out.ptr<float>(b * hidden_dim));
+        rms_view.set_device_type(device_type_);
+
+        auto& wk = qwen_layers_->wk_layers_.at(layer_idx);
+        STATUS_CHECK(wk->forward(rms_view, key_slot));
+
+        // K norm (Qwen3 specific) — apply per-head RMSNorm
+        {
+          int32_t kv_head_num = config_->kv_head_num_;
+          key_slot.reshape({kv_head_num, config_->head_size_});
+          auto& k_norm = qwen_layers_->rmsnorm_layers_.at(3 * config_->layer_num_ + 1 + layer_idx);
+          STATUS_CHECK(k_norm->forward(key_slot, key_slot));
+          key_slot.reshape({kv_dim});
+        }
+
+        auto& wv = qwen_layers_->wv_layers_.at(layer_idx);
+        STATUS_CHECK(wv->forward(rms_view, val_slot));
+
+        tensor::Tensor q_view(base::DataType::kDataTypeFp32, dim, false, nullptr,
+                              q_batch.ptr<float>(b * dim));
+        q_view.set_device_type(device_type_);
+
+        tensor::Tensor pos_tensor(base::DataType::kDataTypeInt32, 1, true, alloc_cpu);
+        pos_tensor.index<int32_t>(0) = pos;
+
+        STATUS_CHECK(qwen_layers_->rope_layer_->forward(
+            q_view, key_slot, pos_tensor,
+            get_buffer(ModelBufferType::kSinCache),
+            get_buffer(ModelBufferType::kCosCache), tensor::Tensor{}));
+      }
+
+      // f. MHA: per-sequence
+      {
+        auto mha_layer = std::dynamic_pointer_cast<op::MultiHeadAttention>(qwen_layers_->mha_layer_);
+        for (int32_t b = 0; b < batch; ++b) {
+          int32_t pos = positions.ptr<int32_t>()[b];
+          int32_t slot = kv_offsets.ptr<int32_t>()[b];
+
+          tensor::Tensor q_single(base::DataType::kDataTypeFp32, dim, false, nullptr,
+                                  q_batch.ptr<float>(b * dim));
+          q_single.set_device_type(device_type_);
+
+          // Create KV cache views for this slot, sized to the actual valid
+          // prefix length (pos + 1) instead of the full slot capacity.
+          int32_t slot_base = layer_idx * num_slots * max_seq_len * kv_dim +
+                              slot * max_seq_len * kv_dim;
+          tensor::Tensor key_view(base::DataType::kDataTypeFp32, pos + 1, kv_dim, false, nullptr,
+                                  const_cast<float*>(key_cache.ptr<float>(slot_base)));
+          tensor::Tensor val_view(base::DataType::kDataTypeFp32, pos + 1, kv_dim, false, nullptr,
+                                  const_cast<float*>(value_cache.ptr<float>(slot_base)));
+          key_view.set_device_type(device_type_);
+          val_view.set_device_type(device_type_);
+
+          tensor::Tensor score_storage = get_buffer(ModelBufferType::kScoreStorage);
+          tensor::Tensor mha_out_single(base::DataType::kDataTypeFp32, dim, false, nullptr,
+                                        mha_out_batch.ptr<float>(b * dim));
+          mha_out_single.set_device_type(device_type_);
+
+          mha_layer->set_pos(pos);
+          mha_layer->set_layer_idx(0);
+          STATUS_CHECK(qwen_layers_->mha_layer_->forward(
+              q_single, score_storage, key_view, val_view, mha_out_single));
+        }
+      }
+    }
+
+    // g. WO projection: [batch, dim] -> [batch, hidden_dim]
+    {
+      auto& wo = qwen_layers_->wo_layers_.at(layer_idx);
+      std::dynamic_pointer_cast<op::MatmulLayer>(wo)->set_batch_size(batch);
+      STATUS_CHECK(wo->forward(mha_out_batch, attn_out));
+    }
+
+    // h. Residual add
+    STATUS_CHECK(qwen_layers_->add_layer_->forward(hidden, attn_out, hidden));
+
+    // i. FFN
+    {
+      auto& ffn_rmsnorm = qwen_layers_->rmsnorm_layers_.at(layer_idx + config_->layer_num_);
+      STATUS_CHECK(ffn_rmsnorm->forward(hidden, ffn_norm_out));
+
+      {
+        auto& w1 = qwen_layers_->w1_layers_.at(layer_idx);
+        std::dynamic_pointer_cast<op::MatmulLayer>(w1)->set_batch_size(batch);
+        STATUS_CHECK(w1->forward(ffn_norm_out, w1_out));
+      }
+
+      {
+        auto& w3 = qwen_layers_->w3_layers_.at(layer_idx);
+        std::dynamic_pointer_cast<op::MatmulLayer>(w3)->set_batch_size(batch);
+        STATUS_CHECK(w3->forward(ffn_norm_out, w3_out));
+      }
+
+      STATUS_CHECK(qwen_layers_->swiglu_layer_->forward(w1_out, w3_out, w1_out));
+
+      {
+        auto& w2 = qwen_layers_->w2_layers_.at(layer_idx);
+        std::dynamic_pointer_cast<op::MatmulLayer>(w2)->set_batch_size(batch);
+        STATUS_CHECK(w2->forward(w1_out, w2_out));
+      }
+
+      STATUS_CHECK(qwen_layers_->add_layer_->forward(hidden, w2_out, hidden));
+    }
+  }
+
+  // 3. Final RMSNorm + LM Head (skipped for prefill chunks: only the first
+  // generated token, produced by a decode step, needs logits)
+  if (need_logits) {
+    auto& final_norm = qwen_layers_->rmsnorm_layers_.at(2 * config_->layer_num_);
+    STATUS_CHECK(final_norm->forward(hidden, hidden));
+
+    logits.reshape({batch, config_->vocab_size_});
+    auto& cls = qwen_layers_->cls_layer_;
+    std::dynamic_pointer_cast<op::MatmulLayer>(cls)->set_batch_size(batch);
+    STATUS_CHECK(cls->forward(hidden, logits));
+  }
+
+  // No stream sync here: the caller (Scheduler) syncs via sync_stream()
+  // right before post_processing_batch reads the logits.
+  return base::error::Success();
+}
+
+}  // namespace model
