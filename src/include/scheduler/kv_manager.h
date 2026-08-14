@@ -24,9 +24,10 @@ class KVManager {
   void copy_to_slot(int slot, const tensor::Tensor& src_key, const tensor::Tensor& src_val,
                     int layer_idx, int start_pos, int num_positions);
 
-  // Get pointer to a slot's KV cache for a specific layer and position
-  float* key_slot_ptr(int layer_idx, int slot, int pos);
-  float* value_slot_ptr(int layer_idx, int slot, int pos);
+  // Get pointer to element (layer, slot, d, pos) of the head-dim-contiguous
+  // KV cache [num_layers, max_batch, kv_dim, max_seq_len].
+  float* key_slot_ptr(int layer_idx, int slot, int pos, int d = 0);
+  float* value_slot_ptr(int layer_idx, int slot, int pos, int d = 0);
 
   tensor::Tensor& key_cache() { return key_cache_; }
   tensor::Tensor& value_cache() { return value_cache_; }
@@ -38,7 +39,7 @@ class KVManager {
   int max_batch_ = 0;
   int max_seq_len_ = 0;
   int kv_dim_ = 0;
-  tensor::Tensor key_cache_;    // [num_layers, max_batch, max_seq_len, kv_dim]
+  tensor::Tensor key_cache_;    // [num_layers, max_batch, kv_dim, max_seq_len]
   tensor::Tensor value_cache_;
   std::vector<bool> slot_busy_;
 };

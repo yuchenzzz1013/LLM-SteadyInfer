@@ -170,6 +170,12 @@ void rope_kernel_cu_batch(int32_t dim, int32_t kv_dim, int32_t head_size,
   }
 }
 
+// Scatter one [kv_dim] row per batch element into the head-dim-contiguous
+// cache layout [num_layers, num_slots, kv_dim, max_seq_len]:
+//   dst[layer][slot][d][pos] = src[b][d]
+// The write is strided (stride max_seq_len between consecutive d) — inherent
+// to the layout; decode-side reads win back far more bandwidth than this
+// kv_dim-element scatter costs.
 __global__ void kv_scatter_kernel(const float* src, float* dst, const int32_t* kv_offsets,
                                   const int32_t* positions, int32_t kv_dim, int32_t num_slots,
                                   int32_t max_seq_len, int32_t layer_idx) {
@@ -177,13 +183,11 @@ __global__ void kv_scatter_kernel(const float* src, float* dst, const int32_t* k
   int tid = threadIdx.x;
   int slot = kv_offsets[b];
   int pos = positions[b];
-  int64_t base = static_cast<int64_t>(layer_idx) * num_slots * max_seq_len * kv_dim +
-                 static_cast<int64_t>(slot) * max_seq_len * kv_dim +
-                 static_cast<int64_t>(pos) * kv_dim;
-  float* dst_row = dst + base;
+  int64_t base = static_cast<int64_t>(layer_idx) * num_slots * kv_dim * max_seq_len +
+                 static_cast<int64_t>(slot) * kv_dim * max_seq_len + pos;
   const float* src_row = src + static_cast<int64_t>(b) * kv_dim;
-  for (int i = tid; i < kv_dim; i += blockDim.x) {
-    dst_row[i] = src_row[i];
+  for (int d = tid; d < kv_dim; d += blockDim.x) {
+    dst[base + static_cast<int64_t>(d) * max_seq_len] = src_row[d];
   }
 }
 

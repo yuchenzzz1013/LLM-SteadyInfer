@@ -51,6 +51,11 @@ class Scheduler {
   int max_seq_len_;
   int max_gen_len_;
   int next_seq_id_ = 0;
+
+  // Adaptive chunked-prefill token budget (see execute_batch). Dampened one
+  // level per step to avoid oscillation when decode pressure hovers around a
+  // threshold.
+  int prefill_token_budget_ = 1024;
 };
 
 }  // namespace scheduler

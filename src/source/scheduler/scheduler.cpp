@@ -179,7 +179,41 @@ void Scheduler::execute_batch(const std::vector<Sequence*>& batch) {
     // no per-token predict calls). Logits are skipped — the first generated
     // token is produced by the following decode step, which already handles
     // sequences with empty generated_tokens.
-    constexpr int kMaxPrefillTokensPerStep = 1024;
+    //
+    // Adaptive token budget: prefill and decode never run in the same step,
+    // so every prefill step delays decode tokens by its whole latency.
+    //   - decode backlog high (>= 50% of max_batch)  -> shrink to 512 to
+    //     interrupt prefill earlier and protect TPOT;
+    //   - decode backlog low (< 25% of max_batch)    -> grow to 4096 to
+    //     shorten TTFT;
+    //   - in between                                  -> 1024.
+    // The budget moves at most one level per step (dampening) so bursts do
+    // not oscillate the chunk size.
+    {
+      int decode_backlog = 0;
+      for (const auto& seq : running_sequences_) {
+        if (!seq.is_finished && seq.is_prefill_complete) {
+          ++decode_backlog;
+        }
+      }
+      const float pressure =
+          max_batch_size_ > 0 ? static_cast<float>(decode_backlog) / max_batch_size_ : 0.f;
+      int target = 1024;
+      if (pressure >= 0.5f) {
+        target = 512;
+      } else if (pressure < 0.25f) {
+        target = 4096;
+      }
+      if (target > prefill_token_budget_) {
+        prefill_token_budget_ = std::min(target, prefill_token_budget_ * 2);
+      } else if (target < prefill_token_budget_) {
+        prefill_token_budget_ = std::max(target, prefill_token_budget_ / 2);
+      }
+      prefill_token_budget_ = std::max(512, std::min(4096, prefill_token_budget_));
+      VLOG(1) << "[SCHED] prefill budget=" << prefill_token_budget_
+              << " decode_backlog=" << decode_backlog << " pressure=" << pressure;
+    }
+    const int kMaxPrefillTokensPerStep = prefill_token_budget_;
 
     std::vector<int32_t> input_ids;
     std::vector<int32_t> positions;
@@ -294,10 +328,13 @@ void Scheduler::execute_batch(const std::vector<Sequence*>& batch) {
       VLOG(1) << "[SCHED] before forward_batch: GPU free=" << (free_mem >> 20) << "MB";
     }
 
-    auto status = model_->forward_batch(input_ids, positions, kv_offsets,
-                                         kv_manager_->key_cache(),
-                                         kv_manager_->value_cache(),
-                                         logits_view);
+    // Decode goes through decode_step: first call per batch size captures a
+    // CUDA graph, later calls only stage inputs and replay it (falls back to
+    // forward_batch automatically when graphs are unavailable).
+    auto status = model_->decode_step(input_ids, positions, kv_offsets,
+                                      kv_manager_->key_cache(),
+                                      kv_manager_->value_cache(),
+                                      logits_view);
     if (!status) {
       LOG(ERROR) << "Batch forward failed: " << status.get_err_msg();
       // Mark all running sequences as finished to prevent infinite retry loop.

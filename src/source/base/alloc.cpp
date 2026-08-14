@@ -36,8 +36,15 @@ void DeviceAllocator::memcpy(const void* src_ptr, void* dest_ptr, size_t byte_si
   } else {
     LOG(FATAL) << "Unknown memcpy kind: " << int(memcpy_kind);
   }
+  // Red line: NEVER call cudaDeviceSynchronize() on the inference hot path —
+  // a global sync blocks every stream and serializes concurrent work.
+  // Sync only the stream that owns this transfer (cudaStreamSynchronize).
   if (need_sync) {
-    cudaDeviceSynchronize();
+    if (stream_) {
+      cudaStreamSynchronize(stream_);
+    }
+    // Without a stream the copy above was issued as a synchronous cudaMemcpy /
+    // cudaMemset, which already blocks until completion — nothing to sync.
   }
 }
 
@@ -47,14 +54,15 @@ void DeviceAllocator::memset_zero(void* ptr, size_t byte_size, void* stream,
   if (device_type_ == base::DeviceType::kDeviceCPU) {
     std::memset(ptr, 0, byte_size);
   } else {
-    if (stream) {
-      cudaStream_t stream_ = static_cast<cudaStream_t>(stream);
+    cudaStream_t stream_ = stream ? static_cast<cudaStream_t>(stream) : nullptr;
+    if (stream_) {
       cudaMemsetAsync(ptr, 0, byte_size, stream_);
     } else {
       cudaMemset(ptr, 0, byte_size);
     }
-    if (need_sync) {
-      cudaDeviceSynchronize();
+    // Stream-scoped sync only — see the note in memcpy above.
+    if (need_sync && stream_) {
+      cudaStreamSynchronize(stream_);
     }
   }
 }

@@ -50,7 +50,8 @@ class Qwen2Model : public Model {
       tensor::Tensor& key_cache,
       tensor::Tensor& value_cache,
       tensor::Tensor& logits,
-      bool need_logits = true) const override;
+      bool need_logits = true,
+      BatchScratch* scratch = nullptr) const override;
 
   op::EmbeddingOutput embedding(const std::vector<int>& tokens) const override;
 
@@ -80,7 +81,6 @@ class Qwen2Model : public Model {
   int32_t post_processing(const tensor::Tensor& pos, bool is_prompt) const override;
 
  private:
-  std::shared_ptr<kernel::CudaConfig> cuda_config_;
   std::unique_ptr<Qwen2Layers> qwen_layers_;
 };
 }  // namespace model

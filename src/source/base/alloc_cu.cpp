@@ -1,8 +1,26 @@
+#include <algorithm>
 #include <cuda_runtime_api.h>
 #include "base/alloc.h"
 namespace base {
 
 CUDADeviceAllocator::CUDADeviceAllocator() : DeviceAllocator(DeviceType::kDeviceCUDA) {}
+
+// Flush-idle threshold per device: max(total_mem * 5%, 1GB). Fixed 1GB is
+// wasteful on small (24GB) cards; on large cards the 5% floor keeps the pool
+// warm enough to absorb allocation spikes.
+size_t CUDADeviceAllocator::idle_flush_threshold(int device_id) const {
+  auto it = idle_thresholds_.find(device_id);
+  if (it != idle_thresholds_.end()) {
+    return it->second;
+  }
+  size_t total_mem = 0, free_mem = 0;
+  if (cudaMemGetInfo(&free_mem, &total_mem) != cudaSuccess) {
+    total_mem = 0;
+  }
+  const size_t threshold = std::max<size_t>(total_mem / 20, 1024ull * 1024 * 1024);
+  idle_thresholds_[device_id] = threshold;
+  return threshold;
+}
 
 void* CUDADeviceAllocator::allocate(size_t byte_size) const {
   int id = -1;
@@ -12,6 +30,19 @@ void* CUDADeviceAllocator::allocate(size_t byte_size) const {
     LOG(WARNING) << "[CUDA_ALLOC] Attempted to allocate 0 bytes; returning nullptr";
     return nullptr;
   }
+  // On OOM, recycle idle pooled buffers once and retry before giving up
+  // (spin-reclaim: frees what the pool hoards before surfacing the error).
+  auto malloc_with_retry = [this](void** ptr, size_t size) -> cudaError_t {
+    cudaError_t st = cudaMalloc(ptr, size);
+    if (st != cudaSuccess) {
+      LOG(WARNING) << "[CUDA_ALLOC] cudaMalloc(" << (size >> 20)
+                   << "MB) failed; recycling idle pool buffers and retrying once.";
+      free_idle();
+      st = cudaMalloc(ptr, size);
+    }
+    return st;
+  };
+
   if (byte_size > 1024 * 1024) {
     auto& big_buffers = big_buffers_map_[id];
     int sel_id = -1;
@@ -32,7 +63,7 @@ void* CUDADeviceAllocator::allocate(size_t byte_size) const {
     }
 
     void* ptr = nullptr;
-    state = cudaMalloc(&ptr, byte_size);
+    state = malloc_with_retry(&ptr, byte_size);
     if (cudaSuccess != state) {
       char buf[256];
       snprintf(buf, 256,
@@ -62,7 +93,7 @@ void* CUDADeviceAllocator::allocate(size_t byte_size) const {
     }
   }
   void* ptr = nullptr;
-  state = cudaMalloc(&ptr, byte_size);
+  state = malloc_with_retry(&ptr, byte_size);
   if (cudaSuccess != state) {
     char buf[256];
     snprintf(buf, 256,
@@ -91,8 +122,9 @@ void CUDADeviceAllocator::release(void* ptr) const {
   }
   cudaError_t state = cudaSuccess;
   for (auto& it : cuda_buffers_map_) {
-    if (no_busy_cnt_[it.first] > 1024 * 1024 * 1024) {
-      VLOG(1) << "[CUDA_FREE] idle > 1GB, flushing all non-busy small buffers";
+    if (no_busy_cnt_[it.first] > idle_flush_threshold(it.first)) {
+      VLOG(1) << "[CUDA_FREE] idle above waterline ("
+              << (idle_flush_threshold(it.first) >> 20) << "MB), flushing all non-busy small buffers";
       auto& cuda_buffers = it.second;
       std::vector<CudaMemoryBuffer> temp;
       for (int i = 0; i < cuda_buffers.size(); i++) {

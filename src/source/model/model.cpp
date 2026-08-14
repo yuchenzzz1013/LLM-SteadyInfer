@@ -2,9 +2,13 @@
 #include <base/alloc.h>
 #include <glog/logging.h>
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <fcntl.h>
+#include <limits>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include "../op/kernels/cuda/mha_kernel.cuh"
 namespace model {
 Model::Model(base::TokenizerType tokenizer_type, base::ModelType model_type, std::string token_path,
              std::string model_path, bool is_quant_model)
@@ -12,7 +16,190 @@ Model::Model(base::TokenizerType tokenizer_type, base::ModelType model_type, std
       model_type_(model_type),
       token_path_(std::move(token_path)),
       model_path_(std::move(model_path)),
-      is_quant_model_(is_quant_model) {}
+      is_quant_model_(is_quant_model) {
+  // Escape hatch for A/B testing graph capture without rebuilding.
+  const char* disable = std::getenv("LLAMA_DISABLE_CUDA_GRAPH");
+  if (disable && std::string(disable) == "1") {
+    use_cuda_graphs_ = false;
+  }
+}
+
+void BatchScratch::ensure(int32_t batch, int32_t hidden_dim, int32_t dim, int32_t kv_dim,
+                          int32_t ffn_dim, int32_t head_num, int32_t head_size,
+                          int32_t max_seq_len, base::DeviceType device,
+                          const std::shared_ptr<base::DeviceAllocator>& alloc) {
+  if (this->batch == batch && !hidden.is_empty() && hidden.get_dim(0) == batch) {
+    return;
+  }
+  this->batch = batch;
+
+  hidden = tensor::Tensor(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
+  rms_out = tensor::Tensor(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
+  q_batch = tensor::Tensor(base::DataType::kDataTypeFp32, batch, dim, true, alloc);
+  mha_out_batch = tensor::Tensor(base::DataType::kDataTypeFp32, batch, dim, true, alloc);
+  attn_out = tensor::Tensor(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
+  ffn_norm_out = tensor::Tensor(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
+  w1_out = tensor::Tensor(base::DataType::kDataTypeFp32, batch, ffn_dim, true, alloc);
+  w3_out = tensor::Tensor(base::DataType::kDataTypeFp32, batch, ffn_dim, true, alloc);
+  w2_out = tensor::Tensor(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
+  key_batch = tensor::Tensor(base::DataType::kDataTypeFp32, batch, kv_dim, true, alloc);
+  val_batch = tensor::Tensor(base::DataType::kDataTypeFp32, batch, kv_dim, true, alloc);
+
+  auto alloc_cpu = base::CPUDeviceAllocatorFactory::get_instance();
+  input_ids = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc_cpu);
+  positions = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc_cpu);
+  kv_offsets = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc_cpu);
+  input_token_num = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc_cpu);
+
+  if (device == base::DeviceType::kDeviceCUDA) {
+    int32_t num_splits = kernel::flash_decoding_num_splits(max_seq_len);
+    partial_batch = tensor::Tensor(base::DataType::kDataTypeFp32,
+                                   static_cast<int64_t>(batch) * head_num * num_splits *
+                                       (head_size + 2),
+                                   true, alloc);
+    tokens_cu = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc);
+    positions_cu = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc);
+    kv_offsets_cu = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc);
+  }
+}
+
+base::Status Model::decode_step(const tensor::Tensor& input_ids,
+                                const tensor::Tensor& positions,
+                                const tensor::Tensor& kv_offsets,
+                                tensor::Tensor& key_cache,
+                                tensor::Tensor& value_cache,
+                                tensor::Tensor& logits) {
+  const bool use_graph = device_type_ == base::DeviceType::kDeviceCUDA && use_cuda_graphs_;
+  if (!use_graph) {
+    return forward_batch(input_ids, positions, kv_offsets, key_cache, value_cache, logits, true);
+  }
+
+  const int32_t batch = input_ids.get_dim(0);
+  const int32_t max_seq_len = key_cache.get_dim(3);
+  const int32_t num_slots = key_cache.get_dim(1);
+  const int32_t kv_dim = key_cache.get_dim(2);
+
+  // Host-side bounds validation — the captured kernels assume in-bounds
+  // positions/slots (forward_batch's own check only runs for CPU tensors).
+  for (int32_t b = 0; b < batch; ++b) {
+    if (positions.ptr<int32_t>()[b] >= max_seq_len ||
+        kv_offsets.ptr<int32_t>()[b] >= num_slots) {
+      LOG(ERROR) << "decode_step: position/slot exceeds KV cache capacity.";
+      return base::error::InvalidArgument(
+          "Position or slot exceeds KV cache capacity. Increase max_seq_len.");
+    }
+  }
+
+  // Pool entry per batch size (LRU-evicted when it grows too large).
+  auto& entry = decode_graph_pool_[batch];
+  if (!entry) {
+    entry = std::make_unique<CudaGraphDecodeEntry>();
+    entry->batch = batch;
+    entry->scratch = std::make_unique<BatchScratch>();
+  }
+  entry->last_used = ++decode_graph_clock_;
+
+  constexpr int kMaxDecodeGraphEntries = 16;
+  if (static_cast<int>(decode_graph_pool_.size()) > kMaxDecodeGraphEntries) {
+    int32_t evict_batch = -1;
+    int64_t oldest = std::numeric_limits<int64_t>::max();
+    for (auto& [key, e] : decode_graph_pool_) {
+      if (e && e->last_used < oldest) {
+        oldest = e->last_used;
+        evict_batch = key;
+      }
+    }
+    if (evict_batch >= 0 && evict_batch != batch) {
+      LOG(INFO) << "[GRAPH] Evicting decode graph entry batch=" << evict_batch;
+      decode_graph_pool_.erase(evict_batch);
+    }
+  }
+
+  // 1. Persistent scratch with the real model dims (allocated OUTSIDE the
+  // capture so no cudaMalloc happens while the stream is capturing).
+  auto alloc = base::CUDADeviceAllocatorFactory::get_instance();
+  const bool is_qwen3 = model_type_ == base::ModelType::kModelTypeQwen3;
+  const int32_t m_hidden_dim = is_qwen3 ? config_->hidden_dim_ : config_->dim_;
+  const int32_t m_attn_dim = config_->dim_;
+  const int32_t m_ffn_dim = is_qwen3 ? config_->immediate_dim_ : config_->hidden_dim_;
+  entry->scratch->ensure(batch, m_hidden_dim, m_attn_dim, kv_dim, m_ffn_dim,
+                         config_->head_num_, config_->head_size_, max_seq_len,
+                         device_type_, alloc);
+
+  // 2. Stage the new inputs at stable host addresses. forward_batch uploads
+  // them to the device staging buffers, so the H2D copies become captured
+  // "upload nodes" and each graph replay re-reads the fresh host data.
+  tensor::Tensor& stage_ids = entry->scratch->input_ids;
+  tensor::Tensor& stage_pos = entry->scratch->positions;
+  tensor::Tensor& stage_off = entry->scratch->kv_offsets;
+  std::memcpy(stage_ids.ptr<int32_t>(), input_ids.ptr<int32_t>(), batch * sizeof(int32_t));
+  std::memcpy(stage_pos.ptr<int32_t>(), positions.ptr<int32_t>(), batch * sizeof(int32_t));
+  std::memcpy(stage_off.ptr<int32_t>(), kv_offsets.ptr<int32_t>(), batch * sizeof(int32_t));
+
+  entry->logits_view =
+      tensor::Tensor(base::DataType::kDataTypeFp32, batch, vocab_size(), false, nullptr,
+                     logits.ptr<float>());
+  entry->logits_view.set_device_type(base::DeviceType::kDeviceCUDA);
+
+  cudaStream_t stream = cuda_config_->stream;
+
+  if (entry->exec == nullptr && !entry->capture_failed) {
+    // 3. First call for this batch size: capture the decode kernels.
+    cudaError_t cap_err = cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal);
+    if (cap_err != cudaSuccess) {
+      entry->capture_failed = true;
+      LOG(WARNING) << "[GRAPH] cudaStreamBeginCapture failed (" << cudaGetErrorString(cap_err)
+                   << "); falling back to direct decode for batch=" << batch;
+      return forward_batch(stage_ids, stage_pos, stage_off, key_cache, value_cache,
+                           entry->logits_view, true, entry->scratch.get());
+    }
+
+    auto status = forward_batch(stage_ids, stage_pos, stage_off, key_cache, value_cache,
+                                entry->logits_view, true, entry->scratch.get());
+    cudaGraph_t graph = nullptr;
+    cap_err = cudaStreamEndCapture(stream, &graph);
+    if (cap_err != cudaSuccess || !status || graph == nullptr) {
+      entry->capture_failed = true;
+      if (graph) {
+        cudaGraphDestroy(graph);
+      }
+      // Drain the stream (the capture may have been invalidated mid-flight)
+      // and re-run directly so this step still produces logits.
+      cudaStreamSynchronize(stream);
+      cudaGetLastError();
+      LOG(WARNING) << "[GRAPH] Capture failed for batch=" << batch
+                   << "; falling back to direct decode.";
+      return forward_batch(stage_ids, stage_pos, stage_off, key_cache, value_cache,
+                           entry->logits_view, true, entry->scratch.get());
+    }
+
+    cap_err = cudaGraphInstantiate(&entry->exec, graph, 0);
+    cudaGraphDestroy(graph);
+    if (cap_err != cudaSuccess) {
+      entry->capture_failed = true;
+      LOG(WARNING) << "[GRAPH] cudaGraphInstantiate failed (" << cudaGetErrorString(cap_err)
+                   << "); falling back to direct decode for batch=" << batch;
+      return forward_batch(stage_ids, stage_pos, stage_off, key_cache, value_cache,
+                           entry->logits_view, true, entry->scratch.get());
+    }
+    LOG(INFO) << "[GRAPH] Captured decode graph for batch=" << batch;
+    return status;
+  }
+
+  if (entry->exec != nullptr) {
+    // 4. Replay: launch the captured decode graph (inputs staged in step 2).
+    cudaError_t launch_err = cudaGraphLaunch(entry->exec, stream);
+    if (launch_err != cudaSuccess) {
+      LOG(ERROR) << "[GRAPH] cudaGraphLaunch failed: " << cudaGetErrorString(launch_err);
+      return base::error::InternalError("CUDA graph launch failed for the decode step.");
+    }
+    return base::error::Success();
+  }
+
+  // capture_failed forever: direct batched forward with the stable scratch.
+  return forward_batch(stage_ids, stage_pos, stage_off, key_cache, value_cache,
+                       entry->logits_view, true, entry->scratch.get());
+}
 
 base::ModelType Model::model_type() const { return model_type_; }
 
@@ -260,47 +447,26 @@ base::Status Model::bind_external_kv_cache(const tensor::Tensor& key_cache,
   if (kv_bound_) {
     unbind_external_kv_cache();
   }
-  const int32_t num_layers = config_->layer_num_;
+  // The external cache now uses the head-dim-contiguous layout
+  // [num_layers, num_slots, kv_dim, max_seq_len]; the legacy single-sequence
+  // kernels index an internal [num_layers, seq, kv_dim] cache, which cannot
+  // be expressed as a flat view of the transposed external layout. Serving
+  // goes through forward_batch/decode_step (continuous batching), so this
+  // legacy bridge is no longer supported — fail loudly instead of silently
+  // mis-indexing the cache.
   const int32_t num_slots = key_cache.get_dim(1);
-  const int32_t max_seq_len = key_cache.get_dim(2);
-  const int32_t kv_dim = key_cache.get_dim(3);
-  if (num_layers != key_cache.get_dim(0) || kv_dim != config_->kv_dim_ ||
-      slot_id < 0 || slot_id >= num_slots ||
-      value_cache.get_dim(0) != num_layers || value_cache.get_dim(1) != num_slots ||
-      value_cache.get_dim(2) != max_seq_len || value_cache.get_dim(3) != kv_dim) {
-    return error::InvalidArgument("External KV cache shape or slot id out of range");
+  const int32_t kv_dim = key_cache.get_dim(2);
+  const int32_t max_seq_len = key_cache.get_dim(3);
+  if (key_cache.get_dim(0) != config_->layer_num_ || kv_dim != config_->kv_dim_ ||
+      value_cache.get_dim(0) != config_->layer_num_ || value_cache.get_dim(1) != num_slots ||
+      value_cache.get_dim(2) != kv_dim || value_cache.get_dim(3) != max_seq_len) {
+    return error::InvalidArgument("External KV cache shape out of range");
   }
-
-  // View shaped [num_layers, num_slots*max_seq_len, kv_dim] whose base pointer
-  // is the slot's first position. slice_kv_cache() and MHA derive their
-  // per-layer stride from get_dim(1), which then matches the external cache
-  // layout [layers, slots, seq_len, kv_dim]; within one prefill only rows
-  // [0, pos) of each layer are ever touched.
-  const int32_t slot_stride = max_seq_len * kv_dim;
-  float* key_base = const_cast<float*>(key_cache.ptr<float>(slot_id * slot_stride));
-  float* val_base = const_cast<float*>(value_cache.ptr<float>(slot_id * slot_stride));
-
-  tensor::Tensor key_view(DataType::kDataTypeFp32, num_layers, num_slots * max_seq_len,
-                          kv_dim, false, nullptr, key_base);
-  tensor::Tensor val_view(DataType::kDataTypeFp32, num_layers, num_slots * max_seq_len,
-                          kv_dim, false, nullptr, val_base);
-  key_view.set_device_type(device_type_);
-  val_view.set_device_type(device_type_);
-
-  // Prefill MHA now uses a per-head score stride of num_slots*max_seq_len;
-  // grow the shared score buffer if it no longer fits.
-  int64_t needed = static_cast<int64_t>(config_->head_num_) * num_slots * max_seq_len;
-  tensor::Tensor& score = buffers_.at(ModelBufferType::kScoreStorage);
-  if (static_cast<int64_t>(score.size()) < needed) {
-    score.reshape({config_->head_num_, static_cast<int32_t>(num_slots * max_seq_len)});
-  }
-
-  kv_key_backup_ = std::move(buffers_.at(ModelBufferType::kKeyCache));
-  kv_value_backup_ = std::move(buffers_.at(ModelBufferType::kValueCache));
-  buffers_.at(ModelBufferType::kKeyCache) = key_view;
-  buffers_.at(ModelBufferType::kValueCache) = val_view;
-  kv_bound_ = true;
-  return error::Success();
+  LOG(WARNING) << "bind_external_kv_cache is not supported with the head-dim-contiguous "
+                  "external KV layout; use the continuous-batching path (forward_batch / "
+                  "decode_step) instead.";
+  return error::InvalidArgument(
+      "Legacy external-KV binding is unsupported with the head-dim-contiguous cache layout.");
 }
 
 void Model::unbind_external_kv_cache() {

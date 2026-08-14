@@ -63,9 +63,14 @@ class CUDADeviceAllocator : public DeviceAllocator {
   void free_idle() const;
 
  private:
+  // Waterline above which release() flushes idle buffers: max(total_mem * 5%,
+  // 1GB), cached per device.
+  size_t idle_flush_threshold(int device_id) const;
+
   mutable std::map<int, size_t> no_busy_cnt_;
   mutable std::map<int, std::vector<CudaMemoryBuffer>> big_buffers_map_;
   mutable std::map<int, std::vector<CudaMemoryBuffer>> cuda_buffers_map_;
+  mutable std::map<int, size_t> idle_thresholds_;
 };
 
 class CPUDeviceAllocatorFactory {

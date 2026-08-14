@@ -21,15 +21,21 @@ base::Status EmbeddingLayer::check() const {
     return base::error::InvalidArgument("The number of input tensor is greater than seq len.");
   }
 
-  // Auto-detect batch from input dimensions
+  // Auto-detect batch from input dimensions. Tokens may live on the host
+  // (normal path) or on the device (CUDA-Graph path: the staged tokens are
+  // uploaded once and the embedding kernel reads them directly — accepting
+  // device input avoids a per-call clone inside the captured region).
+  const base::DeviceType token_device =
+      (device_type_ == base::DeviceType::kDeviceCUDA) ? input_tensor.device_type()
+                                                      : base::DeviceType::kDeviceCPU;
   int input_dims = input_tensor.dims_size();
   base::Status status;
   if (input_dims == 2) {
-    status = check_tensor_with_dim(input_tensor, base::DeviceType::kDeviceCPU,
+    status = check_tensor_with_dim(input_tensor, token_device,
                                     base::DataType::kDataTypeInt32,
                                     input_tensor.get_dim(0), input_tensor.get_dim(1));
   } else {
-    status = check_tensor_with_dim(input_tensor, base::DeviceType::kDeviceCPU,
+    status = check_tensor_with_dim(input_tensor, token_device,
                                     base::DataType::kDataTypeInt32, total_tokens);
   }
   if (!status) {

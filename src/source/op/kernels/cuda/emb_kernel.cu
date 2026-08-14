@@ -22,7 +22,11 @@ __global__ void emb_kernel_cu_fp32(int32_t vocab_size, int32_t token_num, int32_
 
 void emb_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight,
                    const tensor::Tensor& output, int32_t vocab_size, void* stream) {
-  tensor::Tensor input_cu;
+  // Shallow copy shares the buffer when the tokens already live on the
+  // device (CUDA-Graph path); host tokens are cloned and uploaded once.
+  // The old code left input_cu default-constructed for device input, which
+  // would pass a null pointer to the kernel.
+  tensor::Tensor input_cu = input;
   if (input.device_type() != base::DeviceType::kDeviceCUDA) {
     input_cu = input.clone();
     input_cu.to_cuda();
@@ -33,8 +37,10 @@ void emb_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight,
   CHECK(output.device_type() == base::DeviceType::kDeviceCUDA);
 
   constexpr int32_t thread_num = 128;
-  // Use actual token count for grid size, capped at 1024 for large batches
-  int32_t grid_size = std::min(input_num, 1024);
+  // One block per token. The old 1024-block cap silently dropped tokens of
+  // larger batches — the adaptive chunked prefill now sends up to 4096
+  // tokens per step, so the grid must cover the full input.
+  int32_t grid_size = input_num;
   int32_t* in_ptr = input_cu.ptr<int32_t>();
   float* wei_ptr = const_cast<float*>(weight.ptr<float>());
   float* out_ptr = const_cast<float*>(output.ptr<float>());

@@ -1,4 +1,5 @@
 #include <tensor/tensor.h>
+#include <cuda_runtime_api.h>
 #include <cub/block/block_reduce.cuh>
 #include "../kernels_interface.h"
 #include "matmul_kernel.cuh"
@@ -116,9 +117,38 @@ void matmul_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight,
   CHECK_EQ(output_size % K, 0);
   CHECK_EQ(batch, output_size / K);
 
-  int32_t total_rows = batch * K;
-  UNUSED(total_rows);
-  UNUSED(scale);
+  // Tensor-Core fast path (Ampere+): FP32 GEMM through TF32 via cublasGemmEx.
+  // Storage is row-major [batch, M] x [K, M] -> [batch, K]; reinterpreted as
+  // column-major that becomes C^T = W * A^T:
+  //   A' = weight [K, M] (col-major view = [M, K], lda = M), op = transpose
+  //   B' = input  [batch, M] (col-major view = [M, batch], ldb = M), op = N
+  //   C' = output [batch, K] (col-major view = [K, batch], ldc = K)
+  // The TF32 compute type runs on the tensor cores; the hand-written kernel
+  // below stays as the fallback for pre-Ampere devices and cublas errors.
+  if (config && input.data_type() == base::DataType::kDataTypeFp32 &&
+      weight.data_type() == base::DataType::kDataTypeFp32) {
+    static int cc_major = -1;
+    if (cc_major < 0) {
+      int dev = 0;
+      cudaGetDevice(&dev);
+      cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, dev);
+    }
+    if (cc_major >= 8) {
+      const float alpha = scale;
+      const float beta = 0.f;
+      cublasStatus_t st = cublasGemmEx(
+          config->cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N, K, batch, M, &alpha,
+          weight.ptr<float>(), CUDA_R_32F, M, input.ptr<float>(), CUDA_R_32F, M, &beta,
+          const_cast<float*>(output.ptr<float>()), CUDA_R_32F, K, CUBLAS_COMPUTE_32F_FAST_TF32,
+          CUBLAS_GEMM_DEFAULT);
+      if (st == CUBLAS_STATUS_SUCCESS) {
+        return;
+      }
+      LOG(WARNING) << "[MATMUL] cublasGemmEx TF32 failed (" << int(st)
+                   << "); falling back to the custom kernel.";
+    }
+  }
+
   if (config && config->stream) {
     matmul_kernel_cu_fp32<128><<<K, 128, 0, config->stream>>>(
         input.ptr<float>(), weight.ptr<float>(), const_cast<float*>(output.ptr<float>()), M, K,

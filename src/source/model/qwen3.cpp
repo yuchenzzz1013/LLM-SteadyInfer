@@ -7,6 +7,7 @@
 #include <sentencepiece_processor.h>
 #include <algorithm>
 #include <utility>
+#include "../op/kernels/cpu/mha_kernel.h"
 #include "../op/kernels/cpu/rope_kernel.h"
 #include "../op/kernels/cuda/mha_kernel.cuh"
 #include "../op/kernels/cuda/rope_kernel.cuh"
@@ -672,7 +673,8 @@ base::Status Qwen3Model::forward_batch(
     tensor::Tensor& key_cache,
     tensor::Tensor& value_cache,
     tensor::Tensor& logits,
-    bool need_logits) const {
+    bool need_logits,
+    BatchScratch* scratch) const {
   if (input_ids.is_empty()) {
     return base::error::InvalidArgument("The input_ids tensor is empty.");
   }
@@ -681,8 +683,10 @@ base::Status Qwen3Model::forward_batch(
   int32_t hidden_dim = config_->hidden_dim_;
   int32_t dim = config_->dim_;
   int32_t kv_dim = config_->kv_dim_;
-  int32_t max_seq_len = key_cache.get_dim(2);
+  // External KV cache, head-dim-contiguous: [layers, slots, kv_dim, max_seq_len]
   int32_t num_slots = key_cache.get_dim(1);
+  int32_t max_seq_len = key_cache.get_dim(3);
+  CHECK_EQ(key_cache.get_dim(2), kv_dim);
 
   std::shared_ptr<base::DeviceAllocator> alloc;
   if (device_type_ == base::DeviceType::kDeviceCPU) {
@@ -690,65 +694,108 @@ base::Status Qwen3Model::forward_batch(
   } else {
     alloc = base::CUDADeviceAllocatorFactory::get_instance();
   }
-  auto alloc_cpu = base::CPUDeviceAllocatorFactory::get_instance();
 
-  tensor::Tensor hidden(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
+  // Persistent scratch (CUDA-Graph decode path) or pooled allocation (prefill
+  // path). The scratch keeps stable addresses across steps so a captured
+  // graph always replays against the same memory.
+  tensor::Tensor hidden, rms_out, q_batch, key_batch, val_batch, mha_out_batch, attn_out,
+      ffn_norm_out, w1_out, w3_out, w2_out, partial_batch;
+  if (scratch) {
+    scratch->ensure(batch, hidden_dim, dim, kv_dim, config_->immediate_dim_,
+                    config_->head_num_, config_->head_size_, max_seq_len, device_type_, alloc);
+    hidden = scratch->hidden;
+    rms_out = scratch->rms_out;
+    q_batch = scratch->q_batch;
+    key_batch = scratch->key_batch;
+    val_batch = scratch->val_batch;
+    mha_out_batch = scratch->mha_out_batch;
+    attn_out = scratch->attn_out;
+    ffn_norm_out = scratch->ffn_norm_out;
+    w1_out = scratch->w1_out;
+    w3_out = scratch->w3_out;
+    w2_out = scratch->w2_out;
+    partial_batch = scratch->partial_batch;
+  } else {
+    hidden = tensor::Tensor(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
+    rms_out = tensor::Tensor(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
+    q_batch = tensor::Tensor(base::DataType::kDataTypeFp32, batch, dim, true, alloc);
+    mha_out_batch = tensor::Tensor(base::DataType::kDataTypeFp32, batch, dim, true, alloc);
+    attn_out = tensor::Tensor(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
+    ffn_norm_out = tensor::Tensor(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
+    w1_out = tensor::Tensor(base::DataType::kDataTypeFp32, batch, config_->immediate_dim_, true, alloc);
+    w3_out = tensor::Tensor(base::DataType::kDataTypeFp32, batch, config_->immediate_dim_, true, alloc);
+    w2_out = tensor::Tensor(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
+    key_batch = tensor::Tensor(base::DataType::kDataTypeFp32, batch, kv_dim, true, alloc);
+    val_batch = tensor::Tensor(base::DataType::kDataTypeFp32, batch, kv_dim, true, alloc);
+    if (device_type_ == base::DeviceType::kDeviceCUDA) {
+      int32_t num_splits = kernel::flash_decoding_num_splits(max_seq_len);
+      partial_batch = tensor::Tensor(
+          base::DataType::kDataTypeFp32,
+          static_cast<int64_t>(batch) * config_->head_num_ * num_splits *
+              (config_->head_size_ + 2),
+          true, alloc);
+    }
+  }
 
   // 1. Embedding
   {
     const auto& emb_layer = qwen_layers_->embedding_layer_;
-    tensor::Tensor input_token_num(base::DataType::kDataTypeInt32, batch);
-    std::dynamic_pointer_cast<op::EmbeddingLayer>(emb_layer)->set_batch_size(batch);
-    tensor::Tensor tokens_cpu = input_ids;
-    if (tokens_cpu.device_type() != base::DeviceType::kDeviceCPU) {
-      tokens_cpu = input_ids.clone();
+    tensor::Tensor input_token_num;
+    if (scratch) {
+      input_token_num = scratch->input_token_num;
+    } else {
+      input_token_num = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true,
+                                       base::CPUDeviceAllocatorFactory::get_instance());
     }
-    STATUS_CHECK(emb_layer->forward(tokens_cpu, input_token_num, hidden));
+    std::dynamic_pointer_cast<op::EmbeddingLayer>(emb_layer)->set_batch_size(batch);
+    tensor::Tensor tokens = input_ids;
+    if (device_type_ == base::DeviceType::kDeviceCUDA && scratch) {
+      // Upload the stable host staging buffer into the device staging tensor.
+      // Captured as a graph upload node on the first call, re-executed with
+      // the fresh host data on every replay.
+      cudaMemcpyAsync(scratch->tokens_cu.ptr<int32_t>(), input_ids.ptr<int32_t>(),
+                      batch * sizeof(int32_t), cudaMemcpyHostToDevice, cuda_config_->stream);
+      tokens = scratch->tokens_cu;
+    }
+    STATUS_CHECK(emb_layer->forward(tokens, input_token_num, hidden));
   }
 
   // 2. Per-layer processing
-  // Pre-allocate reusable tensors outside the layer loop to avoid accumulating
-  // per-layer temporary buffers.
-  tensor::Tensor rms_out(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
-  tensor::Tensor q_batch(base::DataType::kDataTypeFp32, batch, dim, true, alloc);
-  tensor::Tensor mha_out_batch(base::DataType::kDataTypeFp32, batch, dim, true, alloc);
-  tensor::Tensor attn_out(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
-  tensor::Tensor ffn_norm_out(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
-  tensor::Tensor w1_out(base::DataType::kDataTypeFp32, batch, config_->immediate_dim_, true, alloc);
-  tensor::Tensor w3_out(base::DataType::kDataTypeFp32, batch, config_->immediate_dim_, true, alloc);
-  tensor::Tensor w2_out(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
-
-  // Batched K/V intermediates, MHA score scratch and device copies of
-  // positions/kv_offsets for the CUDA decode path.
-  tensor::Tensor key_batch;
-  tensor::Tensor val_batch;
-  tensor::Tensor score_batch;
+  // Device copies of positions/kv_offsets for the CUDA kernels. In scratch
+  // mode these uploads are captured into the graph too.
   tensor::Tensor positions_cu;
   tensor::Tensor kv_offsets_cu;
   if (device_type_ == base::DeviceType::kDeviceCUDA) {
-    key_batch = tensor::Tensor(base::DataType::kDataTypeFp32, batch, kv_dim, true, alloc);
-    val_batch = tensor::Tensor(base::DataType::kDataTypeFp32, batch, kv_dim, true, alloc);
-    score_batch = tensor::Tensor(base::DataType::kDataTypeFp32, batch * config_->head_num_,
-                                 max_seq_len, true, alloc);
-    positions_cu = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc);
-    kv_offsets_cu = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc);
-    // positions/kv_offsets live on the host; the batched kernels read device copies.
-    cudaMemcpyAsync(const_cast<int32_t*>(positions_cu.ptr<int32_t>()),
-                    positions.ptr<int32_t>(), batch * sizeof(int32_t), cudaMemcpyHostToDevice,
-                    cuda_config_->stream);
-    cudaMemcpyAsync(const_cast<int32_t*>(kv_offsets_cu.ptr<int32_t>()),
-                    kv_offsets.ptr<int32_t>(), batch * sizeof(int32_t), cudaMemcpyHostToDevice,
-                    cuda_config_->stream);
+    if (scratch) {
+      cudaMemcpyAsync(scratch->positions_cu.ptr<int32_t>(), positions.ptr<int32_t>(),
+                      batch * sizeof(int32_t), cudaMemcpyHostToDevice, cuda_config_->stream);
+      cudaMemcpyAsync(scratch->kv_offsets_cu.ptr<int32_t>(), kv_offsets.ptr<int32_t>(),
+                      batch * sizeof(int32_t), cudaMemcpyHostToDevice, cuda_config_->stream);
+      positions_cu = scratch->positions_cu;
+      kv_offsets_cu = scratch->kv_offsets_cu;
+    } else {
+      positions_cu = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc);
+      kv_offsets_cu = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc);
+      cudaMemcpyAsync(const_cast<int32_t*>(positions_cu.ptr<int32_t>()),
+                      positions.ptr<int32_t>(), batch * sizeof(int32_t), cudaMemcpyHostToDevice,
+                      cuda_config_->stream);
+      cudaMemcpyAsync(const_cast<int32_t*>(kv_offsets_cu.ptr<int32_t>()),
+                      kv_offsets.ptr<int32_t>(), batch * sizeof(int32_t), cudaMemcpyHostToDevice,
+                      cuda_config_->stream);
+    }
   }
 
-  // Bounds check once for the whole batch (was repeated per layer).
-  for (int32_t b = 0; b < batch; ++b) {
-    if (positions.ptr<int32_t>()[b] >= max_seq_len) {
-      LOG(ERROR) << "forward_batch: position " << positions.ptr<int32_t>()[b]
-                 << " exceeds max_seq_len " << max_seq_len
-                 << " for slot " << kv_offsets.ptr<int32_t>()[b];
-      return base::error::InvalidArgument(
-          "Position exceeds KV cache capacity. Increase max_seq_len.");
+  // Bounds check once for the whole batch (host tensors only — the graph path
+  // validates its staged inputs in decode_step).
+  if (positions.device_type() == base::DeviceType::kDeviceCPU) {
+    for (int32_t b = 0; b < batch; ++b) {
+      if (positions.ptr<int32_t>()[b] >= max_seq_len) {
+        LOG(ERROR) << "forward_batch: position " << positions.ptr<int32_t>()[b]
+                   << " exceeds max_seq_len " << max_seq_len
+                   << " for slot " << kv_offsets.ptr<int32_t>()[b];
+        return base::error::InvalidArgument(
+            "Position exceeds KV cache capacity. Increase max_seq_len.");
+      }
     }
   }
 
@@ -806,99 +853,72 @@ base::Status Qwen3Model::forward_batch(
                                    cuda_config_->stream);
 
       // Write this layer's K/V rows into each sequence's KV cache slot
+      // (head-dim-contiguous layout: cache[layer][slot][d][pos]).
       kernel::kv_scatter_cu(key_batch, key_cache, kv_offsets_cu, positions_cu, kv_dim, num_slots,
                             max_seq_len, layer_idx, cuda_config_->stream);
       kernel::kv_scatter_cu(val_batch, value_cache, kv_offsets_cu, positions_cu, kv_dim, num_slots,
                             max_seq_len, layer_idx, cuda_config_->stream);
 
-      // f. MHA: one launch per layer for the whole batch
+      // f. MHA: Flash Decoding — split-KV pass + reduce pass, one launch pair
+      // per layer for the whole batch.
       kernel::mha_kernel_cu_batch(config_->head_num_, layer_idx, num_slots, max_seq_len, kv_dim,
                                   config_->kv_head_num_, config_->head_size_, positions_cu,
-                                  kv_offsets_cu, q_batch, score_batch, mha_out_batch, key_cache,
+                                  kv_offsets_cu, q_batch, partial_batch, mha_out_batch, key_cache,
                                   value_cache, cuda_config_.get());
     } else {
-      // CPU path: per-sequence K/V projection + RoPE, writing directly into
-      // each sequence's KV cache slot.
-      for (int32_t b = 0; b < batch; ++b) {
-        int32_t pos = positions.ptr<int32_t>()[b];
-        int32_t slot = kv_offsets.ptr<int32_t>()[b];
-
-        int32_t slot_offset = layer_idx * num_slots * max_seq_len * kv_dim +
-                              slot * max_seq_len * kv_dim + pos * kv_dim;
-
-        float* key_cache_ptr = const_cast<float*>(key_cache.ptr<float>(slot_offset));
-        float* value_cache_ptr = const_cast<float*>(value_cache.ptr<float>(slot_offset));
-
-        tensor::Tensor key_slot(base::DataType::kDataTypeFp32, kv_dim, false, nullptr, key_cache_ptr);
-        tensor::Tensor val_slot(base::DataType::kDataTypeFp32, kv_dim, false, nullptr, value_cache_ptr);
-        key_slot.set_device_type(device_type_);
-        val_slot.set_device_type(device_type_);
-
-        tensor::Tensor rms_view(base::DataType::kDataTypeFp32, hidden_dim, false, nullptr,
-                                rms_out.ptr<float>(b * hidden_dim));
-        rms_view.set_device_type(device_type_);
-
-        auto& wk = qwen_layers_->wk_layers_.at(layer_idx);
-        STATUS_CHECK(wk->forward(rms_view, key_slot));
-
-        // K norm (Qwen3 specific) — apply per-head RMSNorm
-        {
-          int32_t kv_head_num = config_->kv_head_num_;
-          key_slot.reshape({kv_head_num, config_->head_size_});
-          auto& k_norm = qwen_layers_->rmsnorm_layers_.at(3 * config_->layer_num_ + 1 + layer_idx);
-          STATUS_CHECK(k_norm->forward(key_slot, key_slot));
-          key_slot.reshape({kv_dim});
-        }
-
-        auto& wv = qwen_layers_->wv_layers_.at(layer_idx);
-        STATUS_CHECK(wv->forward(rms_view, val_slot));
-
-        tensor::Tensor q_view(base::DataType::kDataTypeFp32, dim, false, nullptr,
-                              q_batch.ptr<float>(b * dim));
-        q_view.set_device_type(device_type_);
-
-        tensor::Tensor pos_tensor(base::DataType::kDataTypeInt32, 1, true, alloc_cpu);
-        pos_tensor.index<int32_t>(0) = pos;
-
-        STATUS_CHECK(qwen_layers_->rope_layer_->forward(
-            q_view, key_slot, pos_tensor,
-            get_buffer(ModelBufferType::kSinCache),
-            get_buffer(ModelBufferType::kCosCache), tensor::Tensor{}));
-      }
-
-      // f. MHA: per-sequence
+      // CPU path: batched K/V GEMM (one GEMM per weight matrix, NOT a
+      // per-sequence loop), batched Qwen3 K-norm, batched RoPE, then scatter
+      // into the head-dim-contiguous cache and a batched OpenMP attention.
       {
-        auto mha_layer = std::dynamic_pointer_cast<op::MultiHeadAttention>(qwen_layers_->mha_layer_);
+        auto& wk = qwen_layers_->wk_layers_.at(layer_idx);
+        std::dynamic_pointer_cast<op::MatmulLayer>(wk)->set_batch_size(batch);
+        STATUS_CHECK(wk->forward(rms_out, key_batch));
+      }
+
+      // K norm (Qwen3 specific) — per-head RMSNorm over the whole batch
+      {
+        int32_t kv_head_num = config_->kv_head_num_;
+        key_batch.reshape({batch * kv_head_num, config_->head_size_});
+        auto& k_norm = qwen_layers_->rmsnorm_layers_.at(3 * config_->layer_num_ + 1 + layer_idx);
+        STATUS_CHECK(k_norm->forward(key_batch, key_batch));
+        key_batch.reshape({batch, kv_dim});
+      }
+
+      {
+        auto& wv = qwen_layers_->wv_layers_.at(layer_idx);
+        std::dynamic_pointer_cast<op::MatmulLayer>(wv)->set_batch_size(batch);
+        STATUS_CHECK(wv->forward(rms_out, val_batch));
+      }
+
+      kernel::rope_kernel_cpu_batch(dim, kv_dim, config_->head_size_, q_batch, key_batch,
+                                    positions, get_buffer(ModelBufferType::kSinCache),
+                                    get_buffer(ModelBufferType::kCosCache), nullptr);
+
+      // Scatter K/V rows into the external cache:
+      //   cache[layer][slot][d][pos] = key_batch[b][d]
+      {
+        const float* k_ptr = key_batch.ptr<float>();
+        const float* v_ptr = val_batch.ptr<float>();
+        float* kcache = const_cast<float*>(key_cache.ptr<float>());
+        float* vcache = const_cast<float*>(value_cache.ptr<float>());
+        const int64_t layer_base = static_cast<int64_t>(layer_idx) * num_slots * kv_dim * max_seq_len;
+#pragma omp parallel for schedule(static)
         for (int32_t b = 0; b < batch; ++b) {
-          int32_t pos = positions.ptr<int32_t>()[b];
-          int32_t slot = kv_offsets.ptr<int32_t>()[b];
-
-          tensor::Tensor q_single(base::DataType::kDataTypeFp32, dim, false, nullptr,
-                                  q_batch.ptr<float>(b * dim));
-          q_single.set_device_type(device_type_);
-
-          // Create KV cache views for this slot, sized to the actual valid
-          // prefix length (pos + 1) instead of the full slot capacity.
-          int32_t slot_base = layer_idx * num_slots * max_seq_len * kv_dim +
-                              slot * max_seq_len * kv_dim;
-          tensor::Tensor key_view(base::DataType::kDataTypeFp32, pos + 1, kv_dim, false, nullptr,
-                                  const_cast<float*>(key_cache.ptr<float>(slot_base)));
-          tensor::Tensor val_view(base::DataType::kDataTypeFp32, pos + 1, kv_dim, false, nullptr,
-                                  const_cast<float*>(value_cache.ptr<float>(slot_base)));
-          key_view.set_device_type(device_type_);
-          val_view.set_device_type(device_type_);
-
-          tensor::Tensor score_storage = get_buffer(ModelBufferType::kScoreStorage);
-          tensor::Tensor mha_out_single(base::DataType::kDataTypeFp32, dim, false, nullptr,
-                                        mha_out_batch.ptr<float>(b * dim));
-          mha_out_single.set_device_type(device_type_);
-
-          mha_layer->set_pos(pos);
-          mha_layer->set_layer_idx(0);
-          STATUS_CHECK(qwen_layers_->mha_layer_->forward(
-              q_single, score_storage, key_view, val_view, mha_out_single));
+          const int32_t pos = positions.ptr<int32_t>()[b];
+          const int32_t slot = kv_offsets.ptr<int32_t>()[b];
+          const int64_t slot_base = layer_base + static_cast<int64_t>(slot) * kv_dim * max_seq_len;
+          for (int32_t d = 0; d < kv_dim; ++d) {
+            const int64_t dst = slot_base + static_cast<int64_t>(d) * max_seq_len + pos;
+            kcache[dst] = k_ptr[static_cast<int64_t>(b) * kv_dim + d];
+            vcache[dst] = v_ptr[static_cast<int64_t>(b) * kv_dim + d];
+          }
         }
       }
+
+      // f. MHA: batched OpenMP attention (one task per (batch, head)).
+      kernel::mha_kernel_cpu_batch(config_->head_num_, layer_idx, num_slots, max_seq_len, kv_dim,
+                                   config_->kv_head_num_, config_->head_size_, positions,
+                                   kv_offsets, q_batch, mha_out_batch, key_cache, value_cache);
     }
 
     // g. WO projection: [batch, dim] -> [batch, hidden_dim]

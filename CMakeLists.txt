@@ -76,6 +76,10 @@ endif()
 find_package(glog REQUIRED)
 find_package(Armadillo REQUIRED)
 
+# OpenMP: the CPU continuous-batching path (P0) parallelizes batched GEMM,
+# RoPE and attention over sequences/heads.
+find_package(OpenMP QUIET)
+
 aux_source_directory(src/source/tensor/ DIR_TENSOR)
 aux_source_directory(src/source/base/ DIR_BASE)
 aux_source_directory(src/source/op/ DIR_OP)
@@ -89,7 +93,10 @@ aux_source_directory(src/source/sampler DIR_SAMPLE)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/lib)
 
 add_library(llama SHARED ${DIR_TENSOR} ${DIR_BASE} ${DIR_OP} ${DIR_KERNEL} ${DIR_MODEL} ${DIR_KERNEL_CPU} ${DIR_KERNEL_CUDA} ${DIR_KERNEL} ${DIR_SAMPLE} ${DIR_SCHEDULER})
-target_link_libraries(llama sentencepiece glog::glog pthread cudart armadillo)
+target_link_libraries(llama sentencepiece glog::glog pthread cudart cublas armadillo)
+if(OpenMP_CXX_FOUND)
+  target_link_libraries(llama OpenMP::OpenMP_CXX)
+endif()
 target_link_directories(llama PUBLIC ${CMAKE_CUDA_COMPILER_LIBRARY_ROOT}/lib64)
 
 target_include_directories(llama PUBLIC ${glog_INCLUDE_DIR})

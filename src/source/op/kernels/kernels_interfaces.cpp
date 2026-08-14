@@ -125,6 +125,8 @@ RMSNormKernel get_rmsnorm_kernel(base::DeviceType device_type) {
 RMSNormKernelDim get_rmsnorm_dim_kernel(base::DeviceType device_type) {
   if (device_type == base::DeviceType::kDeviceCUDA) {
     return rmsnorm_kernel_cu_dim;
+  } else if (device_type == base::DeviceType::kDeviceCPU) {
+    return rmsnorm_kernel_cpu_dim;
   } else {
     LOG(FATAL) << "Unknown device type for get a rmsnorm dim kernel.";
     return nullptr;
