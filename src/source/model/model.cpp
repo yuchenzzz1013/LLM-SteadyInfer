@@ -143,6 +143,27 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
 
   cudaStream_t stream = cuda_config_->stream;
 
+  // Validate the Scheduler-owned pointers baked into the graph at capture
+  // time. KV caches and the logits buffer belong to the Scheduler instance;
+  // after the Scheduler is destroyed and a new one created (benchmark
+  // warm-up/iteration patterns), replaying the old graph would touch freed
+  // memory (illegal memory access). Destroy the stale graph so the capture
+  // path below re-captures against the current buffers.
+  if (entry->exec != nullptr &&
+      (entry->captured_key_ptr != key_cache.ptr<float>() ||
+       entry->captured_value_ptr != value_cache.ptr<float>() ||
+       entry->captured_logits_ptr != logits.ptr<float>() ||
+       entry->captured_key_slots != num_slots ||
+       entry->captured_key_seq_len != max_seq_len)) {
+    LOG(INFO) << "[GRAPH] Decode graph batch=" << batch
+              << " references stale KV/logits buffers; destroying and re-capturing.";
+    cudaGraphExecDestroy(entry->exec);
+    entry->exec = nullptr;
+    // 让流上空闲后再重新捕获,提高 BeginCapture 成功率(发生在压测边界,
+    // 同步开销可忽略)。
+    cudaStreamSynchronize(stream);
+  }
+
   if (entry->exec == nullptr && !entry->capture_failed) {
     // 3. First call for this batch size: capture the decode kernels.
     cudaError_t cap_err = cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal);
@@ -182,6 +203,13 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
       return forward_batch(stage_ids, stage_pos, stage_off, key_cache, value_cache,
                            entry->logits_view, true, entry->scratch.get());
     }
+    // Snapshot the Scheduler-owned buffers baked into the graph; replay is
+    // validated against these on every subsequent decode step.
+    entry->captured_key_ptr = key_cache.ptr<float>();
+    entry->captured_value_ptr = value_cache.ptr<float>();
+    entry->captured_logits_ptr = logits.ptr<float>();
+    entry->captured_key_slots = num_slots;
+    entry->captured_key_seq_len = max_seq_len;
     LOG(INFO) << "[GRAPH] Captured decode graph for batch=" << batch;
     return status;
   }
@@ -527,6 +555,16 @@ void Model::resize_internal_kv_cache(int32_t max_seq_len) {
   if (max_seq_len <= 0) return;
   // Drop any stale external-slot views before touching the real internal cache.
   unbind_external_kv_cache();
+
+  // Any captured decode graph may reference the old internal buffers
+  // (single-sequence prefill path); invalidate the pool so the next decode
+  // re-captures against the resized cache. Cheap: resize happens at
+  // benchmark setup time, not per decode step.
+  if (!decode_graph_pool_.empty()) {
+    LOG(INFO) << "[GRAPH] Internal KV cache resized; invalidating "
+              << decode_graph_pool_.size() << " captured decode graph(s).";
+    decode_graph_pool_.clear();
+  }
 
   auto alloc = (device_type_ == base::DeviceType::kDeviceCUDA)
       ? std::shared_ptr<base::DeviceAllocator>(base::CUDADeviceAllocatorFactory::get_instance())

@@ -51,6 +51,7 @@ Scheduler::Scheduler(std::shared_ptr<model::Model> model,
 int Scheduler::add_request(const std::vector<int>& prompt_tokens) {
   Sequence seq;
   seq.id = next_seq_id_++;
+  seq.arrival_time = std::chrono::steady_clock::now();
   seq.prompt_tokens = prompt_tokens;
   seq.num_prompt_tokens = static_cast<int>(prompt_tokens.size());
 
@@ -371,7 +372,13 @@ void Scheduler::execute_batch(const std::vector<Sequence*>& batch) {
     for (int i = 0; i < batch_size; ++i) {
       if (batch[i]->generated_tokens.empty()) {
         batch[i]->first_token_time = now;
+      } else {
+        // ITL: 距上一个生成 token 的间隔(在线压测指标)
+        double itl_ms = std::chrono::duration<double, std::milli>(
+                            now - batch[i]->last_token_time).count();
+        batch[i]->token_timestamps_ms.push_back(itl_ms);
       }
+      batch[i]->last_token_time = now;
       batch[i]->generated_tokens.push_back(next_tokens[i]);
       batch[i]->num_generated_tokens++;
     }

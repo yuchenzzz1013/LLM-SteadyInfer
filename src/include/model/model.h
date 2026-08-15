@@ -51,6 +51,18 @@ struct CudaGraphDecodeEntry {
   std::unique_ptr<BatchScratch> scratch;
   tensor::Tensor logits_view;  // [batch, vocab] view into the scheduler's logits buffer
 
+  // Snapshot of the Scheduler-owned buffers baked into the graph at capture
+  // time. The KV caches (KVManager) and the logits buffer belong to the
+  // Scheduler instance; when a new Scheduler is created the addresses (and
+  // possibly shapes) change, so replaying a graph captured against a dead
+  // Scheduler would touch freed memory (illegal memory access). decode_step
+  // compares these before every replay and re-captures on mismatch.
+  const void* captured_key_ptr = nullptr;
+  const void* captured_value_ptr = nullptr;
+  const void* captured_logits_ptr = nullptr;
+  int32_t captured_key_slots = 0;
+  int32_t captured_key_seq_len = 0;
+
   ~CudaGraphDecodeEntry() {
     if (exec) {
       cudaGraphExecDestroy(exec);

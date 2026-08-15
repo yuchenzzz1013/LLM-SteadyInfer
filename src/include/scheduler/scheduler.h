@@ -34,6 +34,9 @@ class Scheduler {
   int get_busy_kv_slots() const;
   int get_max_kv_seq_len() const;
 
+  // 等待队列长度(在线压测的排队指标)
+  int num_waiting() const { return static_cast<int>(waiting_queue_.size()); }
+
  private:
   void try_admit_sequences();
   std::vector<Sequence*> select_sequences();

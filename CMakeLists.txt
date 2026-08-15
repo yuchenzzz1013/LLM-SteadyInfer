@@ -114,4 +114,5 @@ if(USE_CPM)
 endif()
 
 set_target_properties(llama PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+# 统一基准目录:benchmark_llama/qwen2/qwen3 + offline_batch_benchmark
 add_subdirectory(benchmark)

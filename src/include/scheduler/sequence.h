@@ -20,6 +20,7 @@ struct Sequence {
   int max_gen_len = 2048;
 
   // Per-request latency tracking
+  TimePoint arrival_time;            // When the request was submitted (add_request)
   TimePoint admit_time;              // When the request entered running set
   TimePoint first_token_time;        // When first token was generated
   TimePoint last_token_time;         // When last token was generated (for ITL)
