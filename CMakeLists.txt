@@ -29,6 +29,16 @@ if (QWEN3_SUPPORT)
   message(STATUS "QWEN3 SUPPORT")
   add_definitions(-DQWEN3_SUPPORT)
 endif()
+
+# vLLM-style paged attention: block-allocated KV cache
+# [num_layers, num_blocks, block_size, kv_dim] + block_table indirection.
+# OFF keeps the legacy continuous layout [num_layers, max_batch, kv_dim,
+# max_seq_len] for A/B comparison.
+option(USE_PAGED_ATTENTION "Use paged KV layout and PagedAttention kernels" ON)
+if (USE_PAGED_ATTENTION)
+  message(STATUS "PAGED ATTENTION ENABLED")
+  add_definitions(-DUSE_PAGED_ATTENTION)
+endif()
 # ---- Add dependencies via CPM ----
 # see https://github.com/TheLartians/CPM.cmake for more info
 option(USE_CPM "Use CPM for dependency management" OFF)

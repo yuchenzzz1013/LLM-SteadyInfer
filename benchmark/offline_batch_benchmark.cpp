@@ -191,8 +191,10 @@ static RunMetrics run_once(const std::shared_ptr<model::Model>& model,
 
   // 根据实际 prompt 长度确定 KV slot 大小,避免按模型全长分配导致碎片率虚高
   int max_prompt_len = 0;
+  long long prompt_len_sum = 0;
   for (const auto& t : prompt_tokens) {
     max_prompt_len = std::max(max_prompt_len, static_cast<int>(t.size()));
+    prompt_len_sum += t.size();
   }
   int max_total_seq_len =
       std::min(max_prompt_len + max_gen_len, static_cast<int>(model->seq_len()));
@@ -204,7 +206,11 @@ static RunMetrics run_once(const std::shared_ptr<model::Model>& model,
   // 访问已释放内存(illegal memory access)。
   model->resize_internal_kv_cache(max_prompt_len);
 
-  Scheduler sched(model, max_batch, max_total_seq_len, max_gen_len);
+  // 分页块大小按工作负载平均 prompt 长度自适应(短文本 8/长文本 32/默认 16)。
+  const long long avg_prompt_len =
+      prompt_tokens.empty() ? 0 : prompt_len_sum / static_cast<long long>(prompt_tokens.size());
+  Scheduler sched(model, max_batch, max_total_seq_len, max_gen_len,
+                  Scheduler::resolve_block_size(avg_prompt_len));
 
   // ---- 预热:与正式压测共用同一 Scheduler ----
   // decode CUDA graph 在首次 decode 时捕获并烘焙当时 KV/logits 的设备指针;
@@ -249,7 +255,14 @@ static RunMetrics run_once(const std::shared_ptr<model::Model>& model,
         used += static_cast<long long>(s.num_prompt_tokens) + s.num_generated_tokens;
       }
       used_cap_sum += used;
-      alloc_cap_sum += static_cast<long long>(busy) * max_total_seq_len;
+      {
+        // Paged: truthful reservation = allocated blocks x block_size (lazy
+        // growth); continuous layout falls back to busy slots x capacity.
+        long long alloc_tokens = sched.get_allocated_kv_tokens();
+        alloc_cap_sum += alloc_tokens > 0
+                             ? alloc_tokens
+                             : static_cast<long long>(busy) * max_total_seq_len;
+      }
       busy_slots_sum += busy;
       running_sum += running.size();
       peak_busy = std::max(peak_busy, busy);

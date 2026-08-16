@@ -19,6 +19,15 @@ struct LLamaLayers {
   std::vector<std::shared_ptr<op::Layer>> wv_layers_;
   std::vector<std::shared_ptr<op::Layer>> wo_layers_;
 
+  // Fused QKV projection (M3): one GEMM with the stacked weight
+  // [dim + 2*kv_dim, dim] instead of three (LLaMA has no QKV bias).
+  // The *_src_ tensors keep the fused weight buffers alive (set_weight
+  // stores a non-owning external view into them).
+  bool fused_qkv_enabled_ = false;
+  std::vector<std::shared_ptr<op::Layer>> fused_qkv_layers_;
+  std::vector<tensor::Tensor> fused_qkv_weight_src_;
+  std::vector<tensor::Tensor> fused_qkv_bias_src_;
+
   std::vector<std::shared_ptr<op::Layer>> w1_layers_;
   std::vector<std::shared_ptr<op::Layer>> w2_layers_;
   std::vector<std::shared_ptr<op::Layer>> rmsnorm_layers_;
@@ -46,7 +55,7 @@ class LLamaModel : public Model {
   base::Status forward_batch(
       const tensor::Tensor& input_ids,
       const tensor::Tensor& positions,
-      const tensor::Tensor& kv_offsets,
+      const tensor::Tensor& block_table,
       tensor::Tensor& key_cache,
       tensor::Tensor& value_cache,
       tensor::Tensor& logits,
@@ -67,6 +76,10 @@ class LLamaModel : public Model {
   void create_nonparam_layers() override;
 
   void create_param_quant_layers() override;
+
+  // Build the fused QKV MatmulLayers from the (already device-resident)
+  // wq/wk/wv weights. Must run after LLamaLayers::to_cuda in init_mem.
+  void build_fused_qkv_layers();
 
   void attention_mha(int32_t layer_idx, const tensor::Tensor& pos_tensor) const;
 

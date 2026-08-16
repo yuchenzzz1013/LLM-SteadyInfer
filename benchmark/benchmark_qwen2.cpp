@@ -57,10 +57,12 @@ BenchmarkResult benchmark_batch(std::shared_ptr<model::Model> model,
   // Compute KV cache slot size from actual prompt lengths + max_gen_len
   // instead of the model's full seq_len (e.g. 32768) to avoid >95% fragmentation.
   int max_prompt_len = 0;
+  long long prompt_len_sum = 0;
   for (int i = 0; i < num_requests; ++i) {
     const std::string& prompt = prompts[i % prompts.size()];
     auto tokens = model->encode(prompt);
     if (!tokens.empty()) max_prompt_len = std::max(max_prompt_len, (int)tokens.size());
+    prompt_len_sum += tokens.size();
   }
   int max_total_seq_len = max_prompt_len + max_gen_len;
   LOG(INFO) << "[BENCH] KV slot size: max_prompt=" << max_prompt_len
@@ -70,7 +72,12 @@ BenchmarkResult benchmark_batch(std::shared_ptr<model::Model> model,
   // (e.g. 32768 * 768 MB) down to max_prompt_len (e.g. ~100 * few MB).
   model->resize_internal_kv_cache(max_prompt_len);
 
-  scheduler::Scheduler sched(model, max_batch_size, max_total_seq_len, max_gen_len);
+  // Paged block size adapts to the workload's average prompt length
+  // (short 8 / default 16 / long 32).
+  const long long avg_prompt_len =
+      num_requests > 0 ? prompt_len_sum / num_requests : 0;
+  scheduler::Scheduler sched(model, max_batch_size, max_total_seq_len, max_gen_len,
+                             scheduler::Scheduler::resolve_block_size(avg_prompt_len));
 
   for (int i = 0; i < num_requests; ++i) {
     const std::string& prompt = prompts[i % prompts.size()];

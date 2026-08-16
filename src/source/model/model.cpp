@@ -26,12 +26,15 @@ Model::Model(base::TokenizerType tokenizer_type, base::ModelType model_type, std
 
 void BatchScratch::ensure(int32_t batch, int32_t hidden_dim, int32_t dim, int32_t kv_dim,
                           int32_t ffn_dim, int32_t head_num, int32_t head_size,
-                          int32_t max_seq_len, base::DeviceType device,
+                          int32_t max_seq_len, int32_t block_table_stride,
+                          base::DeviceType device,
                           const std::shared_ptr<base::DeviceAllocator>& alloc) {
-  if (this->batch == batch && !hidden.is_empty() && hidden.get_dim(0) == batch) {
+  if (this->batch == batch && !hidden.is_empty() && hidden.get_dim(0) == batch &&
+      this->block_table_stride == block_table_stride) {
     return;
   }
   this->batch = batch;
+  this->block_table_stride = block_table_stride;
 
   hidden = tensor::Tensor(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
   rms_out = tensor::Tensor(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
@@ -44,11 +47,15 @@ void BatchScratch::ensure(int32_t batch, int32_t hidden_dim, int32_t dim, int32_
   w2_out = tensor::Tensor(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
   key_batch = tensor::Tensor(base::DataType::kDataTypeFp32, batch, kv_dim, true, alloc);
   val_batch = tensor::Tensor(base::DataType::kDataTypeFp32, batch, kv_dim, true, alloc);
+  // Fused QKV output [batch, dim + 2*kv_dim] — allocated unconditionally so
+  // the fused path never re-allocates (and CUDA graphs stay capture-safe).
+  qkv_out = tensor::Tensor(base::DataType::kDataTypeFp32, batch, dim + 2 * kv_dim, true, alloc);
 
   auto alloc_cpu = base::CPUDeviceAllocatorFactory::get_instance();
   input_ids = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc_cpu);
   positions = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc_cpu);
-  kv_offsets = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc_cpu);
+  block_table = tensor::Tensor(base::DataType::kDataTypeInt32, batch, block_table_stride,
+                               true, alloc_cpu);
   input_token_num = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc_cpu);
 
   if (device == base::DeviceType::kDeviceCUDA) {
@@ -59,35 +66,49 @@ void BatchScratch::ensure(int32_t batch, int32_t hidden_dim, int32_t dim, int32_
                                    true, alloc);
     tokens_cu = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc);
     positions_cu = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc);
-    kv_offsets_cu = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc);
+    block_table_cu = tensor::Tensor(base::DataType::kDataTypeInt32, batch, block_table_stride,
+                                    true, alloc);
   }
 }
 
 base::Status Model::decode_step(const tensor::Tensor& input_ids,
                                 const tensor::Tensor& positions,
-                                const tensor::Tensor& kv_offsets,
+                                const tensor::Tensor& block_table,
                                 tensor::Tensor& key_cache,
                                 tensor::Tensor& value_cache,
                                 tensor::Tensor& logits) {
   const bool use_graph = device_type_ == base::DeviceType::kDeviceCUDA && use_cuda_graphs_;
   if (!use_graph) {
-    return forward_batch(input_ids, positions, kv_offsets, key_cache, value_cache, logits, true);
+    return forward_batch(input_ids, positions, block_table, key_cache, value_cache, logits, true);
   }
 
   const int32_t batch = input_ids.get_dim(0);
-  const int32_t max_seq_len = key_cache.get_dim(3);
-  const int32_t num_slots = key_cache.get_dim(1);
-  const int32_t kv_dim = key_cache.get_dim(2);
+  // use_graph implies a CUDA device, so under USE_PAGED_ATTENTION this is the
+  // paged layout; the resolver centralizes the interpretation for both paths.
+  const KVCacheDims dims = resolve_kv_cache_dims(key_cache, block_table, device_type_);
+  const int32_t kv_dim = key_cache.get_dim(dims.paged ? 3 : 2);
+  const int32_t table_stride = dims.table_stride;
+  const int32_t num_slots = dims.paged ? 0 : dims.num_blocks;
+  const int32_t max_seq_len = dims.max_seq_len;
 
   // Host-side bounds validation — the captured kernels assume in-bounds
   // positions/slots (forward_batch's own check only runs for CPU tensors).
   for (int32_t b = 0; b < batch; ++b) {
-    if (positions.ptr<int32_t>()[b] >= max_seq_len ||
-        kv_offsets.ptr<int32_t>()[b] >= num_slots) {
-      LOG(ERROR) << "decode_step: position/slot exceeds KV cache capacity.";
+    if (positions.ptr<int32_t>()[b] >= max_seq_len) {
+      LOG(ERROR) << "decode_step: position exceeds KV cache capacity.";
       return base::error::InvalidArgument(
-          "Position or slot exceeds KV cache capacity. Increase max_seq_len.");
+          "Position exceeds KV cache capacity. Increase max_seq_len.");
     }
+#ifndef USE_PAGED_ATTENTION
+    // Continuous layout: block_table holds slot ids — validate them against
+    // the cache's slot count. (Paged mode: block ids are BlockAllocator-
+    // issued and validated at allocation time.)
+    if (block_table.ptr<int32_t>()[b] >= num_slots) {
+      LOG(ERROR) << "decode_step: slot exceeds KV cache capacity.";
+      return base::error::InvalidArgument(
+          "Slot exceeds KV cache capacity. Increase max_seq_len.");
+    }
+#endif
   }
 
   // Pool entry per batch size (LRU-evicted when it grows too large).
@@ -123,7 +144,7 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
   const int32_t m_attn_dim = config_->dim_;
   const int32_t m_ffn_dim = is_qwen3 ? config_->immediate_dim_ : config_->hidden_dim_;
   entry->scratch->ensure(batch, m_hidden_dim, m_attn_dim, kv_dim, m_ffn_dim,
-                         config_->head_num_, config_->head_size_, max_seq_len,
+                         config_->head_num_, config_->head_size_, max_seq_len, table_stride,
                          device_type_, alloc);
 
   // 2. Stage the new inputs at stable host addresses. forward_batch uploads
@@ -131,10 +152,11 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
   // "upload nodes" and each graph replay re-reads the fresh host data.
   tensor::Tensor& stage_ids = entry->scratch->input_ids;
   tensor::Tensor& stage_pos = entry->scratch->positions;
-  tensor::Tensor& stage_off = entry->scratch->kv_offsets;
+  tensor::Tensor& stage_bt = entry->scratch->block_table;
   std::memcpy(stage_ids.ptr<int32_t>(), input_ids.ptr<int32_t>(), batch * sizeof(int32_t));
   std::memcpy(stage_pos.ptr<int32_t>(), positions.ptr<int32_t>(), batch * sizeof(int32_t));
-  std::memcpy(stage_off.ptr<int32_t>(), kv_offsets.ptr<int32_t>(), batch * sizeof(int32_t));
+  std::memcpy(stage_bt.ptr<int32_t>(), block_table.ptr<int32_t>(),
+              static_cast<size_t>(batch) * table_stride * sizeof(int32_t));
 
   entry->logits_view =
       tensor::Tensor(base::DataType::kDataTypeFp32, batch, vocab_size(), false, nullptr,
@@ -154,7 +176,10 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
        entry->captured_value_ptr != value_cache.ptr<float>() ||
        entry->captured_logits_ptr != logits.ptr<float>() ||
        entry->captured_key_slots != num_slots ||
-       entry->captured_key_seq_len != max_seq_len)) {
+       entry->captured_key_seq_len != max_seq_len ||
+       entry->captured_key_blocks != dims.num_blocks ||
+       entry->captured_block_size != dims.block_size ||
+       entry->captured_table_stride != table_stride)) {
     LOG(INFO) << "[GRAPH] Decode graph batch=" << batch
               << " references stale KV/logits buffers; destroying and re-capturing.";
     cudaGraphExecDestroy(entry->exec);
@@ -171,11 +196,11 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
       entry->capture_failed = true;
       LOG(WARNING) << "[GRAPH] cudaStreamBeginCapture failed (" << cudaGetErrorString(cap_err)
                    << "); falling back to direct decode for batch=" << batch;
-      return forward_batch(stage_ids, stage_pos, stage_off, key_cache, value_cache,
+      return forward_batch(stage_ids, stage_pos, stage_bt, key_cache, value_cache,
                            entry->logits_view, true, entry->scratch.get());
     }
 
-    auto status = forward_batch(stage_ids, stage_pos, stage_off, key_cache, value_cache,
+    auto status = forward_batch(stage_ids, stage_pos, stage_bt, key_cache, value_cache,
                                 entry->logits_view, true, entry->scratch.get());
     cudaGraph_t graph = nullptr;
     cap_err = cudaStreamEndCapture(stream, &graph);
@@ -190,7 +215,7 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
       cudaGetLastError();
       LOG(WARNING) << "[GRAPH] Capture failed for batch=" << batch
                    << "; falling back to direct decode.";
-      return forward_batch(stage_ids, stage_pos, stage_off, key_cache, value_cache,
+      return forward_batch(stage_ids, stage_pos, stage_bt, key_cache, value_cache,
                            entry->logits_view, true, entry->scratch.get());
     }
 
@@ -200,7 +225,7 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
       entry->capture_failed = true;
       LOG(WARNING) << "[GRAPH] cudaGraphInstantiate failed (" << cudaGetErrorString(cap_err)
                    << "); falling back to direct decode for batch=" << batch;
-      return forward_batch(stage_ids, stage_pos, stage_off, key_cache, value_cache,
+      return forward_batch(stage_ids, stage_pos, stage_bt, key_cache, value_cache,
                            entry->logits_view, true, entry->scratch.get());
     }
     // Snapshot the Scheduler-owned buffers baked into the graph; replay is
@@ -210,7 +235,11 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
     entry->captured_logits_ptr = logits.ptr<float>();
     entry->captured_key_slots = num_slots;
     entry->captured_key_seq_len = max_seq_len;
-    LOG(INFO) << "[GRAPH] Captured decode graph for batch=" << batch;
+    entry->captured_key_blocks = dims.num_blocks;
+    entry->captured_block_size = dims.block_size;
+    entry->captured_table_stride = table_stride;
+    LOG(INFO) << "[GRAPH] Captured decode graph for batch=" << batch
+              << " (paged=" << (dims.paged ? 1 : 0) << ")";
     return status;
   }
 
@@ -225,7 +254,7 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
   }
 
   // capture_failed forever: direct batched forward with the stable scratch.
-  return forward_batch(stage_ids, stage_pos, stage_off, key_cache, value_cache,
+  return forward_batch(stage_ids, stage_pos, stage_bt, key_cache, value_cache,
                        entry->logits_view, true, entry->scratch.get());
 }
 

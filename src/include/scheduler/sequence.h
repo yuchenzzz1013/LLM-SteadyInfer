@@ -7,16 +7,28 @@ namespace scheduler {
 
 using TimePoint = std::chrono::steady_clock::time_point;
 
+// Explicit sequence state machine (vLLM-style). is_finished stays as a
+// convenience mirror of FINISHED for the metrics/benchmark code.
+enum class SeqState {
+  WAITING,     // in the waiting queue, no KV blocks yet
+  RUNNING,     // admitted, owns KV blocks (may still be prefilling)
+  PREEMPTED,   // evicted tail blocks freed; retains its block-table row with
+               // the kept prefix blocks, waiting for re-admission (recompute)
+  FINISHED,    // done: blocks released, moved to finished_sequences_
+};
+
 struct Sequence {
   int id = 0;
   std::vector<int> prompt_tokens;
   std::vector<int> generated_tokens;
   int num_prompt_tokens = 0;
   int num_generated_tokens = 0;
-  int kv_slot_id = -1;               // KV Manager slot index
+  int kv_slot_id = -1;               // KV Manager slot index / block-table row
+  int num_blocks_allocated = 0;      // blocks currently owned by this sequence
+  SeqState state = SeqState::WAITING;
   bool is_finished = false;
   bool is_prefill_complete = false;
-  int next_prefill_chunk_start = 0;  // chunked prefill progress
+  int next_prefill_chunk_start = 0;  // chunked prefill progress (tokens prefilled)
   int max_gen_len = 2048;
 
   // Per-request latency tracking

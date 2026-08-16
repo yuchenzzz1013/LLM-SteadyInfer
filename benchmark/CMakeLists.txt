@@ -198,10 +198,19 @@ if (ONLINE_SERVING_BENCHMARK)
     set_target_properties(online_serving_benchmark PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 endif()
 
+# Token 一致性 A/B 验证驱动 (分页布局 vs 连续布局门禁)
+option(VERIFY_TOKENS "Build the token-consistency verify driver" ON)
+if (VERIFY_TOKENS)
+    message(STATUS "Building verify_tokens driver")
+    add_executable(verify_tokens verify_tokens.cpp)
+    target_link_libraries(verify_tokens PRIVATE bench_deps)
+    set_target_properties(verify_tokens PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+endif()
+
 # ---------- 独立模式:运行时库搜索路径(作用于全部目标) ----------
 if(BENCH_STANDALONE)
   list(REMOVE_DUPLICATES RPATH_DIRS)
-  foreach(tgt benchmark_llama benchmark_qwen2 benchmark_qwen3 offline_batch_benchmark online_serving_benchmark)
+  foreach(tgt benchmark_llama benchmark_qwen2 benchmark_qwen3 offline_batch_benchmark online_serving_benchmark verify_tokens)
     if(TARGET ${tgt})
       set_target_properties(${tgt} PROPERTIES
         BUILD_RPATH "${RPATH_DIRS}"

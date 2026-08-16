@@ -226,8 +226,10 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
 
   // 根据实际 prompt 长度确定 KV slot 大小(与 offline 同口径)
   int max_prompt_len = 0;
+  long long prompt_len_sum = 0;
   for (const auto& t : prompt_tokens) {
     max_prompt_len = std::max(max_prompt_len, static_cast<int>(t.size()));
+    prompt_len_sum += t.size();
   }
   int max_total_seq_len =
       std::min(max_prompt_len + args.max_gen, static_cast<int>(model->seq_len()));
@@ -237,7 +239,11 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
   // 收缩模型内部 KV cache(必须在任何 decode CUDA graph 捕获之前,同 offline)
   model->resize_internal_kv_cache(max_prompt_len);
 
-  Scheduler sched(model, args.max_batch, max_total_seq_len, args.max_gen);
+  // 分页块大小按工作负载平均 prompt 长度自适应(短文本 8/长文本 32/默认 16)。
+  const long long avg_prompt_len =
+      prompt_tokens.empty() ? 0 : prompt_len_sum / static_cast<long long>(prompt_tokens.size());
+  Scheduler sched(model, args.max_batch, max_total_seq_len, args.max_gen,
+                  Scheduler::resolve_block_size(avg_prompt_len));
 
   // ---- 预热:与正式压测共用同一 Scheduler(同 offline,统计中跳过) ----
   std::set<int> warm_ids;
@@ -326,7 +332,14 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
         used += static_cast<long long>(s.num_prompt_tokens) + s.num_generated_tokens;
       }
       used_cap_sum += used;
-      alloc_cap_sum += static_cast<long long>(busy) * max_total_seq_len;
+      {
+        // Paged: truthful reservation = allocated blocks x block_size (lazy
+        // growth); continuous layout falls back to busy slots x capacity.
+        long long alloc_tokens = sched.get_allocated_kv_tokens();
+        alloc_cap_sum += alloc_tokens > 0
+                             ? alloc_tokens
+                             : static_cast<long long>(busy) * max_total_seq_len;
+      }
       busy_slots_sum += busy;
       running_sum += running.size();
       peak_busy = std::max(peak_busy, busy);

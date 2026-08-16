@@ -1,25 +1,65 @@
 #include "scheduler/kv_manager.h"
 #include <cuda_runtime_api.h>
-#include <cstring>
 #include <glog/logging.h>
 
 namespace scheduler {
 
 KVManager::KVManager(int num_layers, int max_batch, int max_seq_len, int kv_dim,
-                     std::shared_ptr<base::DeviceAllocator> alloc)
+                     std::shared_ptr<base::DeviceAllocator> alloc,
+                     base::DeviceType device, int block_size)
     : num_layers_(num_layers),
       max_batch_(max_batch),
       max_seq_len_(max_seq_len),
-      kv_dim_(kv_dim),
-      slot_busy_(max_batch, false) {
-  size_t kv_bytes = static_cast<size_t>(num_layers_) * max_batch_ * max_seq_len_ * kv_dim_ * 4;
-  LOG(INFO) << "[KVMGR] Allocating KV caches:"
-            << " num_layers=" << num_layers_
-            << " max_batch=" << max_batch_
-            << " max_seq_len=" << max_seq_len_
-            << " kv_dim=" << kv_dim_
-            << " each_size=" << (kv_bytes >> 20) << "MB"
-            << " total=" << ((kv_bytes * 2) >> 20) << "MB";
+      kv_dim_(kv_dim) {
+#ifdef USE_PAGED_ATTENTION
+  paged_ = (device == base::DeviceType::kDeviceCUDA);
+#else
+  paged_ = false;
+#endif
+
+  size_t kv_bytes = 0;
+  if (paged_) {
+    // Paged layout: [num_layers, num_blocks, block_size, kv_dim]. One block
+    // pool serves all layers (block i of layer l is key_cache[l][i]).
+    // Pool capacity matches the continuous layout within one block per seq:
+    //   num_blocks = max_batch * ceil(max_seq_len / block_size)
+    block_size_ = block_size;
+    max_blocks_per_seq_ = (max_seq_len_ + block_size_ - 1) / block_size_;
+    num_blocks_ = max_batch_ * max_blocks_per_seq_;
+    kv_bytes = static_cast<size_t>(num_layers_) * num_blocks_ * block_size_ * kv_dim_ * 4;
+    LOG(INFO) << "[KVMGR] Allocating PAGED KV caches:"
+              << " num_layers=" << num_layers_
+              << " num_blocks=" << num_blocks_
+              << " block_size=" << block_size_
+              << " max_blocks_per_seq=" << max_blocks_per_seq_
+              << " kv_dim=" << kv_dim_
+              << " each_size=" << (kv_bytes >> 20) << "MB"
+              << " total=" << ((kv_bytes * 2) >> 20) << "MB"
+              << " (continuous equivalent:"
+              << " each=" << ((static_cast<size_t>(num_layers_) * max_batch_ * max_seq_len_ *
+                               kv_dim_ * 4) >> 20) << "MB)";
+    block_allocator_ = std::make_unique<BlockAllocator>(num_blocks_, max_batch_,
+                                                        max_blocks_per_seq_, block_size_);
+  } else {
+    // Continuous layout: [num_layers, max_batch, kv_dim, max_seq_len].
+    block_size_ = max_seq_len_;
+    max_blocks_per_seq_ = 1;
+    slot_busy_.assign(max_batch_, false);
+    kv_bytes = static_cast<size_t>(num_layers_) * max_batch_ * max_seq_len_ * kv_dim_ * 4;
+    LOG(INFO) << "[KVMGR] Allocating continuous KV caches:"
+              << " num_layers=" << num_layers_
+              << " max_batch=" << max_batch_
+              << " max_seq_len=" << max_seq_len_
+              << " kv_dim=" << kv_dim_
+              << " each_size=" << (kv_bytes >> 20) << "MB"
+              << " total=" << ((kv_bytes * 2) >> 20) << "MB";
+#ifdef USE_PAGED_ATTENTION
+    // CPU device (or paging disabled): degenerate slot-mode pool so the
+    // scheduler's block-table code path stays uniform — one block == one
+    // whole slot, block table width 1.
+    block_allocator_ = std::make_unique<BlockAllocator>(max_batch_, max_batch_, 1, max_seq_len_);
+#endif
+  }
 
   // Log GPU memory before allocation
   {
@@ -29,18 +69,29 @@ KVManager::KVManager(int num_layers, int max_batch, int max_seq_len, int kv_dim,
               << "MB total=" << (total_mem >> 20) << "MB";
   }
 
-  // Allocate KV cache in head-dim-contiguous layout:
-  //   [num_layers, max_batch, kv_dim, max_seq_len]
-  // Decode MHA reads one vector per position, i.e. cache[layer][slot][d][pos]
-  // for d in [0, kv_dim): with kv_dim as the innermost-contiguous dim a warp
-  // reads one head's consecutive positions — coalesced access, ~30%+ better
-  // bandwidth utilization than the old [.., max_seq_len, kv_dim] layout.
-  key_cache_ = tensor::Tensor(base::DataType::kDataTypeFp32,
-                               num_layers_, max_batch_, kv_dim_, max_seq_len_,
-                               true, alloc);
-  value_cache_ = tensor::Tensor(base::DataType::kDataTypeFp32,
+  if (paged_) {
+    // Element (layer, block, pos_in_block, d) at
+    //   layer * (num_blocks * block_size * kv_dim)
+    // + block * (block_size * kv_dim)
+    // + pos_in_block * kv_dim + d
+    // d-innermost within a page: the flash-decoding kernels walk consecutive
+    // positions contiguously, crossing page boundaries through block_table.
+    key_cache_ = tensor::Tensor(base::DataType::kDataTypeFp32,
+                                 num_layers_, num_blocks_, block_size_, kv_dim_,
+                                 true, alloc);
+    value_cache_ = tensor::Tensor(base::DataType::kDataTypeFp32,
+                                   num_layers_, num_blocks_, block_size_, kv_dim_,
+                                   true, alloc);
+  } else {
+    // Head-dim-contiguous layout: cache[layer][slot][d][pos], position
+    // innermost so decode MHA reads coalesce across consecutive positions.
+    key_cache_ = tensor::Tensor(base::DataType::kDataTypeFp32,
                                  num_layers_, max_batch_, kv_dim_, max_seq_len_,
                                  true, alloc);
+    value_cache_ = tensor::Tensor(base::DataType::kDataTypeFp32,
+                                   num_layers_, max_batch_, kv_dim_, max_seq_len_,
+                                   true, alloc);
+  }
 
   {
     size_t free_mem, total_mem;
@@ -54,6 +105,9 @@ KVManager::KVManager(int num_layers, int max_batch, int max_seq_len, int kv_dim,
 }
 
 int KVManager::allocate() {
+#ifdef USE_PAGED_ATTENTION
+  return block_allocator_->allocate_blocks(max_blocks_per_seq_);
+#else
   for (int i = 0; i < max_batch_; ++i) {
     if (!slot_busy_[i]) {
       slot_busy_[i] = true;
@@ -61,71 +115,17 @@ int KVManager::allocate() {
     }
   }
   return -1;
+#endif
 }
 
-void KVManager::deallocate(int slot) {
-  if (slot >= 0 && slot < max_batch_) {
-    slot_busy_[slot] = false;
+void KVManager::deallocate(int slot_or_row) {
+#ifdef USE_PAGED_ATTENTION
+  block_allocator_->free_all(slot_or_row);
+#else
+  if (slot_or_row >= 0 && slot_or_row < max_batch_) {
+    slot_busy_[slot_or_row] = false;
   }
-}
-
-void KVManager::copy_to_slot(int slot, const tensor::Tensor& src_key,
-                              const tensor::Tensor& src_val,
-                              int layer_idx, int start_pos, int num_positions) {
-  // Bounds check: prevent buffer overflow when prompt is longer than max_seq_len_
-  int end_pos = start_pos + num_positions;
-  if (end_pos > max_seq_len_) {
-    LOG(WARNING) << "[KVMGR] copy_to_slot truncating: start=" << start_pos
-                 << " num=" << num_positions << " max_seq_len=" << max_seq_len_
-                 << " slot=" << slot;
-    num_positions = max_seq_len_ - start_pos;
-    if (num_positions <= 0) return;
-  }
-
-  bool is_cuda = (src_key.device_type() == base::DeviceType::kDeviceCUDA);
-  int src_seq_len = src_key.get_dim(1);
-  size_t copy_bytes = kv_dim_ * sizeof(float);
-
-  // Layout [layers, slots, kv_dim, seq]: a position's K/V row is strided
-  // (element d lives at [.., d, pos]), so copy per element or use a staging
-  // row. Positions are copied in bulk with a temporary contiguous row.
-  std::vector<float> staging_k(kv_dim_), staging_v(kv_dim_);
-  for (int p = 0; p < num_positions; ++p) {
-    const float* src_k = src_key.ptr<float>(
-        layer_idx * src_seq_len * kv_dim_ + (start_pos + p) * kv_dim_);
-    const float* src_v = src_val.ptr<float>(
-        layer_idx * src_seq_len * kv_dim_ + (start_pos + p) * kv_dim_);
-    if (is_cuda) {
-      cudaMemcpy(staging_k.data(), src_k, copy_bytes, cudaMemcpyDeviceToHost);
-      cudaMemcpy(staging_v.data(), src_v, copy_bytes, cudaMemcpyDeviceToHost);
-    } else {
-      std::memcpy(staging_k.data(), src_k, copy_bytes);
-      std::memcpy(staging_v.data(), src_v, copy_bytes);
-    }
-    for (int d = 0; d < kv_dim_; ++d) {
-      *key_slot_ptr(layer_idx, slot, start_pos + p, d) = staging_k[d];
-      *value_slot_ptr(layer_idx, slot, start_pos + p, d) = staging_v[d];
-    }
-  }
-}
-
-// Element (layer, slot, d, pos) of the head-dim-contiguous cache:
-//   offset = layer * (max_batch * kv_dim * max_seq_len)
-//          + slot  * (kv_dim * max_seq_len)
-//          + d     * max_seq_len
-//          + pos
-float* KVManager::key_slot_ptr(int layer_idx, int slot, int pos, int d) {
-  int64_t offset = static_cast<int64_t>(layer_idx) * max_batch_ * kv_dim_ * max_seq_len_ +
-                   static_cast<int64_t>(slot) * kv_dim_ * max_seq_len_ +
-                   static_cast<int64_t>(d) * max_seq_len_ + pos;
-  return const_cast<float*>(key_cache_.ptr<float>(offset));
-}
-
-float* KVManager::value_slot_ptr(int layer_idx, int slot, int pos, int d) {
-  int64_t offset = static_cast<int64_t>(layer_idx) * max_batch_ * kv_dim_ * max_seq_len_ +
-                   static_cast<int64_t>(slot) * kv_dim_ * max_seq_len_ +
-                   static_cast<int64_t>(d) * max_seq_len_ + pos;
-  return const_cast<float*>(value_cache_.ptr<float>(offset));
+#endif
 }
 
 bool KVManager::has_free_slot() const {
@@ -133,19 +133,31 @@ bool KVManager::has_free_slot() const {
 }
 
 int KVManager::busy_slot_count() const {
+#ifdef USE_PAGED_ATTENTION
+  int count = 0;
+  for (int r = 0; r < max_batch_; ++r) {
+    if (block_allocator_->num_used_blocks(r) > 0) ++count;
+  }
+  return count;
+#else
   int count = 0;
   for (bool busy : slot_busy_) {
     if (busy) ++count;
   }
   return count;
+#endif
 }
 
 int KVManager::free_slot_count() const {
+#ifdef USE_PAGED_ATTENTION
+  return block_allocator_->free_block_count() / max_blocks_per_seq_;
+#else
   int count = 0;
   for (bool busy : slot_busy_) {
     if (!busy) ++count;
   }
   return count;
+#endif
 }
 
 }  // namespace scheduler

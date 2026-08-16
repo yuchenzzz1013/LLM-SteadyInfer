@@ -5,6 +5,8 @@
 #include <map>
 #include <memory>
 #include <string>
+#include "base/alloc.h"
+#include "base/base.h"
 #include "config.h"
 #include "op/encode.h"
 #include "op/layer.h"
@@ -22,23 +24,32 @@ namespace model {
 // reuse all temporary tensors instead of allocating per iteration).
 struct BatchScratch {
   int32_t batch = 0;
+  // Block table width this scratch was sized for (1 in continuous mode).
+  // Baked into the fast-path re-use check so a stride change re-allocates
+  // (and thus forces a graph re-capture in decode_step).
+  int32_t block_table_stride = 0;
 
   // Device buffers (CUDA) or CPU buffers (CPU models), sized [batch, ...].
   tensor::Tensor hidden, rms_out, q_batch, key_batch, val_batch, mha_out_batch, attn_out,
       ffn_norm_out, w1_out, w3_out, w2_out;
+  // Fused QKV output (M3): [batch, dim + 2*kv_dim]; the q/k/v views used by
+  // the fused path point into this buffer (zero-copy row split).
+  tensor::Tensor qkv_out;
   // Flash-Decoding partials (CUDA only):
   //   [batch * head_num * num_splits * (head_size + 2)]
   tensor::Tensor partial_batch;
   // Device copies of the per-token inputs (CUDA graph path reads these).
-  tensor::Tensor tokens_cu, positions_cu, kv_offsets_cu;
+  // block_table_cu is [batch, block_table_stride]: slot ids (continuous
+  // layout) or physical block ids per position (paged layout).
+  tensor::Tensor tokens_cu, positions_cu, block_table_cu;
 
   // Host staging at stable addresses (CUDA graph path writes new values here
   // before each launch; the H2D uploads happen outside the captured graph).
-  tensor::Tensor input_ids, positions, kv_offsets, input_token_num;
+  tensor::Tensor input_ids, positions, block_table, input_token_num;
 
   // Allocate (or keep, when sizes already match) every buffer above.
   void ensure(int32_t batch, int32_t hidden_dim, int32_t dim, int32_t kv_dim, int32_t ffn_dim,
-              int32_t head_num, int32_t head_size, int32_t max_seq_len,
+              int32_t head_num, int32_t head_size, int32_t max_seq_len, int32_t block_table_stride,
               base::DeviceType device, const std::shared_ptr<base::DeviceAllocator>& alloc);
 };
 
@@ -62,6 +73,10 @@ struct CudaGraphDecodeEntry {
   const void* captured_logits_ptr = nullptr;
   int32_t captured_key_slots = 0;
   int32_t captured_key_seq_len = 0;
+  // Paged-layout geometry baked into the graph (continuous: 0 / 1).
+  int32_t captured_key_blocks = 0;     // num_blocks per layer
+  int32_t captured_block_size = 0;     // block_size
+  int32_t captured_table_stride = 0;   // block table width
 
   ~CudaGraphDecodeEntry() {
     if (exec) {
@@ -69,6 +84,62 @@ struct CudaGraphDecodeEntry {
     }
   }
 };
+
+// Resolved KV-cache geometry, shared by forward_batch / decode_step so the
+// two never disagree on layout interpretation.
+struct KVCacheDims {
+  bool paged = false;
+  int32_t num_blocks = 0;    // paged: physical blocks per layer
+  int32_t block_size = 0;    // paged: page size (continuous: 0)
+  int32_t max_seq_len = 0;   // per-seq KV capacity in tokens
+  int32_t table_stride = 0;  // block table width (continuous: 1)
+};
+
+// Paged layout [num_layers, num_blocks, block_size, kv_dim] is selected by
+// USE_PAGED_ATTENTION + CUDA device; everything else (CPU device, or the A/B
+// baseline build) uses the continuous layout [num_layers, num_slots, kv_dim,
+// max_seq_len]. The per-seq capacity is table_stride * block_size — derived
+// from the block table width, never from the pool size — so num_splits and
+// smem sizing stay stable across steps (CUDA-graph safe).
+inline KVCacheDims resolve_kv_cache_dims(const tensor::Tensor& key_cache,
+                                         const tensor::Tensor& block_table,
+                                         base::DeviceType device) {
+  KVCacheDims d;
+#ifdef USE_PAGED_ATTENTION
+  d.paged = (device == base::DeviceType::kDeviceCUDA);
+#endif
+  if (d.paged) {
+    d.num_blocks = key_cache.get_dim(1);
+    d.block_size = key_cache.get_dim(2);
+    d.table_stride = block_table.get_dim(1);
+    d.max_seq_len = d.table_stride * d.block_size;
+  } else {
+    d.num_blocks = key_cache.get_dim(1);  // == num_slots
+    d.max_seq_len = key_cache.get_dim(3);
+    d.table_stride = 1;
+  }
+  return d;
+}
+
+// Continuous-layout kernels (CPU device) expect a [batch] slot-id tensor.
+// In paged builds the slot ids live in column 0 of the block table rows
+// (slot-mode block pool: one block == one whole slot, table width 1, so this
+// usually returns the input unchanged).
+inline tensor::Tensor cpu_slot_offsets(const tensor::Tensor& block_table, int32_t batch) {
+#ifdef USE_PAGED_ATTENTION
+  if (block_table.get_dim(1) <= 1) return block_table;
+  tensor::Tensor offs(base::DataType::kDataTypeInt32, batch, true,
+                      base::CPUDeviceAllocatorFactory::get_instance());
+  const int32_t stride = block_table.get_dim(1);
+  for (int32_t b = 0; b < batch; ++b) {
+    offs.ptr<int32_t>()[b] = block_table.ptr<int32_t>()[static_cast<int64_t>(b) * stride];
+  }
+  return offs;
+#else
+  UNUSED(batch);
+  return block_table;
+#endif
+}
 
 class Model {
  public:
@@ -84,19 +155,25 @@ class Model {
                                int& next) const = 0;
 
   // ========== Continuous Batching Interface ==========
-  // Batched forward: each row is one token with its own position and KV slot,
-  // so the same call serves both decode (1 token per sequence) and chunked
-  // prefill (many prompt tokens per sequence, need_logits=false skips the
-  // final RMSNorm + LM head).
-  // key_cache/value_cache use the head-dim-contiguous external layout
-  // [num_layers, num_slots, kv_dim, max_seq_len].
+  // Batched forward: each row is one token with its own position and block
+  // table row, so the same call serves both decode (1 token per sequence) and
+  // chunked prefill (many prompt tokens per sequence, need_logits=false skips
+  // the final RMSNorm + LM head).
+  //
+  // key_cache/value_cache layout is resolved from the tensors themselves:
+  //   paged (USE_PAGED_ATTENTION + CUDA):
+  //     [num_layers, num_blocks, block_size, kv_dim]; block_table is
+  //     [batch, max_blocks_per_seq] — physical block ids per position.
+  //   continuous (legacy / CPU):
+  //     [num_layers, num_slots, kv_dim, max_seq_len]; block_table is the
+  //     [batch] slot-id tensor.
   // When scratch != nullptr the call reuses its persistent buffers (stable
   // addresses — CUDA-Graph capturable) and reads the staged device inputs
-  // (input_ids/positions/kv_offsets must already be CUDA tensors).
+  // (input_ids/positions/block_table must already be CUDA tensors).
   virtual base::Status forward_batch(
       const tensor::Tensor& input_ids,
       const tensor::Tensor& positions,
-      const tensor::Tensor& kv_offsets,
+      const tensor::Tensor& block_table,
       tensor::Tensor& key_cache,
       tensor::Tensor& value_cache,
       tensor::Tensor& logits,
@@ -111,7 +188,7 @@ class Model {
   // chunk sizes vary per step).
   virtual base::Status decode_step(const tensor::Tensor& input_ids,
                                    const tensor::Tensor& positions,
-                                   const tensor::Tensor& kv_offsets,
+                                   const tensor::Tensor& block_table,
                                    tensor::Tensor& key_cache,
                                    tensor::Tensor& value_cache,
                                    tensor::Tensor& logits);

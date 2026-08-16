@@ -6,10 +6,14 @@
 #include <op/rmsnorm.h>
 #include <sentencepiece_processor.h>
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <string>
 #include <utility>
 #include "../op/kernels/cpu/mha_kernel.h"
 #include "../op/kernels/cpu/rope_kernel.h"
 #include "../op/kernels/cuda/mha_kernel.cuh"
+#include "../op/kernels/cuda/paged_kernels.cuh"
 #include "../op/kernels/cuda/rope_kernel.cuh"
 #include "base/tick.h"
 namespace model {
@@ -305,6 +309,78 @@ void Qwen3Model::create_param_layers() {
   qwen_layers_->cls_layer_ = lm_head;
 }
 
+void Qwen3Model::build_fused_qkv_layers() {
+  // Escape hatch: fall back to the three-GEMM path (numerics A/B).
+  const char* disable = std::getenv("LLAMA_DISABLE_FUSED_QKV");
+  if (disable && std::string(disable) == "1") {
+    LOG(INFO) << "[MODEL] Fused QKV disabled via LLAMA_DISABLE_FUSED_QKV";
+    return;
+  }
+  if (is_quant_model_) {
+    LOG(INFO) << "[MODEL] Fused QKV skipped for int8 quant model";
+    return;
+  }
+
+  const int32_t dim = config_->dim_;
+  const int32_t kv_dim = config_->kv_dim_;
+  const int32_t hidden_dim = config_->hidden_dim_;
+  const int32_t fused_dim = dim + 2 * kv_dim;
+  const int32_t num_layers = config_->layer_num_;
+  const size_t w_block_q = static_cast<size_t>(dim) * hidden_dim * 4;
+  const size_t w_block_kv = static_cast<size_t>(kv_dim) * hidden_dim * 4;
+
+  std::shared_ptr<base::DeviceAllocator> alloc;
+  if (device_type_ == base::DeviceType::kDeviceCUDA) {
+    alloc = base::CUDADeviceAllocatorFactory::get_instance();
+  } else {
+    alloc = base::CPUDeviceAllocatorFactory::get_instance();
+  }
+
+  qwen_layers_->fused_qkv_layers_.clear();
+  qwen_layers_->fused_qkv_weight_src_.clear();
+  qwen_layers_->fused_qkv_bias_src_.clear();
+  for (int32_t i = 0; i < num_layers; ++i) {
+    const tensor::Tensor& wq_w =
+        std::dynamic_pointer_cast<op::MatmulLayer>(qwen_layers_->wq_layers_.at(i))->get_weight(0);
+    const tensor::Tensor& wk_w =
+        std::dynamic_pointer_cast<op::MatmulLayer>(qwen_layers_->wk_layers_.at(i))->get_weight(0);
+    const tensor::Tensor& wv_w =
+        std::dynamic_pointer_cast<op::MatmulLayer>(qwen_layers_->wv_layers_.at(i))->get_weight(0);
+
+    // Stacked weight [q | k | v]: K-major blocks, one contiguous memcpy each.
+    tensor::Tensor fused_w(base::DataType::kDataTypeFp32, fused_dim, hidden_dim, true, alloc);
+    if (device_type_ == base::DeviceType::kDeviceCUDA) {
+      cudaStream_t stream = cuda_config_->stream;
+      cudaMemcpyAsync(fused_w.ptr<float>(), wq_w.ptr<float>(), w_block_q,
+                      cudaMemcpyDeviceToDevice, stream);
+      cudaMemcpyAsync(fused_w.ptr<float>(static_cast<int64_t>(dim) * hidden_dim),
+                      wk_w.ptr<float>(), w_block_kv, cudaMemcpyDeviceToDevice, stream);
+      cudaMemcpyAsync(fused_w.ptr<float>(static_cast<int64_t>(dim + kv_dim) * hidden_dim),
+                      wv_w.ptr<float>(), w_block_kv, cudaMemcpyDeviceToDevice, stream);
+      cudaStreamSynchronize(stream);  // init-time only: weights must be ready pre-forward
+    } else {
+      std::memcpy(fused_w.ptr<float>(), wq_w.ptr<float>(), w_block_q);
+      std::memcpy(fused_w.ptr<float>(static_cast<int64_t>(dim) * hidden_dim),
+                  wk_w.ptr<float>(), w_block_kv);
+      std::memcpy(fused_w.ptr<float>(static_cast<int64_t>(dim + kv_dim) * hidden_dim),
+                  wv_w.ptr<float>(), w_block_kv);
+    }
+
+    // Qwen3 has no QKV bias (unlike Qwen2).
+    auto fused = std::make_shared<op::MatmulLayer>(device_type_, fused_dim, hidden_dim,
+                                                   false, false);
+    CHECK(fused->set_weight(0, fused_w));
+    if (device_type_ == base::DeviceType::kDeviceCUDA) {
+      fused->set_cuda_config(cuda_config_);
+    }
+    qwen_layers_->fused_qkv_layers_.push_back(fused);
+    qwen_layers_->fused_qkv_weight_src_.push_back(fused_w);
+  }
+  qwen_layers_->fused_qkv_enabled_ = true;
+  LOG(INFO) << "[MODEL] Fused QKV ready: " << num_layers << " layers of ["
+            << fused_dim << ", " << hidden_dim << "] (LLAMA_DISABLE_FUSED_QKV=1 to disable)";
+}
+
 void Qwen3Model::init_mem() {
   std::shared_ptr<base::DeviceAllocator> alloc;
   if (device_type_ == base::DeviceType::kDeviceCPU) {
@@ -317,6 +393,13 @@ void Qwen3Model::init_mem() {
     CHECK_NE(cuda_config_, nullptr);
     qwen_layers_->to_cuda(cuda_config_);
   }
+
+  // Fused QKV (M3): the wq/wk/wv weights are on the target device now.
+  // Gated on the paged-attention build so the A/B baseline (macro OFF)
+  // reproduces the original three-GEMM path exactly.
+#ifdef USE_PAGED_ATTENTION
+  build_fused_qkv_layers();
+#endif
 
   std::shared_ptr<base::DeviceAllocator> alloc_cpu =
       base::CPUDeviceAllocatorFactory::get_instance();
@@ -669,7 +752,7 @@ void Qwen3Model::sync_stream() const {
 base::Status Qwen3Model::forward_batch(
     const tensor::Tensor& input_ids,
     const tensor::Tensor& positions,
-    const tensor::Tensor& kv_offsets,
+    const tensor::Tensor& block_table,
     tensor::Tensor& key_cache,
     tensor::Tensor& value_cache,
     tensor::Tensor& logits,
@@ -683,10 +766,16 @@ base::Status Qwen3Model::forward_batch(
   int32_t hidden_dim = config_->hidden_dim_;
   int32_t dim = config_->dim_;
   int32_t kv_dim = config_->kv_dim_;
-  // External KV cache, head-dim-contiguous: [layers, slots, kv_dim, max_seq_len]
-  int32_t num_slots = key_cache.get_dim(1);
-  int32_t max_seq_len = key_cache.get_dim(3);
-  CHECK_EQ(key_cache.get_dim(2), kv_dim);
+  // KV cache geometry from the tensors themselves: paged
+  // [layers, num_blocks, block_size, kv_dim] (CUDA + USE_PAGED_ATTENTION) or
+  // head-dim-contiguous [layers, slots, kv_dim, max_seq_len] (CPU / baseline).
+  const KVCacheDims cache_dims = resolve_kv_cache_dims(key_cache, block_table, device_type_);
+  int32_t num_blocks = cache_dims.num_blocks;
+  int32_t block_size = cache_dims.block_size;
+  int32_t table_stride = cache_dims.table_stride;
+  int32_t num_slots = cache_dims.paged ? 0 : num_blocks;
+  int32_t max_seq_len = cache_dims.max_seq_len;
+  CHECK_EQ(key_cache.get_dim(cache_dims.paged ? 3 : 2), kv_dim);
 
   std::shared_ptr<base::DeviceAllocator> alloc;
   if (device_type_ == base::DeviceType::kDeviceCPU) {
@@ -699,10 +788,11 @@ base::Status Qwen3Model::forward_batch(
   // path). The scratch keeps stable addresses across steps so a captured
   // graph always replays against the same memory.
   tensor::Tensor hidden, rms_out, q_batch, key_batch, val_batch, mha_out_batch, attn_out,
-      ffn_norm_out, w1_out, w3_out, w2_out, partial_batch;
+      ffn_norm_out, w1_out, w3_out, w2_out, partial_batch, qkv_out;
   if (scratch) {
     scratch->ensure(batch, hidden_dim, dim, kv_dim, config_->immediate_dim_,
-                    config_->head_num_, config_->head_size_, max_seq_len, device_type_, alloc);
+                    config_->head_num_, config_->head_size_, max_seq_len, table_stride,
+                    device_type_, alloc);
     hidden = scratch->hidden;
     rms_out = scratch->rms_out;
     q_batch = scratch->q_batch;
@@ -715,6 +805,7 @@ base::Status Qwen3Model::forward_batch(
     w3_out = scratch->w3_out;
     w2_out = scratch->w2_out;
     partial_batch = scratch->partial_batch;
+    qkv_out = scratch->qkv_out;
   } else {
     hidden = tensor::Tensor(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
     rms_out = tensor::Tensor(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
@@ -727,6 +818,8 @@ base::Status Qwen3Model::forward_batch(
     w2_out = tensor::Tensor(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
     key_batch = tensor::Tensor(base::DataType::kDataTypeFp32, batch, kv_dim, true, alloc);
     val_batch = tensor::Tensor(base::DataType::kDataTypeFp32, batch, kv_dim, true, alloc);
+    qkv_out = tensor::Tensor(base::DataType::kDataTypeFp32, batch,
+                             config_->dim_ + 2 * kv_dim, true, alloc);
     if (device_type_ == base::DeviceType::kDeviceCUDA) {
       int32_t num_splits = kernel::flash_decoding_num_splits(max_seq_len);
       partial_batch = tensor::Tensor(
@@ -761,27 +854,30 @@ base::Status Qwen3Model::forward_batch(
   }
 
   // 2. Per-layer processing
-  // Device copies of positions/kv_offsets for the CUDA kernels. In scratch
+  // Device copies of positions/block_table for the CUDA kernels. In scratch
   // mode these uploads are captured into the graph too.
   tensor::Tensor positions_cu;
-  tensor::Tensor kv_offsets_cu;
+  tensor::Tensor block_table_cu;
   if (device_type_ == base::DeviceType::kDeviceCUDA) {
     if (scratch) {
       cudaMemcpyAsync(scratch->positions_cu.ptr<int32_t>(), positions.ptr<int32_t>(),
                       batch * sizeof(int32_t), cudaMemcpyHostToDevice, cuda_config_->stream);
-      cudaMemcpyAsync(scratch->kv_offsets_cu.ptr<int32_t>(), kv_offsets.ptr<int32_t>(),
-                      batch * sizeof(int32_t), cudaMemcpyHostToDevice, cuda_config_->stream);
+      cudaMemcpyAsync(scratch->block_table_cu.ptr<int32_t>(), block_table.ptr<int32_t>(),
+                      static_cast<size_t>(batch) * table_stride * sizeof(int32_t),
+                      cudaMemcpyHostToDevice, cuda_config_->stream);
       positions_cu = scratch->positions_cu;
-      kv_offsets_cu = scratch->kv_offsets_cu;
+      block_table_cu = scratch->block_table_cu;
     } else {
       positions_cu = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc);
-      kv_offsets_cu = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc);
+      block_table_cu = tensor::Tensor(base::DataType::kDataTypeInt32, batch, table_stride,
+                                      true, alloc);
       cudaMemcpyAsync(const_cast<int32_t*>(positions_cu.ptr<int32_t>()),
                       positions.ptr<int32_t>(), batch * sizeof(int32_t), cudaMemcpyHostToDevice,
                       cuda_config_->stream);
-      cudaMemcpyAsync(const_cast<int32_t*>(kv_offsets_cu.ptr<int32_t>()),
-                      kv_offsets.ptr<int32_t>(), batch * sizeof(int32_t), cudaMemcpyHostToDevice,
-                      cuda_config_->stream);
+      cudaMemcpyAsync(const_cast<int32_t*>(block_table_cu.ptr<int32_t>()),
+                      block_table.ptr<int32_t>(),
+                      static_cast<size_t>(batch) * table_stride * sizeof(int32_t),
+                      cudaMemcpyHostToDevice, cuda_config_->stream);
     }
   }
 
@@ -792,7 +888,7 @@ base::Status Qwen3Model::forward_batch(
       if (positions.ptr<int32_t>()[b] >= max_seq_len) {
         LOG(ERROR) << "forward_batch: position " << positions.ptr<int32_t>()[b]
                    << " exceeds max_seq_len " << max_seq_len
-                   << " for slot " << kv_offsets.ptr<int32_t>()[b];
+                   << " for table row " << block_table.ptr<int32_t>()[b];
         return base::error::InvalidArgument(
             "Position exceeds KV cache capacity. Increase max_seq_len.");
       }
@@ -806,14 +902,34 @@ base::Status Qwen3Model::forward_batch(
       STATUS_CHECK(rmsnorm->forward(hidden, rms_out));
     }
 
-    // b. Q projection: [batch, hidden_dim] -> [batch, dim]
-    {
-      auto& wq = qwen_layers_->wq_layers_.at(layer_idx);
-      std::dynamic_pointer_cast<op::MatmulLayer>(wq)->set_batch_size(batch);
-      STATUS_CHECK(wq->forward(rms_out, q_batch));
+    // b. QKV projection: one fused GEMM (M3) with zero-copy q/k/v views, or
+    // the classic three GEMMs (escape hatch LLAMA_DISABLE_FUSED_QKV / quant).
+    const bool fused_qkv = qwen_layers_->fused_qkv_enabled_;
+    if (fused_qkv) {
+      auto& fused = qwen_layers_->fused_qkv_layers_.at(layer_idx);
+      std::dynamic_pointer_cast<op::MatmulLayer>(fused)->set_batch_size(batch);
+      STATUS_CHECK(fused->forward(rms_out, qkv_out));
+      // Views into the fused output row blocks: [q | k | v].
+      q_batch = tensor::Tensor(base::DataType::kDataTypeFp32, batch, dim,
+                               false, nullptr, qkv_out.ptr<float>());
+      key_batch = tensor::Tensor(base::DataType::kDataTypeFp32, batch, kv_dim,
+                                 false, nullptr, qkv_out.ptr<float>(dim));
+      val_batch = tensor::Tensor(base::DataType::kDataTypeFp32, batch, kv_dim,
+                                 false, nullptr, qkv_out.ptr<float>(dim + kv_dim));
+      q_batch.set_device_type(device_type_);
+      key_batch.set_device_type(device_type_);
+      val_batch.set_device_type(device_type_);
+    } else {
+      // b. Q projection: [batch, hidden_dim] -> [batch, dim]
+      {
+        auto& wq = qwen_layers_->wq_layers_.at(layer_idx);
+        std::dynamic_pointer_cast<op::MatmulLayer>(wq)->set_batch_size(batch);
+        STATUS_CHECK(wq->forward(rms_out, q_batch));
+      }
     }
 
-    // Q norm (Qwen3 specific): per-head RMSNorm
+    // Q norm (Qwen3 specific): per-head RMSNorm (applies to the fused view
+    // just like to the GEMM output).
     {
       auto& q_norm = qwen_layers_->rmsnorm_layers_.at(2 * config_->layer_num_ + 1 + layer_idx);
       q_batch.reshape({batch * config_->head_num_, config_->head_size_});
@@ -821,13 +937,15 @@ base::Status Qwen3Model::forward_batch(
       q_batch.reshape({batch, dim});
     }
 
-    // c/d/e: K, V projections + RoPE + cache write
+    // c/d/e: K, V projections (skipped under fused QKV) + RoPE + cache write
     if (device_type_ == base::DeviceType::kDeviceCUDA) {
-      // Batched K projection: [batch, hidden_dim] -> [batch, kv_dim]
-      {
-        auto& wk = qwen_layers_->wk_layers_.at(layer_idx);
-        std::dynamic_pointer_cast<op::MatmulLayer>(wk)->set_batch_size(batch);
-        STATUS_CHECK(wk->forward(rms_out, key_batch));
+      if (!fused_qkv) {
+        // Batched K projection: [batch, hidden_dim] -> [batch, kv_dim]
+        {
+          auto& wk = qwen_layers_->wk_layers_.at(layer_idx);
+          std::dynamic_pointer_cast<op::MatmulLayer>(wk)->set_batch_size(batch);
+          STATUS_CHECK(wk->forward(rms_out, key_batch));
+        }
       }
 
       // K norm (Qwen3 specific) — per-head RMSNorm over the whole batch
@@ -839,11 +957,13 @@ base::Status Qwen3Model::forward_batch(
         key_batch.reshape({batch, kv_dim});
       }
 
-      // Batched V projection
-      {
-        auto& wv = qwen_layers_->wv_layers_.at(layer_idx);
-        std::dynamic_pointer_cast<op::MatmulLayer>(wv)->set_batch_size(batch);
-        STATUS_CHECK(wv->forward(rms_out, val_batch));
+      if (!fused_qkv) {
+        // Batched V projection
+        {
+          auto& wv = qwen_layers_->wv_layers_.at(layer_idx);
+          std::dynamic_pointer_cast<op::MatmulLayer>(wv)->set_batch_size(batch);
+          STATUS_CHECK(wv->forward(rms_out, val_batch));
+        }
       }
 
       // RoPE over the whole batch (single kernel, in place on q_batch/key_batch)
@@ -852,27 +972,46 @@ base::Status Qwen3Model::forward_batch(
                                    get_buffer(ModelBufferType::kCosCache),
                                    cuda_config_->stream);
 
+#ifdef USE_PAGED_ATTENTION
+      // Write this layer's K/V rows into each sequence's paged cache blocks
+      // (layout [layers, num_blocks, block_size, kv_dim], addressed through
+      // the block table).
+      kernel::paged_kv_scatter_cu(key_batch, key_cache, block_table_cu, positions_cu, kv_dim,
+                                  num_blocks, block_size, layer_idx, cuda_config_->stream);
+      kernel::paged_kv_scatter_cu(val_batch, value_cache, block_table_cu, positions_cu, kv_dim,
+                                  num_blocks, block_size, layer_idx, cuda_config_->stream);
+
+      // f. MHA: Paged Flash Decoding — split-KV pass + reduce pass, one
+      // launch pair per layer for the whole batch.
+      kernel::paged_attention_cu_batch(config_->head_num_, layer_idx, num_blocks, block_size,
+                                       kv_dim, config_->kv_head_num_, config_->head_size_,
+                                       positions_cu, block_table_cu, q_batch, partial_batch,
+                                       mha_out_batch, key_cache, value_cache, cuda_config_.get());
+#else
       // Write this layer's K/V rows into each sequence's KV cache slot
       // (head-dim-contiguous layout: cache[layer][slot][d][pos]).
-      kernel::kv_scatter_cu(key_batch, key_cache, kv_offsets_cu, positions_cu, kv_dim, num_slots,
+      kernel::kv_scatter_cu(key_batch, key_cache, block_table_cu, positions_cu, kv_dim, num_slots,
                             max_seq_len, layer_idx, cuda_config_->stream);
-      kernel::kv_scatter_cu(val_batch, value_cache, kv_offsets_cu, positions_cu, kv_dim, num_slots,
+      kernel::kv_scatter_cu(val_batch, value_cache, block_table_cu, positions_cu, kv_dim, num_slots,
                             max_seq_len, layer_idx, cuda_config_->stream);
 
       // f. MHA: Flash Decoding — split-KV pass + reduce pass, one launch pair
       // per layer for the whole batch.
       kernel::mha_kernel_cu_batch(config_->head_num_, layer_idx, num_slots, max_seq_len, kv_dim,
                                   config_->kv_head_num_, config_->head_size_, positions_cu,
-                                  kv_offsets_cu, q_batch, partial_batch, mha_out_batch, key_cache,
+                                  block_table_cu, q_batch, partial_batch, mha_out_batch, key_cache,
                                   value_cache, cuda_config_.get());
+#endif
     } else {
       // CPU path: batched K/V GEMM (one GEMM per weight matrix, NOT a
       // per-sequence loop), batched Qwen3 K-norm, batched RoPE, then scatter
       // into the head-dim-contiguous cache and a batched OpenMP attention.
-      {
-        auto& wk = qwen_layers_->wk_layers_.at(layer_idx);
-        std::dynamic_pointer_cast<op::MatmulLayer>(wk)->set_batch_size(batch);
-        STATUS_CHECK(wk->forward(rms_out, key_batch));
+      if (!fused_qkv) {
+        {
+          auto& wk = qwen_layers_->wk_layers_.at(layer_idx);
+          std::dynamic_pointer_cast<op::MatmulLayer>(wk)->set_batch_size(batch);
+          STATUS_CHECK(wk->forward(rms_out, key_batch));
+        }
       }
 
       // K norm (Qwen3 specific) — per-head RMSNorm over the whole batch
@@ -884,15 +1023,21 @@ base::Status Qwen3Model::forward_batch(
         key_batch.reshape({batch, kv_dim});
       }
 
-      {
-        auto& wv = qwen_layers_->wv_layers_.at(layer_idx);
-        std::dynamic_pointer_cast<op::MatmulLayer>(wv)->set_batch_size(batch);
-        STATUS_CHECK(wv->forward(rms_out, val_batch));
+      if (!fused_qkv) {
+        {
+          auto& wv = qwen_layers_->wv_layers_.at(layer_idx);
+          std::dynamic_pointer_cast<op::MatmulLayer>(wv)->set_batch_size(batch);
+          STATUS_CHECK(wv->forward(rms_out, val_batch));
+        }
       }
 
       kernel::rope_kernel_cpu_batch(dim, kv_dim, config_->head_size_, q_batch, key_batch,
                                     positions, get_buffer(ModelBufferType::kSinCache),
                                     get_buffer(ModelBufferType::kCosCache), nullptr);
+
+      // CPU kernels expect [batch] slot ids; the paged block table stores
+      // them in column 0 (slot-mode pool on CPU devices).
+      const tensor::Tensor& cpu_offsets = cpu_slot_offsets(block_table, batch);
 
       // Scatter K/V rows into the external cache:
       //   cache[layer][slot][d][pos] = key_batch[b][d]
@@ -905,7 +1050,7 @@ base::Status Qwen3Model::forward_batch(
 #pragma omp parallel for schedule(static)
         for (int32_t b = 0; b < batch; ++b) {
           const int32_t pos = positions.ptr<int32_t>()[b];
-          const int32_t slot = kv_offsets.ptr<int32_t>()[b];
+          const int32_t slot = cpu_offsets.ptr<int32_t>()[b];
           const int64_t slot_base = layer_base + static_cast<int64_t>(slot) * kv_dim * max_seq_len;
           for (int32_t d = 0; d < kv_dim; ++d) {
             const int64_t dst = slot_base + static_cast<int64_t>(d) * max_seq_len + pos;
@@ -918,7 +1063,7 @@ base::Status Qwen3Model::forward_batch(
       // f. MHA: batched OpenMP attention (one task per (batch, head)).
       kernel::mha_kernel_cpu_batch(config_->head_num_, layer_idx, num_slots, max_seq_len, kv_dim,
                                    config_->kv_head_num_, config_->head_size_, positions,
-                                   kv_offsets, q_batch, mha_out_batch, key_cache, value_cache);
+                                   cpu_offsets, q_batch, mha_out_batch, key_cache, value_cache);
     }
 
     // g. WO projection: [batch, dim] -> [batch, hidden_dim]
