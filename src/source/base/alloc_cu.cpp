@@ -67,9 +67,9 @@ void* CUDADeviceAllocator::allocate(size_t byte_size) const {
     if (cudaSuccess != state) {
       char buf[256];
       snprintf(buf, 256,
-               "Error: CUDA error when allocating %lu MB memory! maybe there's no enough memory "
+               "Error: CUDA error when allocating %lu MB: %s (%d)! maybe there's no enough memory "
                "left on  device.",
-               byte_size >> 20);
+               byte_size >> 20, cudaGetErrorString(state), static_cast<int>(state));
       LOG(ERROR) << buf;
       return nullptr;
     }
@@ -80,26 +80,36 @@ void* CUDADeviceAllocator::allocate(size_t byte_size) const {
   }
 
   auto& cuda_buffers = cuda_buffers_map_[id];
+  // Best-fit: hand out the smallest idle buffer that satisfies the request.
+  // First-fit instead lets a small tensor consume a large pooled buffer, so
+  // the next large-tensor request finds nothing reusable and cudaMallocs a
+  // fresh one every step — the pool then grows without bound until the
+  // device OOMs (observed: +808KB/step of partial_batch buffers).
+  int sel_id = -1;
   for (int i = 0; i < cuda_buffers.size(); i++) {
-    if (cuda_buffers[i].byte_size >= byte_size && !cuda_buffers[i].busy) {
-      cuda_buffers[i].busy = true;
-      no_busy_cnt_[id] -= cuda_buffers[i].byte_size;
-      VLOG(1) << "[CUDA_ALLOC] SMALL reuse id=" << i
-                << " asked=" << byte_size << "B"
-                << " have=" << cuda_buffers[i].byte_size << "B"
-                << " (pool small cnt=" << cuda_buffers.size()
-                << " idle=" << (no_busy_cnt_[id] >> 10) << "KB)";
-      return cuda_buffers[i].data;
+    if (cuda_buffers[i].byte_size >= byte_size && !cuda_buffers[i].busy &&
+        (sel_id == -1 || cuda_buffers[i].byte_size < cuda_buffers[sel_id].byte_size)) {
+      sel_id = i;
     }
+  }
+  if (sel_id != -1) {
+    cuda_buffers[sel_id].busy = true;
+    no_busy_cnt_[id] -= cuda_buffers[sel_id].byte_size;
+    VLOG(1) << "[CUDA_ALLOC] SMALL reuse id=" << sel_id
+              << " asked=" << byte_size << "B"
+              << " have=" << cuda_buffers[sel_id].byte_size << "B"
+              << " (pool small cnt=" << cuda_buffers.size()
+              << " idle=" << (no_busy_cnt_[id] >> 10) << "KB)";
+    return cuda_buffers[sel_id].data;
   }
   void* ptr = nullptr;
   state = malloc_with_retry(&ptr, byte_size);
   if (cudaSuccess != state) {
     char buf[256];
     snprintf(buf, 256,
-             "Error: CUDA error when allocating %lu MB memory! maybe there's no enough memory "
+             "Error: CUDA error when allocating %lu MB: %s (%d)! maybe there's no enough memory "
              "left on  device.",
-             byte_size >> 20);
+             byte_size >> 20, cudaGetErrorString(state), static_cast<int>(state));
     LOG(ERROR) << buf;
     return nullptr;
   }
