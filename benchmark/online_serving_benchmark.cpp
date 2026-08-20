@@ -233,8 +233,6 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
   }
   int max_total_seq_len =
       std::min(max_prompt_len + args.max_gen, static_cast<int>(model->seq_len()));
-  LOG(INFO) << "[SERVING] KV slot: max_prompt=" << max_prompt_len
-            << " max_gen=" << args.max_gen << " => " << max_total_seq_len;
 
   // 收缩模型内部 KV cache(必须在任何 decode CUDA graph 捕获之前,同 offline)
   model->resize_internal_kv_cache(max_prompt_len);
@@ -450,10 +448,6 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
   m.gpu_mem_util_pct = sampler.mem_util_pct();
   m.gpu_mem_used_mb = sampler.mem_used_mb();
 
-  LOG(INFO) << "[SERVING] run " << run_id << " finished: " << total_ms << " ms, "
-            << m.completed << "/" << m.num_requests << " requests (rejected="
-            << m.rejected << "), " << m.output_tokens << " output tokens, "
-            << "nvml samples=" << sampler.samples();
   return m;
 }
 
@@ -499,7 +493,6 @@ static void write_csv(const std::string& path,
       << r.gpu_mem_util_pct << "," << r.gpu_mem_used_mb << "\n";
   }
   f.close();
-  LOG(INFO) << "结果 CSV 已写出: " << path;
 }
 
 // ============================== 控制台报告 ==============================
@@ -606,14 +599,6 @@ int main(int argc, char* argv[]) {
   args.checkpoint = resolve_default(args.checkpoint, exe_root);
   args.tokenizer = resolve_default(args.tokenizer, exe_root);
   args.model_config = resolve_default(args.model_config, exe_root);
-  LOG(INFO) << "dataset    : " << args.dataset
-            << "\ncheckpoint : " << args.checkpoint
-            << "\ntokenizer  : " << args.tokenizer
-            << "\nconfig     : " << args.model_config
-            << "\nrequest_rate="
-            << (args.request_rate < 0 ? "inf" : std::to_string(args.request_rate))
-            << " burstiness=" << args.burstiness
-            << " duration=" << args.duration;
 
   // ---- 数据集 ----
   std::vector<Request> dataset = load_dataset(args.dataset);
@@ -621,14 +606,12 @@ int main(int argc, char* argv[]) {
     LOG(ERROR) << "数据集为空: " << args.dataset;
     return -1;
   }
-  LOG(INFO) << "数据集加载: " << dataset.size() << " 条 prompt";
 
   // 按种子抽样(仅当请求数小于数据集规模时)
   if (args.num_requests > 0 && args.num_requests < static_cast<int>(dataset.size())) {
     std::mt19937 rng(args.seed);
     std::shuffle(dataset.begin(), dataset.end(), rng);
     dataset.resize(args.num_requests);
-    LOG(INFO) << "随机抽样(seed=" << args.seed << "): " << dataset.size() << " 条";
   }
 
   // ---- 模型加载:按 --model-type 运行时选择(与 offline 一致) ----
@@ -662,11 +645,6 @@ int main(int argc, char* argv[]) {
 
   auto model = load_model();
   if (!model) return -1;
-  LOG(INFO) << "模型就绪: layers=" << model->layer_num()
-            << " hidden=" << model->hidden_dim()
-            << " kv_dim=" << model->kv_dim()
-            << " vocab=" << model->vocab_size()
-            << " seq_len=" << model->seq_len();
 
   // ---- Tokenize(仅对抽样后的子集) ----
   std::vector<std::vector<int>> prompt_tokens;
@@ -679,29 +657,22 @@ int main(int argc, char* argv[]) {
     LOG(ERROR) << "所有 prompt 编码后均为空";
     return -1;
   }
-  LOG(INFO) << "编码完成: " << prompt_tokens.size() << " 条有效 prompt";
 
   // ---- 模型结构 / 算力 ----
   ModelDims dims;
   double flops_per_tok = 0;
   if (load_model_dims(args.model_config, dims)) {
     flops_per_tok = flops_per_token(dims);
-    LOG(INFO) << "模型结构: d=" << dims.d << " ffn=" << dims.ffn
-              << " layers=" << dims.layers << " heads=" << dims.heads
-              << " kv_heads=" << dims.kv_heads << " => " << flops_per_tok / 1e9
-              << " GFLOPs/token";
   } else {
     LOG(WARNING) << "无法读取 model config,MFU 将不可用: " << args.model_config;
   }
   double peak_tflops = peak_fp32_tflops();
-  LOG(INFO) << "GPU 峰值 FP32 算力: " << peak_tflops << " TFLOPS";
 
   // ---- 正式压测 ----
   // 多轮迭代可安全复用同一 Model(同 offline,decode_step 会校验并重捕获 CUDA graph)
   std::vector<ServingMetrics> results;
   results.reserve(args.iterations);
   for (int i = 0; i < args.iterations; ++i) {
-    LOG(INFO) << "=== Run " << (i + 1) << "/" << args.iterations << " ===";
     results.push_back(serve_once(model, prompt_tokens, args, i, flops_per_tok,
                                  peak_tflops));
     print_report(results.back(), args);
@@ -717,6 +688,5 @@ int main(int argc, char* argv[]) {
     write_csv(args.output_csv, results);
   }
 
-  LOG(INFO) << "Serving benchmark 完成。";
   return 0;
 }

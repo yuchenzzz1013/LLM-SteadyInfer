@@ -2,8 +2,9 @@
 # 统一 Benchmark 构建脚本(双模式)
 #
 # 包含目标:
-#   benchmark_llama / benchmark_qwen2 / benchmark_qwen3   单模型快速压测
 #   offline_batch_benchmark                               离线批推理全指标压测
+#   online_serving_benchmark                              在线 Serving 压测(vLLM 风格)
+#   verify_tokens                                         Token 一致性 A/B 验证驱动
 #
 # 模式 1 — 根项目子目录(推荐):根 CMakeLists.txt 中 add_subdirectory 引入,
 #   直接复用根项目的 llama target 与 CPM 依赖。
@@ -23,11 +24,7 @@ else()
   set(BENCH_STANDALONE OFF)
 endif()
 
-# 选项控制(默认开启;作为根项目子目录时沿用根项目 cache 中的同名选项,
-# 即引擎编译时启用的模型集合与压测程序自动保持一致)
-option(LLAMA3_SUPPORT        "Build LLaMA3 benchmark"            ON)
-option(QWEN2_SUPPORT         "Build Qwen2 benchmark"             ON)
-option(QWEN3_SUPPORT         "Build Qwen3 benchmark"             ON)
+# 选项控制(默认开启)
 option(OFFLINE_BATCH_BENCHMARK "Build offline batch benchmark"   ON)
 option(ONLINE_SERVING_BENCHMARK "Build online serving benchmark (vLLM-style)" ON)
 
@@ -53,9 +50,8 @@ if(BENCH_STANDALONE)
   add_library(bench_deps INTERFACE)
 
   # ---------- 编译选项(与根项目 benchmark 目标保持一致) ----------
-  # 引擎无条件编译全部三个模型,这里同时定义三个 SUPPORT 宏,与引擎产物对齐。
   target_compile_definitions(bench_deps INTERFACE
-    GLOG_USE_GLOG_EXPORT LLAMA3_SUPPORT QWEN2_SUPPORT QWEN3_SUPPORT)
+    GLOG_USE_GLOG_EXPORT)
 
   # ---------- 头文件 ----------
   target_include_directories(bench_deps INTERFACE
@@ -158,30 +154,6 @@ endif()
 # ----------------------------------------------
 # 各可执行目标:统一链接 bench_deps
 # ----------------------------------------------
-# LLaMA3 基准 (支持 --batch 多批次 continuous batching 模式)
-if (LLAMA3_SUPPORT)
-    message(STATUS "Building LLaMA3 benchmark")
-    add_executable(benchmark_llama benchmark_llama.cpp)
-    target_link_libraries(benchmark_llama PRIVATE bench_deps)
-    set_target_properties(benchmark_llama PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-endif()
-
-# Qwen2 基准
-if (QWEN2_SUPPORT)
-    message(STATUS "Building Qwen2 benchmark")
-    add_executable(benchmark_qwen2 benchmark_qwen2.cpp)
-    target_link_libraries(benchmark_qwen2 PRIVATE bench_deps)
-    set_target_properties(benchmark_qwen2 PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-endif()
-
-# Qwen3 基准
-if (QWEN3_SUPPORT)
-    message(STATUS "Building Qwen3 benchmark")
-    add_executable(benchmark_qwen3 benchmark_qwen3.cpp)
-    target_link_libraries(benchmark_qwen3 PRIVATE bench_deps)
-    set_target_properties(benchmark_qwen3 PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-endif()
-
 # 离线批推理基准 (离线压测全指标:吞吐/延迟/KV 碎片/硬件利用率)
 if (OFFLINE_BATCH_BENCHMARK)
     message(STATUS "Building offline batch benchmark")
@@ -210,7 +182,7 @@ endif()
 # ---------- 独立模式:运行时库搜索路径(作用于全部目标) ----------
 if(BENCH_STANDALONE)
   list(REMOVE_DUPLICATES RPATH_DIRS)
-  foreach(tgt benchmark_llama benchmark_qwen2 benchmark_qwen3 offline_batch_benchmark online_serving_benchmark verify_tokens)
+  foreach(tgt offline_batch_benchmark online_serving_benchmark verify_tokens)
     if(TARGET ${tgt})
       set_target_properties(${tgt} PROPERTIES
         BUILD_RPATH "${RPATH_DIRS}"

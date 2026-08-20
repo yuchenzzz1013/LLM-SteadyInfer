@@ -13,23 +13,6 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 14)
 
-option(LLAMA3_SUPPORT OFF)
-if (LLAMA3_SUPPORT)
-  message(STATUS "LLAMA3 SUPPORT")
-  add_definitions(-DLLAMA3_SUPPORT)
-endif()
-option(QWEN2_SUPPORT OFF)
-if (QWEN2_SUPPORT)
-  message(STATUS "QWEN2 SUPPORT")
-  add_definitions(-DQWEN2_SUPPORT)
-endif()
-
-option(QWEN3_SUPPORT OFF)
-if (QWEN3_SUPPORT)
-  message(STATUS "QWEN3 SUPPORT")
-  add_definitions(-DQWEN3_SUPPORT)
-endif()
-
 # vLLM-style paged attention: block-allocated KV cache
 # [num_layers, num_blocks, block_size, kv_dim] + block_table indirection.
 # OFF keeps the legacy continuous layout [num_layers, max_batch, kv_dim,
@@ -124,5 +107,5 @@ if(USE_CPM)
 endif()
 
 set_target_properties(llama PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-# 统一基准目录:benchmark_llama/qwen2/qwen3 + offline_batch_benchmark
+# 统一基准目录:offline_batch_benchmark / online_serving_benchmark / verify_tokens
 add_subdirectory(benchmark)

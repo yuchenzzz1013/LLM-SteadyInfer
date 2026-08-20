@@ -254,12 +254,6 @@ static std::vector<size_t> unicode_regex_split_custom_gpt2(const std::string & t
                 bpe_offsets.push_back(len);
             }
             _prev_end = end;
-            //if (len > 0) {
-            //    std::string s = "";
-            //    for(size_t p = end-len; p < end; p++)
-            //        s += unicode_cpt_to_utf8(cpts[p]);
-            //    printf(">>> '%s'\n", s.c_str());
-            //}
             return len;
         };
 
@@ -372,12 +366,6 @@ static std::vector<size_t> unicode_regex_split_custom_llama3(const std::string &
                 bpe_offsets.push_back(len);
             }
             _prev_end = end;
-            //if (len > 0) {
-            //    std::string s = "";
-            //    for(size_t p = end-len; p < end; p++)
-            //        s += unicode_cpt_to_utf8(cpts[p]);
-            //    printf(">>> '%s'\n", s.c_str());
-            //}
             return len;
         };
 
@@ -777,8 +765,6 @@ std::vector<std::string> unicode_regex_split(const std::string & text, const std
                     regex_expr_collapsed += regex_expr[i];
                 }
 
-                //printf("text_collapsed: %s\n", text_collapsed.c_str());
-                //printf("regex_expr_collapsed: %s\n", regex_expr_collapsed.c_str());
                 bpe_offsets = unicode_regex_split_stl(text_collapsed, regex_expr_collapsed, bpe_offsets);
             } else {
                 // no unicode category used, we can use std::wregex directly
@@ -792,8 +778,6 @@ std::vector<std::string> unicode_regex_split(const std::string & text, const std
                     }
                 }
 
-                //printf("text: %s\n", text.c_str());
-                //printf("regex_expr: %s\n", regex_expr.c_str());
                 bpe_offsets = unicode_regex_split_stl(wtext, wregex_expr, bpe_offsets);
             }
         } catch (std::regex_error & e) {

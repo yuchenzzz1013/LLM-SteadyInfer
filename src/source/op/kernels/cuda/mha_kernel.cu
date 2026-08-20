@@ -3,7 +3,6 @@
 #include <cfloat>
 #include <cub/cub.cuh>
 #include "mha_kernel.cuh"
-#include <base/tick.h>
 namespace kernel {
 // The flash kernels use one accumulator per thread for the output dims, so
 // head_size must not exceed the 256-thread block (real models: <= 128).

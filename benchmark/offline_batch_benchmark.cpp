@@ -163,7 +163,7 @@ struct RunMetrics {
   // KV cache
   double kv_cache_util_global = 0;   // 时间加权:已用 token 槽 / 已分配容量
   double kv_cache_frag_global = 0;   // 1 - util_global
-  double kv_cache_frag_per_seq = 0;  // 每请求视角(与 benchmark_qwen2 口径一致)
+  double kv_cache_frag_per_seq = 0;  // 每请求视角
   double avg_busy_kv_slots = 0, peak_busy_kv_slots = 0;
 
   // batch 重建开销
@@ -198,9 +198,6 @@ static RunMetrics run_once(const std::shared_ptr<model::Model>& model,
   }
   int max_total_seq_len =
       std::min(max_prompt_len + max_gen_len, static_cast<int>(model->seq_len()));
-  LOG(INFO) << "[BENCH] KV slot: max_prompt=" << max_prompt_len
-            << " max_gen=" << max_gen_len << " => " << max_total_seq_len;
-
   // 收缩模型内部 KV cache —— 必须在任何 decode CUDA graph 捕获之前调用:
   // 捕获会把当时的 buffer 指针烘焙进图,捕获后再重分配会导致 replay 时
   // 访问已释放内存(illegal memory access)。
@@ -331,7 +328,7 @@ static RunMetrics run_once(const std::shared_ptr<model::Model>& model,
   m.kv_cache_util_global =
       alloc_cap_sum > 0 ? static_cast<double>(used_cap_sum) / alloc_cap_sum : 0;
   m.kv_cache_frag_global = 1.0 - m.kv_cache_util_global;
-  // 每请求视角:单个请求对其 KV slot 序列维度的浪费(与 benchmark_qwen2 口径一致)
+  // 每请求视角:单个请求对其 KV slot 序列维度的浪费
   m.kv_cache_frag_per_seq = mean(per_seq_frag);
   m.avg_busy_kv_slots =
       kv_samples > 0 ? static_cast<double>(busy_slots_sum) / kv_samples : 0;
@@ -367,10 +364,6 @@ static RunMetrics run_once(const std::shared_ptr<model::Model>& model,
   m.gpu_mem_util_pct = sampler.mem_util_pct();
   m.gpu_mem_used_mb = sampler.mem_used_mb();
 
-  LOG(INFO) << "[BENCH] run " << run_id << " finished: " << total_ms << " ms, "
-            << m.completed << "/" << m.num_requests << " requests, "
-            << m.output_tokens << " output tokens, "
-            << "nvml samples=" << sampler.samples();
   return m;
 }
 
@@ -412,7 +405,6 @@ static void write_csv(const std::string& path,
       << r.gpu_mem_used_mb << "\n";
   }
   f.close();
-  LOG(INFO) << "结果 CSV 已写出: " << path;
 }
 
 // ============================== 控制台报告 ==============================
@@ -509,10 +501,6 @@ int main(int argc, char* argv[]) {
   args.checkpoint = resolve_default(args.checkpoint, exe_root);
   args.tokenizer = resolve_default(args.tokenizer, exe_root);
   args.model_config = resolve_default(args.model_config, exe_root);
-  LOG(INFO) << "dataset    : " << args.dataset
-            << "\ncheckpoint : " << args.checkpoint
-            << "\ntokenizer  : " << args.tokenizer
-            << "\nconfig     : " << args.model_config;
 
   // ---- 数据集 ----
   std::vector<Request> dataset = load_dataset(args.dataset);
@@ -520,14 +508,12 @@ int main(int argc, char* argv[]) {
     LOG(ERROR) << "数据集为空: " << args.dataset;
     return -1;
   }
-  LOG(INFO) << "数据集加载: " << dataset.size() << " 条 prompt";
 
   // 按种子抽样(仅当请求数小于数据集规模时)
   if (args.num_requests > 0 && args.num_requests < static_cast<int>(dataset.size())) {
     std::mt19937 rng(args.seed);
     std::shuffle(dataset.begin(), dataset.end(), rng);
     dataset.resize(args.num_requests);
-    LOG(INFO) << "随机抽样(seed=" << args.seed << "): " << dataset.size() << " 条";
   }
 
   // ---- 模型加载:按 --model-type 运行时选择(三个模型均已编译进引擎库) ----
@@ -561,11 +547,6 @@ int main(int argc, char* argv[]) {
 
   auto model = load_model();
   if (!model) return -1;
-  LOG(INFO) << "模型就绪: layers=" << model->layer_num()
-            << " hidden=" << model->hidden_dim()
-            << " kv_dim=" << model->kv_dim()
-            << " vocab=" << model->vocab_size()
-            << " seq_len=" << model->seq_len();
 
   // ---- Tokenize(仅对抽样后的子集) ----
   std::vector<std::vector<int>> prompt_tokens;
@@ -578,22 +559,16 @@ int main(int argc, char* argv[]) {
     LOG(ERROR) << "所有 prompt 编码后均为空";
     return -1;
   }
-  LOG(INFO) << "编码完成: " << prompt_tokens.size() << " 条有效 prompt";
 
   // ---- 模型结构 / 算力 ----
   ModelDims dims;
   double flops_per_tok = 0;
   if (load_model_dims(args.model_config, dims)) {
     flops_per_tok = flops_per_token(dims);
-    LOG(INFO) << "模型结构: d=" << dims.d << " ffn=" << dims.ffn
-              << " layers=" << dims.layers << " heads=" << dims.heads
-              << " kv_heads=" << dims.kv_heads << " => " << flops_per_tok / 1e9
-              << " GFLOPs/token";
   } else {
-    LOG(WARNING) << "无法读取 model config,M FU 将不可用: " << args.model_config;
+    LOG(WARNING) << "无法读取 model config,MFU 将不可用: " << args.model_config;
   }
   double peak_tflops = peak_fp32_tflops();
-  LOG(INFO) << "GPU 峰值 FP32 算力: " << peak_tflops << " TFLOPS";
 
   // ---- 正式压测 ----
   // 多轮迭代可安全复用同一 Model:引擎 decode_step 已在 replay 前校验图中烘焙的
@@ -602,7 +577,6 @@ int main(int argc, char* argv[]) {
   std::vector<RunMetrics> results;
   results.reserve(args.iterations);
   for (int i = 0; i < args.iterations; ++i) {
-    LOG(INFO) << "=== Run " << (i + 1) << "/" << args.iterations << " ===";
     results.push_back(run_once(model, prompt_tokens, i, args.max_batch,
                                args.max_gen, flops_per_tok, peak_tflops));
     print_report(results.back());
@@ -618,6 +592,5 @@ int main(int argc, char* argv[]) {
     write_csv(args.output_csv, results);
   }
 
-  LOG(INFO) << "Benchmark 完成。";
   return 0;
 }

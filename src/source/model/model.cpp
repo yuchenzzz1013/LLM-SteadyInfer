@@ -131,7 +131,6 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
       }
     }
     if (evict_batch >= 0 && evict_batch != batch) {
-      LOG(INFO) << "[GRAPH] Evicting decode graph entry batch=" << evict_batch;
       decode_graph_pool_.erase(evict_batch);
     }
   }
@@ -180,8 +179,6 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
        entry->captured_key_blocks != dims.num_blocks ||
        entry->captured_block_size != dims.block_size ||
        entry->captured_table_stride != table_stride)) {
-    LOG(INFO) << "[GRAPH] Decode graph batch=" << batch
-              << " references stale KV/logits buffers; destroying and re-capturing.";
     cudaGraphExecDestroy(entry->exec);
     entry->exec = nullptr;
     // 让流上空闲后再重新捕获,提高 BeginCapture 成功率(发生在压测边界,
@@ -238,8 +235,6 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
     entry->captured_key_blocks = dims.num_blocks;
     entry->captured_block_size = dims.block_size;
     entry->captured_table_stride = table_stride;
-    LOG(INFO) << "[GRAPH] Captured decode graph for batch=" << batch
-              << " (paged=" << (dims.paged ? 1 : 0) << ")";
     return status;
   }
 
@@ -590,8 +585,6 @@ void Model::resize_internal_kv_cache(int32_t max_seq_len) {
   // re-captures against the resized cache. Cheap: resize happens at
   // benchmark setup time, not per decode step.
   if (!decode_graph_pool_.empty()) {
-    LOG(INFO) << "[GRAPH] Internal KV cache resized; invalidating "
-              << decode_graph_pool_.size() << " captured decode graph(s).";
     decode_graph_pool_.clear();
   }
 
@@ -603,8 +596,6 @@ void Model::resize_internal_kv_cache(int32_t max_seq_len) {
   auto it_val = buffers_.find(ModelBufferType::kValueCache);
 
   if (it_key != buffers_.end() && it_val != buffers_.end()) {
-    size_t old_bytes = it_key->second.byte_size() + it_val->second.byte_size();
-
     int32_t num_layers = it_key->second.get_dim(0);
     int32_t kv_dim = it_key->second.get_dim(2);
 
@@ -612,11 +603,6 @@ void Model::resize_internal_kv_cache(int32_t max_seq_len) {
                                      num_layers, max_seq_len, kv_dim, true, alloc);
     it_val->second = tensor::Tensor(base::DataType::kDataTypeFp32,
                                      num_layers, max_seq_len, kv_dim, true, alloc);
-
-    size_t new_bytes = it_key->second.byte_size() + it_val->second.byte_size();
-    LOG(INFO) << "[MODEL] Internal KV cache resized: "
-              << (old_bytes >> 20) << "MB -> " << (new_bytes >> 20) << "MB"
-              << " (seq_len " << max_seq_len << ")";
   }
 
   if (device_type_ == base::DeviceType::kDeviceCUDA) {

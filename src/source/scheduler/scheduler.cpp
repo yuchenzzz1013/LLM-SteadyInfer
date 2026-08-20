@@ -29,10 +29,6 @@ Scheduler::Scheduler(std::shared_ptr<model::Model> model,
     LOG(FATAL) << "Scheduler: model not properly initialized. kv_dim=" << kv_dim
                << " num_layers=" << num_layers;
   }
-  LOG(INFO) << "[SCHED] Creating scheduler: max_batch=" << max_batch_size
-            << " max_seq_len=" << max_seq_len
-            << " kv_dim=" << kv_dim
-            << " num_layers=" << num_layers;
   std::shared_ptr<base::DeviceAllocator> alloc;
   if (model_->device_type() == base::DeviceType::kDeviceCPU) {
     alloc = base::CPUDeviceAllocatorFactory::get_instance();
@@ -49,7 +45,6 @@ Scheduler::Scheduler(std::shared_ptr<model::Model> model,
       block_size_ = std::atoi(bs_env);
     }
   }
-  LOG(INFO) << "[SCHED] paged block_size=" << block_size_;
   kv_manager_ = std::make_unique<KVManager>(num_layers, max_batch_size,
                                              max_seq_len, kv_dim, alloc,
                                              model_->device_type(), block_size_);
@@ -61,7 +56,6 @@ Scheduler::Scheduler(std::shared_ptr<model::Model> model,
     const char* pc_env = std::getenv("LLAMA_DISABLE_PREFIX_CACHE");
     if (!(pc_env && std::string(pc_env) == "1")) {
       prefix_cache_ = std::make_unique<PrefixCache>(block_size_);
-      LOG(INFO) << "[SCHED] prefix cache enabled (LLAMA_DISABLE_PREFIX_CACHE=1 to disable)";
     }
   }
 #endif
@@ -79,7 +73,6 @@ Scheduler::Scheduler(std::shared_ptr<model::Model> model,
                << max_batch_size << "," << vocab_size
                << "] — GPU may be out of memory";
   }
-  LOG(INFO) << "[SCHED] Scheduler created, KVManager ready";
 }
 
 Scheduler::~Scheduler() {
@@ -87,11 +80,6 @@ Scheduler::~Scheduler() {
   // The block pool is pure bookkeeping: refcount leaks (or double frees)
   // silently strand blocks. Verify the invariant before the pool dies.
   if (kv_manager_ && kv_manager_->block_allocator()) {
-    LOG(INFO) << "[SCHED] block pool at destruction: free="
-              << kv_manager_->block_allocator()->free_block_count()
-              << "/" << kv_manager_->block_allocator()->num_blocks()
-              << " prefix_cache_entries="
-              << (prefix_cache_ ? prefix_cache_->entry_count() : 0);
     if (!kv_manager_->block_allocator()->invariant_holds()) {
       LOG(FATAL) << "[SCHED] BlockAllocator invariant violated at scheduler "
                     "destruction: refcount leak or double-free";

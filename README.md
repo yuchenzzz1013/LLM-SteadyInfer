@@ -1,14 +1,16 @@
 # LLM-SteadyInfer
 
-轻量级大模型推理框架，支持 LLaMA / Qwen 系列模型的高效推理。
+**轻量级大模型推理框架**，支持 LLaMA / Qwen 系列模型的高效推理。
 
 > **项目状态**：本项目**仍在持续开发中**。当前已完成核心框架、双后端算子、量化推理、分页注意力（PagedAttention）、Continuous Batching 调度器及离线/在线 Benchmark，后续将持续扩展功能、优化性能、支持更多模型。
 
+---
+
 ## 项目简介
 
-LLM-SteadyInfer 是一个轻量级大语言模型推理框架，采用 **C++ / CUDA C++** 实现，支持 **CPU / CUDA 双后端**运行。框架支持 FP32 及 INT8 量化推理（LLaMA && Qwen2），并提供了完整的推理流水线及性能基准测试工具。
+LLM-SteadyInfer 是一个轻量级大语言模型推理框架，采用 **C++ / CUDA C++** 实现，支持 **CPU / CUDA 双后端**运行。框架支持 FP32 及 INT8 量化推理（LLaMA & Qwen2），并提供了完整的推理流水线及性能基准测试工具。
 
-核心特性：
+### 核心特性
 
 - **分页 KV Cache**：块式显存池 + BlockTable 间接寻址，消除连续 KV 布局的显存碎片；block size 按工作负载自适应
 - **PagedAttention 内核**：支持 GQA 与 Flash Decoding 风格的分裂规约
@@ -18,10 +20,42 @@ LLM-SteadyInfer 是一个轻量级大语言模型推理框架，采用 **C++ / C
 - **CUDA Graph**：Decode 路径图捕获与重放，多 batch size 图池化
 - **Fused QKV**：Q / K / V 投影合并为单次 GEMM
 
+---
+
 ## 支持模型
 
 - LLaMA 系列
 - Qwen 系列（Qwen2、Qwen3）
+
+---
+
+## 环境要求与编译
+
+### 依赖
+- Linux
+- g++ 9+（C++17）
+- CUDA 11.8+
+- CMake 3.16+
+
+### 构建
+```bash
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release -DUSE_CPM=ON -DUSE_PAGED_ATTENTION=ON \
+         -DLLAMA3_SUPPORT=ON -DQWEN2_SUPPORT=ON -DQWEN3_SUPPORT=ON
+make -j$(nproc)
+```
+
+### 主要选项说明
+| 选项 | 作用 |
+|------|------|
+| `USE_CPM` | 自动拉取依赖 |
+| `USE_PAGED_ATTENTION` | 启用分页 KV |
+| `LLAMA3_SUPPORT` / `QWEN2_SUPPORT` / `QWEN3_SUPPORT` | 模型支持开关，按需开启 |
+
+### 模型文件准备
+需准备自定义格式 `.bin` 权重及对应 tokenizer。
+
+---
 
 ## 项目结构
 
@@ -33,7 +67,6 @@ LLM-SteadyInfer/
 │   ├── online_serving_benchmark.cpp # 在线 Serving 压测
 │   └── verify_tokens.cpp           # Token 一致性 A/B 验证
 ├── cmake/                          # CMake 构建配置
-|
 ├── src/
 │   ├── include/                    # 头文件（base / model / op / sampler / scheduler / tensor）
 │   └── source/                     # 源文件（含 op/kernels/cuda 下的 CUDA 内核）
@@ -42,8 +75,8 @@ LLM-SteadyInfer/
 └── README.md
 ```
 
+---
+
 ## 致谢
 
-本项目在设计与实现过程中参考了 [KuiperLLama](https://github.com/zjhellofss/KuiperLLama)，特此致谢！
-
----
+> 感谢 [vLLM](https://github.com/vllm-project/vllm) 与 [KuiperLLama](https://github.com/zjhellofss/KuiperLLama) 项目为本项目提供的设计参考与启发。

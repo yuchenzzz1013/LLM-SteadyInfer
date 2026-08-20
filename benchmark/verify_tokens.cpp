@@ -40,8 +40,6 @@ int main(int argc, char* argv[]) {
   if (!st) {
     LOG(FATAL) << "Init failed: " << st.get_err_code();
   }
-  LOG(INFO) << "Model ready. kv_dim=" << model->kv_dim()
-            << " layers=" << model->layer_num();
 
   // Warmup through the same scheduler path (exercises CUDA-graph capture).
   {

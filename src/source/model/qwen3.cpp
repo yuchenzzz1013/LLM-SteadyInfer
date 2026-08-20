@@ -15,7 +15,6 @@
 #include "../op/kernels/cuda/mha_kernel.cuh"
 #include "../op/kernels/cuda/paged_kernels.cuh"
 #include "../op/kernels/cuda/rope_kernel.cuh"
-#include "base/tick.h"
 namespace model {
 
 void Qwen3Layers::to_cuda(std::shared_ptr<kernel::CudaConfig> config) {
@@ -313,11 +312,9 @@ void Qwen3Model::build_fused_qkv_layers() {
   // Escape hatch: fall back to the three-GEMM path (numerics A/B).
   const char* disable = std::getenv("LLAMA_DISABLE_FUSED_QKV");
   if (disable && std::string(disable) == "1") {
-    LOG(INFO) << "[MODEL] Fused QKV disabled via LLAMA_DISABLE_FUSED_QKV";
     return;
   }
   if (is_quant_model_) {
-    LOG(INFO) << "[MODEL] Fused QKV skipped for int8 quant model";
     return;
   }
 
@@ -377,8 +374,6 @@ void Qwen3Model::build_fused_qkv_layers() {
     qwen_layers_->fused_qkv_weight_src_.push_back(fused_w);
   }
   qwen_layers_->fused_qkv_enabled_ = true;
-  LOG(INFO) << "[MODEL] Fused QKV ready: " << num_layers << " layers of ["
-            << fused_dim << ", " << hidden_dim << "] (LLAMA_DISABLE_FUSED_QKV=1 to disable)";
 }
 
 void Qwen3Model::init_mem() {
