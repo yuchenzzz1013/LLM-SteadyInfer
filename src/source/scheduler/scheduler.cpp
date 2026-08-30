@@ -113,9 +113,11 @@ int Scheduler::add_request(const std::vector<int>& prompt_tokens) {
   const int seq_prompt_len = seq.num_prompt_tokens;
   const int seq_max_gen_len = seq.max_gen_len;
   waiting_queue_.push_back(std::move(seq));
+#ifndef NDEBUG
   VLOG(1) << "[SCHED] add_request id=" << seq_id
           << " prompt_len=" << seq_prompt_len
           << " max_gen_len=" << seq_max_gen_len;
+#endif
   return seq_id;
 }
 
@@ -133,10 +135,13 @@ void Scheduler::step() {
   // are pure index bookkeeping until the pool itself is destroyed.)
   constexpr int kFreeIdleInterval = 1000;
   if (step_count % kFreeIdleInterval == 0) {
+#ifndef NDEBUG
     VLOG(1) << "[SCHED] Periodic pool flush at step " << step_count;
+#endif
     base::CUDADeviceAllocatorFactory::get_instance()->free_idle();
   }
 
+#ifndef NDEBUG
   VLOG(1) << "[SCHED] === step " << step_count << " begin === "
           << "running=" << running_sequences_.size()
           << " waiting=" << waiting_queue_.size()
@@ -152,15 +157,20 @@ void Scheduler::step() {
               << " used=" << ((total_mem - free_mem) >> 20) << "MB";
     }
   }
+#endif
 
   try_admit_sequences();
   auto rows = build_batch_rows();
   if (!rows.empty()) {
+#ifndef NDEBUG
     VLOG(1) << "[SCHED] batch size=" << rows.size()
             << " is_pure_decode=" << (rows[0].is_decode ? 1 : 0);
+#endif
     execute_batch(rows);
   } else {
+#ifndef NDEBUG
     VLOG(1) << "[SCHED] empty batch this step";
+#endif
   }
   update_sequences();
 }
@@ -185,8 +195,10 @@ void Scheduler::try_admit_sequences() {
       waiting_queue_.pop_front();
       resumed.state = SeqState::RUNNING;
       resumed.admit_time = now;
+#ifndef NDEBUG
       VLOG(1) << "[SCHED] resumed preempted seq id=" << resumed.id
               << " blocks=" << resumed.num_blocks_allocated;
+#endif
       running_sequences_.push_back(std::move(resumed));
       continue;
     }
@@ -243,9 +255,11 @@ void Scheduler::try_admit_sequences() {
       admitted.is_prefill_complete =
           (admitted.next_prefill_chunk_start >= admitted.num_prompt_tokens);
     }
+#ifndef NDEBUG
     VLOG(1) << "[SCHED] admitted seq id=" << admitted.id
             << " prompt_blocks=" << prompt_blocks
             << " shared_prefix=" << matched << " row=" << row;
+#endif
     running_sequences_.push_back(std::move(admitted));
   }
 #else
@@ -335,11 +349,13 @@ void Scheduler::truncate_sequence(Sequence& seq, int keep_blocks) {
     }
   }
   seq.state = SeqState::PREEMPTED;
+#ifndef NDEBUG
   VLOG(1) << "[SCHED] preempted seq id=" << seq.id
           << " keep_blocks=" << keep_blocks
           << " trunc_pos=" << trunc_pos
           << " prompt=" << seq.num_prompt_tokens
           << " gen=" << seq.num_generated_tokens;
+#endif
 #else
   UNUSED(seq);
   UNUSED(keep_blocks);
@@ -438,8 +454,10 @@ std::vector<Scheduler::BatchRow> Scheduler::build_batch_rows() {
         prefill_token_budget_ = std::max(target, prefill_token_budget_ / 2);
       }
       prefill_token_budget_ = std::max(512, std::min(4096, prefill_token_budget_));
+#ifndef NDEBUG
       VLOG(1) << "[SCHED] prefill budget=" << prefill_token_budget_
               << " decode_backlog=" << decode_backlog << " pressure=" << pressure;
+#endif
     }
 
     int prefill_taken = 0;
@@ -544,15 +562,19 @@ void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
 #else
     block_table.index<int32_t>(i) = r.seq->kv_slot_id;
 #endif
+#ifndef NDEBUG
     VLOG(2) << "[SCHED] row[" << i << "] seq id=" << r.seq->id
             << " is_decode=" << (r.is_decode ? 1 : 0)
             << " pos=" << r.position
             << " token=" << r.token_id;
+#endif
   }
 
+#ifndef NDEBUG
   VLOG(1) << "[SCHED] batch size=" << batch
           << " decode_rows=" << num_decode_rows
           << " prefill_rows=" << (batch - num_decode_rows);
+#endif
 
   if (!any_prefill) {
     // Pure-decode step: the CUDA-graph path (decode_step) with its

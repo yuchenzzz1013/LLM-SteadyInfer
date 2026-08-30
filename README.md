@@ -104,25 +104,10 @@ mkdir build && cd build
 cmake .. \
   -DCMAKE_BUILD_TYPE=Release \
   -DUSE_CPM=ON \
-  -DUSE_PAGED_ATTENTION=ON \
-  -DLLAMA3_SUPPORT=ON \
-  -DQWEN2_SUPPORT=ON \
-  -DQWEN3_SUPPORT=ON
+  -DUSE_PAGED_ATTENTION=ON
 
 make -j$(nproc)
 ````
-
----
-
-### 主要选项说明
-
-| 选项                    | 作用                               |
-| --------------------- | -------------------------------- |
-| `USE_CPM`             | 自动管理第三方依赖                        |
-| `USE_PAGED_ATTENTION` | 开启 Paged KV Cache 与 Attention 优化 |
-| `LLAMA3_SUPPORT`      | 开启 LLaMA3 模型支持                   |
-| `QWEN2_SUPPORT`       | 开启 Qwen2 模型支持                    |
-| `QWEN3_SUPPORT`       | 开启 Qwen3 模型支持                    |
 
 ---
 
@@ -183,5 +168,3 @@ LLM-SteadyInfer/
 > 感谢 [vLLM](https://github.com/vllm-project/vllm) 与
 > [KuiperLLama](https://github.com/zjhellofss/KuiperLLama)
 > 项目在 LLM Serving 架构、KV Cache 管理以及轻量级 Runtime 设计方面提供的参考与启发。
-
-```

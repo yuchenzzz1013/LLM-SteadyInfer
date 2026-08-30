@@ -56,7 +56,9 @@ void PrefixCache::insert(const std::vector<int>& prompt_tokens,
   // rebuild (the next identical-prefix request re-records them).
   constexpr size_t kMaxEntries = 1u << 16;
   if (map_.size() >= kMaxEntries) {
+#ifndef NDEBUG
     VLOG(1) << "[PREFIX] entry cap reached (" << kMaxEntries << "); flushing";
+#endif
     map_.clear();
   }
 

@@ -64,6 +64,8 @@ struct Args {
   int max_gen = 256;
   int iterations = 1;
   int seed = 42;
+  int warmup_requests = 0;   // 预热请求数,0 = max_batch
+  int warmup_iterations = 3; // 预热轮数(每轮完整 prefill + decode)
 
   // ---- 在线负载(与 vLLM benchmark_serving 对齐) ----
   double request_rate = -1;  // 请求到达速率 req/s;<0 = 无穷大(全部立即到达,退化为 offline)
@@ -116,6 +118,10 @@ static Args parse_args(int argc, char** argv) {
     a.max_gen = std::stoi(get_arg(argc, argv, "--max-gen"));
   if (has_arg(argc, argv, "--iterations"))
     a.iterations = std::stoi(get_arg(argc, argv, "--iterations"));
+  if (has_arg(argc, argv, "--warmup-requests"))
+    a.warmup_requests = std::stoi(get_arg(argc, argv, "--warmup-requests"));
+  if (has_arg(argc, argv, "--warmup-iterations"))
+    a.warmup_iterations = std::stoi(get_arg(argc, argv, "--warmup-iterations"));
   if (has_arg(argc, argv, "--seed"))
     a.seed = std::stoi(get_arg(argc, argv, "--seed"));
   if (has_arg(argc, argv, "--request-rate"))
@@ -158,6 +164,9 @@ static void print_usage(const char* prog) {
       << "  --max-gen <N>          每个请求最大生成 token 数(默认 256)\n"
       << "  --iterations <N>       重复轮数(默认 1)\n"
       << "  --seed <N>             数据集抽样与到达过程随机种子(默认 42)\n"
+      << "  --warmup-requests <N>  预热请求数,0 = max_batch(默认 0)\n"
+      << "  --warmup-iterations <N> 预热轮数,每轮跑完整 prefill+decode 以稳定 GPU\n"
+      << "                         频率并预构建 CUDA graph(默认 3)\n"
       << "  --request-rate <R>     请求到达速率 req/s;inf 或 -1 表示全部立即到达\n"
       << "                         (退化为 offline 模式,默认 inf)\n"
       << "  --burstiness <g>       到达间隔伽马分布 shape 参数(默认 1.0 = 泊松过程;\n"
@@ -244,17 +253,33 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
                   Scheduler::resolve_block_size(avg_prompt_len));
 
   // ---- 预热:与正式压测共用同一 Scheduler(同 offline,统计中跳过) ----
+  // 每轮提交 warmup_requests(默认 = max_batch)个相同 prompt,请求同步完成
+  // prefill,第一轮即以目标 batch 触发纯 decode step 捕获 CUDA graph;跑
+  // warmup_iterations 轮完整 prefill + decode 稳定 GPU 频率并预热内存池。
   std::set<int> warm_ids;
   {
-    auto t = model->encode("warm up");
-    if (t.empty()) t = {1};
+    int warm_requests = args.warmup_requests > 0 ? args.warmup_requests
+                                                 : args.max_batch;
+    warm_requests = std::min(warm_requests, args.max_batch);
+    int warm_iterations = std::max(1, args.warmup_iterations);
+
+    auto t = model->encode("This is a warm-up prompt for stabilizing GPU "
+                           "frequency and graph capture.");
     std::vector<int> warm_tokens(t.begin(), t.end());
-    for (int i = 0; i < 2; ++i) {
-      int id = sched.add_request(warm_tokens);
-      if (id >= 0) warm_ids.insert(id);
+    // 极端负载下(max_seq_len 接近 prompt 长度)预热文本可能放不进 KV cache,
+    // add_request 会拒绝;回退为最小 prompt。
+    if (warm_tokens.empty() ||
+        static_cast<int>(warm_tokens.size()) >= max_total_seq_len) {
+      warm_tokens = {1};
     }
-    while (!sched.all_finished()) {
-      sched.step();
+    for (int iter = 0; iter < warm_iterations; ++iter) {
+      for (int i = 0; i < warm_requests; ++i) {
+        int id = sched.add_request(warm_tokens);
+        if (id >= 0) warm_ids.insert(id);
+      }
+      while (!sched.all_finished()) {
+        sched.step();
+      }
     }
     cudaDeviceSynchronize();
   }

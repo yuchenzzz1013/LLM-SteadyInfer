@@ -65,6 +65,8 @@ struct Args {
   int max_gen = 256;
   int iterations = 1;
   int seed = 42;
+  int warmup_requests = 0;   // 预热请求数,0 = max_batch
+  int warmup_iterations = 3; // 预热轮数(每轮完整 prefill + decode)
 };
 
 static Args parse_args(int argc, char** argv) {
@@ -106,6 +108,10 @@ static Args parse_args(int argc, char** argv) {
     a.iterations = std::stoi(get_arg(argc, argv, "--iterations"));
   if (has_arg(argc, argv, "--seed"))
     a.seed = std::stoi(get_arg(argc, argv, "--seed"));
+  if (has_arg(argc, argv, "--warmup-requests"))
+    a.warmup_requests = std::stoi(get_arg(argc, argv, "--warmup-requests"));
+  if (has_arg(argc, argv, "--warmup-iterations"))
+    a.warmup_iterations = std::stoi(get_arg(argc, argv, "--warmup-iterations"));
   return a;
 }
 
@@ -136,6 +142,9 @@ static void print_usage(const char* prog) {
       << "  --max-gen <N>          每个请求最大生成 token 数(默认 256)\n"
       << "  --iterations <N>       重复轮数(默认 1)\n"
       << "  --seed <N>             请求抽样随机种子(默认 42)\n"
+      << "  --warmup-requests <N>  预热请求数,0 = max_batch(默认 0)\n"
+      << "  --warmup-iterations <N> 预热轮数,每轮跑完整 prefill+decode 以稳定 GPU\n"
+      << "                         频率并预构建 CUDA graph(默认 3)\n"
       << "  --output-csv <path>    结果 CSV 路径(默认 results/metrics.csv)\n";
 }
 
@@ -183,6 +192,7 @@ struct RunMetrics {
 static RunMetrics run_once(const std::shared_ptr<model::Model>& model,
                            const std::vector<std::vector<int>>& prompt_tokens,
                            int run_id, int max_batch, int max_gen_len,
+                           int warmup_requests, int warmup_iterations,
                            double flops_per_tok, double peak_tflops) {
   using namespace scheduler;
   RunMetrics m;
@@ -215,17 +225,33 @@ static RunMetrics run_once(const std::shared_ptr<model::Model>& model,
   // (见 src/source/model/model.cpp 的 decode_step)。预热仍与压测共用同一
   // Scheduler:避免多余的一次重捕获,且预热请求在统计中跳过。
   // 注意:这里不能调用 free_idle(),它可能释放图引用的池内缓冲。
+  //
+  // 预热强度由 --warmup-requests / --warmup-iterations 控制:
+  //   - 每轮提交 warmup_requests(默认 = max_batch)个相同 prompt,请求同步
+  //     完成 prefill,第一轮即以目标 batch 触发一次纯 decode step —— decode
+  //     CUDA graph 在这一步按 batch 捕获,正式压测直接 replay,无首步尖峰;
+  //   - 跑 warmup_iterations 轮完整 prefill + decode,让 GPU 频率稳定,
+  //     并按正式规模预热内存池(中间张量复用池内缓冲,避免正式首步
+  //     cudaMalloc 延迟)。
   std::set<int> warm_ids;
   {
-    auto t = model->encode("warm up");
-    if (t.empty()) t = {1};
+    auto t = model->encode("This is a warm-up prompt for stabilizing GPU "
+                           "frequency and graph capture.");
     std::vector<int> warm_tokens(t.begin(), t.end());
-    for (int i = 0; i < 2; ++i) {
-      int id = sched.add_request(warm_tokens);
-      if (id >= 0) warm_ids.insert(id);
+    // 极端负载下(max_seq_len 接近 prompt 长度)预热文本可能放不进 KV cache,
+    // add_request 会拒绝;回退为最小 prompt。
+    if (warm_tokens.empty() ||
+        static_cast<int>(warm_tokens.size()) >= max_total_seq_len) {
+      warm_tokens = {1};
     }
-    while (!sched.all_finished()) {
-      sched.step();
+    for (int iter = 0; iter < warmup_iterations; ++iter) {
+      for (int i = 0; i < warmup_requests; ++i) {
+        int id = sched.add_request(warm_tokens);
+        if (id >= 0) warm_ids.insert(id);
+      }
+      while (!sched.all_finished()) {
+        sched.step();
+      }
     }
     cudaDeviceSynchronize();
   }
@@ -574,11 +600,18 @@ int main(int argc, char* argv[]) {
   // 多轮迭代可安全复用同一 Model:引擎 decode_step 已在 replay 前校验图中烘焙的
   // KV/logits 指针与形状,新 Scheduler 缓冲地址变化时自动销毁旧图并重捕获
   // (见 src/source/model/model.cpp),无需每轮重载模型。
+  // 预热请求数:默认取 max_batch(让预热 batch 覆盖正式峰值规模)。
+  int warm_requests = args.warmup_requests > 0 ? args.warmup_requests
+                                               : args.max_batch;
+  warm_requests = std::min(warm_requests, args.max_batch);
+  int warm_iterations = std::max(1, args.warmup_iterations);
+
   std::vector<RunMetrics> results;
   results.reserve(args.iterations);
   for (int i = 0; i < args.iterations; ++i) {
     results.push_back(run_once(model, prompt_tokens, i, args.max_batch,
-                               args.max_gen, flops_per_tok, peak_tflops));
+                               args.max_gen, warm_requests, warm_iterations,
+                               flops_per_tok, peak_tflops));
     print_report(results.back());
   }
 

@@ -56,9 +56,11 @@ void* CUDADeviceAllocator::allocate(size_t byte_size) const {
     }
     if (sel_id != -1) {
       big_buffers[sel_id].busy = true;
+#ifndef NDEBUG
       VLOG(1) << "[CUDA_ALLOC] BIG reuse id=" << sel_id
                 << " size=" << (byte_size >> 10) << "KB"
                 << " (pool big_buffers cnt=" << big_buffers.size() << ")";
+#endif
       return big_buffers[sel_id].data;
     }
 
@@ -74,8 +76,10 @@ void* CUDADeviceAllocator::allocate(size_t byte_size) const {
       return nullptr;
     }
     big_buffers.emplace_back(ptr, byte_size, true);
+#ifndef NDEBUG
     VLOG(1) << "[CUDA_ALLOC] BIG new size=" << (byte_size >> 10) << "KB"
               << " (pool big_buffers cnt=" << big_buffers.size() << ")";
+#endif
     return ptr;
   }
 
@@ -95,11 +99,13 @@ void* CUDADeviceAllocator::allocate(size_t byte_size) const {
   if (sel_id != -1) {
     cuda_buffers[sel_id].busy = true;
     no_busy_cnt_[id] -= cuda_buffers[sel_id].byte_size;
+#ifndef NDEBUG
     VLOG(1) << "[CUDA_ALLOC] SMALL reuse id=" << sel_id
               << " asked=" << byte_size << "B"
               << " have=" << cuda_buffers[sel_id].byte_size << "B"
               << " (pool small cnt=" << cuda_buffers.size()
               << " idle=" << (no_busy_cnt_[id] >> 10) << "KB)";
+#endif
     return cuda_buffers[sel_id].data;
   }
   void* ptr = nullptr;
@@ -114,9 +120,11 @@ void* CUDADeviceAllocator::allocate(size_t byte_size) const {
     return nullptr;
   }
   cuda_buffers.emplace_back(ptr, byte_size, true);
+#ifndef NDEBUG
   VLOG(1) << "[CUDA_ALLOC] SMALL new size=" << byte_size << "B"
             << " (pool small cnt=" << cuda_buffers.size()
             << " idle=" << (no_busy_cnt_[id] >> 10) << "KB)";
+#endif
   return ptr;
 }
 
@@ -133,8 +141,10 @@ void CUDADeviceAllocator::release(void* ptr) const {
   cudaError_t state = cudaSuccess;
   for (auto& it : cuda_buffers_map_) {
     if (no_busy_cnt_[it.first] > idle_flush_threshold(it.first)) {
+#ifndef NDEBUG
       VLOG(1) << "[CUDA_FREE] idle above waterline ("
               << (idle_flush_threshold(it.first) >> 20) << "MB), flushing all non-busy small buffers";
+#endif
       auto& cuda_buffers = it.second;
       std::vector<CudaMemoryBuffer> temp;
       for (int i = 0; i < cuda_buffers.size(); i++) {
@@ -150,7 +160,9 @@ void CUDADeviceAllocator::release(void* ptr) const {
       cuda_buffers.clear();
       it.second = temp;
       no_busy_cnt_[it.first] = 0;
+#ifndef NDEBUG
       VLOG(1) << "[CUDA_FREE] flush done, small pool now " << temp.size() << " busy buffers";
+#endif
     }
   }
 
@@ -160,9 +172,11 @@ void CUDADeviceAllocator::release(void* ptr) const {
       if (cuda_buffers[i].data == ptr) {
         no_busy_cnt_[it.first] += cuda_buffers[i].byte_size;
         cuda_buffers[i].busy = false;
+#ifndef NDEBUG
         VLOG(1) << "[CUDA_FREE] SMALL release idx=" << i
                   << " size=" << cuda_buffers[i].byte_size << "B"
                   << " idle_now=" << (no_busy_cnt_[it.first] >> 10) << "KB";
+#endif
         return;
       }
     }
@@ -170,8 +184,10 @@ void CUDADeviceAllocator::release(void* ptr) const {
     for (int i = 0; i < big_buffers.size(); i++) {
       if (big_buffers[i].data == ptr) {
         big_buffers[i].busy = false;
+#ifndef NDEBUG
         VLOG(1) << "[CUDA_FREE] BIG release idx=" << i
                   << " size=" << (big_buffers[i].byte_size >> 10) << "KB";
+#endif
         return;
       }
     }
