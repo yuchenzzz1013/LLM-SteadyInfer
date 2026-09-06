@@ -17,6 +17,10 @@ MultiHeadAttention::MultiHeadAttention(base::DeviceType device_type, int32_t lay
 }
 
 base::Status MultiHeadAttention::forward() {
+  // The effective compute dtype follows the query tensor (BF16 on CUDA, FP32
+  // fallback); weightless layer, so data_type_ is not weight-driven. The
+  // flash kernels ignore the score tensor (no global score round-trip).
+  data_type_ = get_input(0).data_type();
   auto status = check();
   if (!status) {
     return status;

@@ -33,6 +33,9 @@ base::Status SwiGLULayer::check() const {
 }
 
 base::Status SwiGLULayer::forward() {
+  // The effective compute dtype follows the inputs (BF16 on CUDA, FP32
+  // fallback); weightless layer, so data_type_ is not weight-driven.
+  data_type_ = get_input(0).data_type();
   auto status = check();
   if (!status) {
     return status;

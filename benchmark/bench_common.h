@@ -188,13 +188,39 @@ inline double peak_fp32_tflops() {
   return cores * 2.0 * clock_ghz / 1000.0;  // TFLOPS
 }
 
+// 每 SM 每周期 BF16 Tensor Core 稠密 FLOPs(查表,按 NVIDIA 官方峰值折算):
+// Ampere 1024(A100: 108 SM x 1.41GHz x 1024 ≈ 156 TFLOPS dense),Hopper 4096
+// (H100 SXM: 132 SM x 1.83GHz x 4096 ≈ 990 TFLOPS dense);无 BF16 TC 返回 0。
+inline double bf16_flops_per_sm(int major, int minor) {
+  int cc = major * 10 + minor;
+  if (cc >= 90) return 4096;  // Hopper(90)及之后按 4096 起步
+  if (cc >= 80) return 1024;  // Ampere(80/86)
+  return 0;                   // 前代无 BF16 Tensor Core
+}
+
+// 理论峰值 BF16 TFLOPS(仅 BF16 模型 MFU 用;架构不支持时返回 0)
+inline double peak_bf16_tflops() {
+  cudaDeviceProp prop{};
+  if (cudaGetDeviceProperties(&prop, 0) != cudaSuccess) return 0.0;
+  const double per_sm = bf16_flops_per_sm(prop.major, prop.minor);
+  if (per_sm <= 0) return 0.0;
+  return per_sm * prop.multiProcessorCount * prop.clockRate / 1e9;  // TFLOPS
+}
+
 struct ModelDims {
   double d = 0, ffn = 0, head_size = 0;
   int layers = 0, heads = 0, kv_heads = 0;
 };
 
+// 从 HF 模型目录读取 config.json(亦兼容直接传入 config.json 文件路径)
 inline bool load_model_dims(const std::string& path, ModelDims& m) {
-  std::ifstream f(path);
+  std::filesystem::path p(path);
+  std::ifstream f;
+  if (std::filesystem::is_directory(p)) {
+    f.open(p / "config.json");
+  } else {
+    f.open(p);
+  }
   if (!f.is_open()) return false;
   try {
     auto j = json::parse(f);

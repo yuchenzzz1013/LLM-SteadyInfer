@@ -2,6 +2,7 @@
 #define SRC_SOURCE_OP_KERNELS_CUDA_RMSNORM_KERNEL_CUH
 #include <tensor/tensor.h>
 namespace kernel {
+// CUDA RMSNorm on raw bfloat16 in/weight/out (fp32 accumulation).
 void rmsnorm_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight,
                        const tensor::Tensor& output, void* stream = nullptr);
 

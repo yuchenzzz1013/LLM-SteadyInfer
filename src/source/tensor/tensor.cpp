@@ -25,6 +25,9 @@ static size_t data_type_size(base::DataType data_type) {
     case base::DataType::kDataTypeInt32: {
       return 4;
     }
+    case base::DataType::kDataTypeBF16: {
+      return 2;
+    }
     default: {
       LOG(FATAL) << "Unknown data type size for " << int(data_type);
       return 0;

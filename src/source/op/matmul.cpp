@@ -99,13 +99,18 @@ base::Status MatmulLayer::forward() {
   int32_t total_input = batch * M;
   int32_t total_output = batch * K;
 
-  // Always flatten to 1D for the kernel: [batch*M] x [K, M] -> [batch*K]
-  tensor::Tensor input_flat(base::DataType::kDataTypeFp32, total_input, false, nullptr,
-                            const_cast<float*>(input.ptr<float>()));
+  // The effective compute dtype is the input/weight dtype (BF16 on CUDA,
+  // FP32 on CPU). Flatten to 1D for the kernel: [batch*M] x [K, M] ->
+  // [batch*K]; views alias the caller's storage byte-wise so any element
+  // size works.
+  const base::DataType dtype = input.data_type();
+  const size_t elem_size = base::DataTypeSize(dtype);
+  tensor::Tensor input_flat(dtype, total_input, false, nullptr,
+                            const_cast<uint8_t*>(input.ptr<uint8_t>()));
   input_flat.set_device_type(device_type_);
 
-  tensor::Tensor output_flat(base::DataType::kDataTypeFp32, total_output, false, nullptr,
-                             output.ptr<float>());
+  tensor::Tensor output_flat(dtype, total_output, false, nullptr,
+                             const_cast<uint8_t*>(output.ptr<uint8_t>()));
   output_flat.set_device_type(device_type_);
 
   if (is_quant_layer_) {
@@ -118,30 +123,32 @@ base::Status MatmulLayer::forward() {
   }
 
   if (has_bias_) {
+    const auto& bias = get_bias(0);
+    void* stream = cuda_config_ ? cuda_config_->stream : nullptr;
     if (batch > 1) {
       for (int b = 0; b < batch; ++b) {
-        tensor::Tensor output_view(base::DataType::kDataTypeFp32, K, false, nullptr,
-                                   output.ptr<float>(b * K));
+        tensor::Tensor output_view(dtype, K, false, nullptr,
+                                   output.ptr<uint8_t>(static_cast<int64_t>(b) * K * elem_size));
         output_view.set_device_type(device_type_);
-        kernel::get_add_kernel(device_type_)(output_view, get_bias(0), output_view,
-                                             cuda_config_ ? cuda_config_->stream : nullptr);
+        kernel::get_add_kernel(device_type_)(output_view, bias, output_view, stream);
       }
     } else {
-      kernel::get_add_kernel(device_type_)(output_flat, get_bias(0), output_flat,
-                                           cuda_config_ ? cuda_config_->stream : nullptr);
+      kernel::get_add_kernel(device_type_)(output_flat, bias, output_flat, stream);
     }
   }
 
   return base::error::Success();
 }
 
-base::Status MatmulLayer::set_bias(int32_t idx, int32_t& dim, const void* bias_ptr,
-                                   base::DeviceType device_type) {
+base::Status MatmulLayer::set_bias(int32_t idx, int32_t dim, const void* bias_ptr,
+                                   base::DeviceType device_type, base::DataType data_type) {
   CHECK_GE(idx, 0);
   CHECK_LT(idx, bias_.size());
   CHECK_NE(bias_ptr, nullptr);
+  CHECK(data_type == base::DataType::kDataTypeFp32 ||
+        data_type == base::DataType::kDataTypeBF16);
 
-  size_t size = dim * sizeof(float);
+  size_t size = dim * base::DataTypeSize(data_type);
   std::shared_ptr<base::Buffer> buffer =
       std::make_shared<base::Buffer>(size, nullptr, const_cast<void*>(bias_ptr), true);
   if (device_type != base::DeviceType::kDeviceUnknown) {
@@ -149,10 +156,12 @@ base::Status MatmulLayer::set_bias(int32_t idx, int32_t& dim, const void* bias_p
   }
 
   if (!is_quant_layer_) {
-    tensor::Tensor bias(base::DataType::kDataTypeFp32, dim);
+    tensor::Tensor bias(data_type, dim);
     bias.set_device_type(device_type);
     CHECK(bias.assign(buffer));
     bias_.at(idx) = bias;
+    // The layer computes in its weight dtype (BF16 on CUDA, FP32 on CPU).
+    data_type_ = data_type;
   } else {
     // is quant layer
     tensor::Tensor bias(base::DataType::kDataTypeInt8, dim);

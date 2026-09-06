@@ -2,15 +2,17 @@
 #define SRC_INCLUDE_MODEL_MODEL_H_
 #include <op/embedding.h>
 #include <cuda_runtime_api.h>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <string>
+#include <unordered_map>
+#include <vector>
 #include "base/alloc.h"
 #include "base/base.h"
 #include "config.h"
 #include "op/encode.h"
 #include "op/layer.h"
-#include "raw_model_data.h"
 #include "sampler/argmax_sampler.h"
 #include "sentencepiece_processor.h"
 #include "tensor/tensor.h"
@@ -48,9 +50,12 @@ struct BatchScratch {
   tensor::Tensor input_ids, positions, block_table, input_token_num;
 
   // Allocate (or keep, when sizes already match) every buffer above.
+  // dtype selects the activation element type: kDataTypeBF16 on CUDA models
+  // (compute_dtype()), kDataTypeFp32 on CPU models.
   void ensure(int32_t batch, int32_t hidden_dim, int32_t dim, int32_t kv_dim, int32_t ffn_dim,
               int32_t head_num, int32_t head_size, int32_t max_seq_len, int32_t block_table_stride,
-              base::DeviceType device, const std::shared_ptr<base::DeviceAllocator>& alloc);
+              base::DeviceType device, base::DataType dtype,
+              const std::shared_ptr<base::DeviceAllocator>& alloc);
 };
 
 // One entry of the decode CUDA-Graph pool (indexed by batch size).
@@ -197,6 +202,14 @@ class Model {
 
   base::DeviceType device_type() const { return device_type_; }
 
+  // Effective compute / storage dtype of this model: BF16 on CUDA, FP32 on
+  // CPU (weights are converted to FP32 at load time).
+  base::DataType compute_dtype() const {
+    return (device_type_ == base::DeviceType::kDeviceCUDA)
+               ? base::DataType::kDataTypeBF16
+               : base::DataType::kDataTypeFp32;
+  }
+
   int32_t layer_num() const { return config_ ? config_->layer_num_ : 0; }
   int32_t kv_dim() const { return config_ ? config_->kv_dim_ : 0; }
   int32_t hidden_dim() const { return config_ ? config_->dim_ : 0; }
@@ -255,13 +268,17 @@ class Model {
  protected:
   virtual base::Status insert_buffer(ModelBufferType buffer_idx, const tensor::Tensor& tensor);
 
-  virtual base::Status read_model_file();
+  // Load model weight tensors from an HF model dir (config.json +
+  // safetensors, see safetensors_reader.h) into weight_map_.
+  virtual base::Status load_hf_model();
 
   virtual base::Status create_encode_layer();
 
   virtual base::Status gen_model_from_file();
 
-  virtual base::Status generate_model_infos(const ModelConfig& config) const;
+  // Fill config_ (TransformerConfig) from an HF config.json, i.e. resolve
+  // kv_dim_/head_size_/rope theta and the Qwen3 dim vs. hidden_dim split.
+  virtual base::Status generate_model_infos(const HfConfig& config) const;
 
   virtual int32_t post_processing(const tensor::Tensor& pos, bool is_prompt) const = 0;
 
@@ -289,7 +306,24 @@ class Model {
   tensor::Tensor kv_key_backup_;
   tensor::Tensor kv_value_backup_;
   std::unique_ptr<sampler::Sampler> sampler_;
-  std::shared_ptr<RawModelData> raw_model_data_;
+
+  // ---------- HF safetensors weight storage (host, BF16 raw bits) ----------
+  // HF tensor name -> raw bfloat16 storage (little-endian uint16_t). Layers
+  // hold non-owning views into these buffers (they outlive the views: the
+  // map lives as long as the Model). populate: load_hf_model().
+  std::unordered_map<std::string, std::shared_ptr<std::vector<uint16_t>>> weight_map_;
+  // Lazy FP32 copies of weight_map_ (CPU device only): weights are converted
+  // at first get_weight_data() access, so FP32 models never carry BF16 tensors.
+  std::unordered_map<std::string, std::shared_ptr<std::vector<float>>> weight_map_fp32_;
+
+  // Host pointer to the storage of the HF tensor `name`. Element type is
+  // compute_dtype(): uint16_t BF16 bits on CUDA models, float on CPU models
+  // (converted lazily and cached). Stable for the model lifetime; CHECK-fails
+  // when the tensor is unknown.
+  const void* get_weight_data(const std::string& name);
+
+  size_t get_weight_numel(const std::string& name) const;
+
   base::DeviceType device_type_ = base::DeviceType::kDeviceUnknown;
   base::ModelType model_type_ = base::ModelType::kModelTypeUnknown;
   base::TokenizerType tokenizer_type_ = base::TokenizerType::kEncodeUnknown;

@@ -3,8 +3,9 @@
 **轻量级 LLM Serving Runtime**，面向单 GPU 场景，支持 LLaMA / Qwen 系列模型的高效推理。
 
 > **项目状态**：本项目**仍在持续开发中**。
-> 当前已完成核心 Runtime 架构、CPU / CUDA 双后端、FP32 / INT8（LLaMA & Qwen2）推理、
-> Paged KV Cache、PagedAttention、Continuous Batching 调度器以及 Offline / Online Benchmark 系统。
+> 当前已完成核心 Runtime 架构、CPU / CUDA 双后端、BF16 全链路推理（HF safetensors
+> 权重,CUDA 全链路 BF16 存储 / Tensor Core 计算,CPU 设备 FP32 兼容后备）、Paged KV Cache、
+> PagedAttention、Continuous Batching 调度器以及 Offline / Online Benchmark 系统。
 > 后续将持续扩展模型支持、优化推理性能并完善 Serving 能力。
 
 ---
@@ -19,8 +20,9 @@ LLM-SteadyInfer 是一个基于 **C++ / CUDA C++** 实现的轻量级大语言�
 
 目前支持：
 
-- FP32 推理
-- INT8 Group-wise Quantization 推理（LLaMA / Qwen2）
+- BF16 推理（HF safetensors 模型目录加载;CUDA 全链路 BF16——权重 / 激活 /
+  KV Cache / logits 均 BF16,Tensor Core 数学运算;CPU 设备自动回退 FP32,
+  权重加载时转换）
 - LLaMA3 / Qwen2 / Qwen3 模型架构
 
 ---
@@ -75,12 +77,11 @@ LLM-SteadyInfer 是一个基于 **C++ / CUDA C++** 实现的轻量级大语言�
   - Qwen2
   - Qwen3
 
-量化支持：
+精度支持：
 
-- FP32 推理
-- INT8 Group-wise Quantization
-  - LLaMA
-  - Qwen2
+- BF16（CUDA:全链路权重 / 激活 / KV Cache / RoPE sin-cos 表均 BF16）
+- FP32（后备:仅 CPU 设备,权重加载时转换;CUDA 侧不保留任何 FP32 算子）
+- INT8 Group-wise Quantization（LLaMA / Qwen2,未随 BF16 迁移,已禁用）
 
 ---
 

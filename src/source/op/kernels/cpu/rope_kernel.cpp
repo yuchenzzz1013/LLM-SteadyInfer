@@ -61,7 +61,8 @@ void rope_kernel_cpu_batch(int32_t dim, int32_t kv_dim, int32_t head_size,
   const int32_t num_heads = dim / head_size;
   const int32_t total_pairs = num_heads * head_pair_count;
 
-  // Same math as rope_kernel_cu_fp32_batch, one OpenMP task per rotary pair.
+  // Same math as the CUDA RoPE batch kernel (rope_kernel_cu_batch, BF16 on
+  // CUDA), one OpenMP task per rotary pair.
 #pragma omp parallel for collapse(2) schedule(static)
   for (int32_t b = 0; b < batch; ++b) {
     for (int32_t pair_idx = 0; pair_idx < total_pairs; ++pair_idx) {

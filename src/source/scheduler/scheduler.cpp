@@ -61,14 +61,20 @@ Scheduler::Scheduler(std::shared_ptr<model::Model> model,
 #endif
 
   // Preallocate the decode logits buffer once instead of per decode step.
+  // The buffer follows the model compute dtype: BF16 (raw uint16_t bits) on
+  // CUDA, FP32 on CPU — the LM head and the argmax sampler must see the same
+  // representation as forward_batch writes.
   int vocab_size = model_->vocab_size();
   if (vocab_size <= 0) {
     LOG(FATAL) << "[SCHED] model vocab_size=" << vocab_size
                << " invalid — model file/tokenizer mismatch";
   }
-  logits_ = tensor::Tensor(base::DataType::kDataTypeFp32, max_batch_size,
-                           vocab_size, true, alloc);
-  if (logits_.is_empty() || logits_.ptr<float>() == nullptr) {
+  const base::DataType logits_dtype = model_->compute_dtype();
+  logits_ = tensor::Tensor(logits_dtype, max_batch_size, vocab_size, true, alloc);
+  const bool logits_ok =
+      logits_dtype == base::DataType::kDataTypeBF16 ? logits_.ptr<uint16_t>() != nullptr
+                                                    : logits_.ptr<float>() != nullptr;
+  if (logits_.is_empty() || !logits_ok) {
     LOG(FATAL) << "[SCHED] Failed to preallocate logits buffer ["
                << max_batch_size << "," << vocab_size
                << "] — GPU may be out of memory";
@@ -581,10 +587,15 @@ void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
     // per-batch-size graph pool.
     auto recon_start = std::chrono::steady_clock::now();
 
-    // View into the preallocated logits buffer (no per-step allocation).
-    tensor::Tensor logits_view(base::DataType::kDataTypeFp32, batch,
-                               model_->vocab_size(), false, nullptr,
-                               logits_.ptr<float>());
+    // View into the preallocated logits buffer (no per-step allocation);
+    // dtype mirrors the buffer so post_processing_batch picks the BF16 or
+    // FP32 argmax path.
+    const base::DataType logits_dtype = logits_.data_type();
+    void* logits_ptr = logits_dtype == base::DataType::kDataTypeBF16
+                           ? static_cast<void*>(logits_.ptr<uint16_t>())
+                           : static_cast<void*>(logits_.ptr<float>());
+    tensor::Tensor logits_view(logits_dtype, batch, model_->vocab_size(), false,
+                               nullptr, logits_ptr);
     logits_view.set_device_type(model_->device_type());
 
     // Record batch reconstruction time (tensor setup overhead)
@@ -648,9 +659,14 @@ void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
 
     if (need_logits) {
       // Sample only the decode rows: prefill rows produce no token this step.
-      tensor::Tensor logits_view(base::DataType::kDataTypeFp32, batch,
-                                 model_->vocab_size(), false, nullptr,
-                                 logits_.ptr<float>());
+      // dtype mirrors the buffer so post_processing_batch picks the BF16 or
+      // FP32 argmax path.
+      const base::DataType logits_dtype = logits_.data_type();
+      void* logits_ptr = logits_dtype == base::DataType::kDataTypeBF16
+                             ? static_cast<void*>(logits_.ptr<uint16_t>())
+                             : static_cast<void*>(logits_.ptr<float>());
+      tensor::Tensor logits_view(logits_dtype, batch, model_->vocab_size(), false,
+                                 nullptr, logits_ptr);
       logits_view.set_device_type(model_->device_type());
       model_->sync_stream();
       auto next_tokens = model_->post_processing_batch(logits_view);

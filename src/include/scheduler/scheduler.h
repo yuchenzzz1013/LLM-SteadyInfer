@@ -88,7 +88,7 @@ class Scheduler {
   // LLAMA_DISABLE_PREFIX_CACHE=1). Shares whole-block prompt prefixes
   // read-only and skips their prefill.
   std::unique_ptr<PrefixCache> prefix_cache_;
-  tensor::Tensor logits_;  // preallocated [max_batch_size, vocab_size] for decode
+  tensor::Tensor logits_;  // preallocated [max_batch_size, vocab_size], model compute dtype
   std::deque<Sequence> waiting_queue_;  // deque: preempted seqs jump the head
   std::vector<Sequence> running_sequences_;
   std::vector<Sequence> finished_sequences_;

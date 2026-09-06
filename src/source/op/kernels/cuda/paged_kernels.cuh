@@ -20,6 +20,7 @@ namespace kernel {
 //   dst[layer][table[b][pos / block_size]][pos % block_size][d] = src[b][d]
 // One block per batch row; positions are per-token (prefill rows and decode
 // rows are both single-token rows after the scheduler flattens chunks).
+// Raw bf16 element copy.
 void paged_kv_scatter_cu(const tensor::Tensor& src, tensor::Tensor& dst_cache,
                          const tensor::Tensor& block_table, const tensor::Tensor& positions,
                          int32_t kv_dim, int32_t num_blocks, int32_t block_size,
@@ -28,13 +29,13 @@ void paged_kv_scatter_cu(const tensor::Tensor& src, tensor::Tensor& dst_cache,
 // Batched decode / chunked-prefill MHA over the paged cache (Flash Decoding):
 // one split-KV launch pair per layer for the whole batch. Identical grid /
 // thread mapping / partials format / GQA mapping as mha_kernel_cu_batch —
-// only the cache addressing goes through block_table indirection — so A/B
-// runs against the continuous layout are bit-identical in fp32.
+// only the cache addressing goes through block_table indirection.
 //   positions    [batch] CUDA int32
 //   block_table  [batch, table_stride] CUDA int32 (-1 = unused entry)
 //   query_batch  [batch, dim] (dim = head_num * head_size)
 //   score_batch  scratch: batch * head_num * flash_decoding_num_splits(
-//                table_stride * block_size) * (head_size + 2) floats
+//                table_stride * block_size) * (head_size + 2) elements of the
+//                model dtype (raw bf16)
 //   mha_out      [batch, dim]
 //   key/value_cache [num_layers, num_blocks, block_size, kv_dim]
 void paged_attention_cu_batch(int32_t head_num, int32_t layer_idx, int32_t num_blocks,

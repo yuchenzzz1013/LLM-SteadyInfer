@@ -13,6 +13,10 @@ RoPELayer::RoPELayer(base::DeviceType device_type, int32_t dim, int32_t kv_dim, 
 }
 
 base::Status RoPELayer::forward() {
+  // The effective compute dtype follows the query/key tensors (BF16 on CUDA,
+  // FP32 on CPU). The sin/cos caches carry the same dtype: bf16 on CUDA
+  // (filled by sin_cos_cache_calc_cu), fp32 on CPU.
+  data_type_ = get_input(0).data_type();
   base::Status status = check();
   if (!status) {
     return status;

@@ -47,7 +47,18 @@ __forceinline__ __device__ void block_reduce_argmax(float& val, size_t& ptr, flo
   }
 }
 
-__global__ void argmax_kernel_fp32(const float* input_ptr, size_t size, size_t* output_idx) {
+// Widen the upper 16 bits of the bit pattern: bfloat16 is the top half of
+// IEEE float32, so the result is the exact float value of the bfloat16.
+__forceinline__ __device__ float bf16_bits_to_fp32(uint16_t bits) {
+  union {
+    uint32_t u;
+    float f;
+  } conv;
+  conv.u = static_cast<uint32_t>(bits) << 16;
+  return conv.f;
+}
+
+__global__ void argmax_kernel(const uint16_t* input_ptr, size_t size, size_t* output_idx) {
   __shared__ size_t shared_max_ptr[32];
   __shared__ float shared_max_value[32];
   uint32_t tid = threadIdx.x;
@@ -56,11 +67,12 @@ __global__ void argmax_kernel_fp32(const float* input_ptr, size_t size, size_t* 
   // instead so the kernel is correct for any `size` (incl. size < blockDim).
   bool valid = tid < size;
   size_t max_index = threadIdx.x;
-  float max_value = valid ? input_ptr[max_index] : -FLT_MAX;
+  float max_value = valid ? bf16_bits_to_fp32(input_ptr[max_index]) : -FLT_MAX;
   for (size_t i = tid; i < size; i += blockDim.x) {
-    if (input_ptr[i] > max_value) {
+    const float v = bf16_bits_to_fp32(input_ptr[i]);
+    if (v > max_value) {
       max_index = i;
-      max_value = input_ptr[i];
+      max_value = v;
     }
   }
 
@@ -71,40 +83,22 @@ __global__ void argmax_kernel_fp32(const float* input_ptr, size_t size, size_t* 
   }
 }
 
-size_t argmax_kernel_cu(const float* input_ptr, size_t size, void* stream) {
-  std::shared_ptr<base::DeviceAllocator> alloc_cu =
-      base::CUDADeviceAllocatorFactory::get_instance();
-  size_t* index = static_cast<size_t*>(alloc_cu->allocate(sizeof(size_t)));
-  size_t output_index = 0;
-  if (!stream) {
-    argmax_kernel_fp32<<<1, 512>>>(input_ptr, size, index);
-    cudaMemcpy(&output_index, index, sizeof(size_t), cudaMemcpyDeviceToHost);
-  } else {
-    cudaStream_t stream_ = static_cast<cudaStream_t>(stream);
-    argmax_kernel_fp32<<<1, 512, 0, stream_>>>(input_ptr, size, index);
-    cudaMemcpyAsync(&output_index, index, sizeof(size_t), cudaMemcpyDeviceToHost, stream_);
-    // The async copy is still in flight when this function returns the host
-    // value; sync before reading output_index.
-    cudaStreamSynchronize(stream_);
-  }
-  return output_index;
-}
-
-__global__ void argmax_kernel_batch_fp32(const float* input_ptr, size_t row_stride, size_t size,
-                                         int32_t* output_idx) {
+__global__ void argmax_kernel_batch(const uint16_t* input_ptr, size_t row_stride, size_t size,
+                                    int32_t* output_idx) {
   __shared__ size_t shared_max_ptr[32];
   __shared__ float shared_max_value[32];
   uint32_t tid = threadIdx.x;
-  // Same rule as argmax_kernel_fp32: no early return (full-mask ballot),
+  // Same rule as argmax_kernel: no early return (full-mask ballot),
   // guard the reads instead.
-  const float* row = input_ptr + blockIdx.x * row_stride;
+  const uint16_t* row = input_ptr + blockIdx.x * row_stride;
   bool valid = tid < size;
   size_t max_index = threadIdx.x;
-  float max_value = valid ? row[max_index] : -FLT_MAX;
+  float max_value = valid ? bf16_bits_to_fp32(row[max_index]) : -FLT_MAX;
   for (size_t i = tid; i < size; i += blockDim.x) {
-    if (row[i] > max_value) {
+    const float v = bf16_bits_to_fp32(row[i]);
+    if (v > max_value) {
       max_index = i;
-      max_value = row[i];
+      max_value = v;
     }
   }
 
@@ -116,7 +110,26 @@ __global__ void argmax_kernel_batch_fp32(const float* input_ptr, size_t row_stri
   }
 }
 
-void argmax_kernel_cu_batch(const float* input_ptr, size_t row_stride, size_t size,
+size_t argmax_kernel_cu(const uint16_t* input_ptr, size_t size, void* stream) {
+  std::shared_ptr<base::DeviceAllocator> alloc_cu =
+      base::CUDADeviceAllocatorFactory::get_instance();
+  size_t* index = static_cast<size_t*>(alloc_cu->allocate(sizeof(size_t)));
+  size_t output_index = 0;
+  if (!stream) {
+    argmax_kernel<<<1, 512>>>(input_ptr, size, index);
+    cudaMemcpy(&output_index, index, sizeof(size_t), cudaMemcpyDeviceToHost);
+  } else {
+    cudaStream_t stream_ = static_cast<cudaStream_t>(stream);
+    argmax_kernel<<<1, 512, 0, stream_>>>(input_ptr, size, index);
+    cudaMemcpyAsync(&output_index, index, sizeof(size_t), cudaMemcpyDeviceToHost, stream_);
+    // The async copy is still in flight when this function returns the host
+    // value; sync before reading output_index.
+    cudaStreamSynchronize(stream_);
+  }
+  return output_index;
+}
+
+void argmax_kernel_cu_batch(const uint16_t* input_ptr, size_t row_stride, size_t size,
                             int32_t batch, int32_t* out_tokens, void* stream) {
   std::shared_ptr<base::DeviceAllocator> alloc_cu =
       base::CUDADeviceAllocatorFactory::get_instance();
@@ -126,12 +139,12 @@ void argmax_kernel_cu_batch(const float* input_ptr, size_t row_stride, size_t si
 
   if (stream) {
     cudaStream_t stream_ = static_cast<cudaStream_t>(stream);
-    argmax_kernel_batch_fp32<<<batch, 512, 0, stream_>>>(input_ptr, row_stride, size, dev_idx);
+    argmax_kernel_batch<<<batch, 512, 0, stream_>>>(input_ptr, row_stride, size, dev_idx);
     cudaMemcpyAsync(out_tokens, dev_idx, static_cast<size_t>(batch) * sizeof(int32_t),
                     cudaMemcpyDeviceToHost, stream_);
     cudaStreamSynchronize(stream_);
   } else {
-    argmax_kernel_batch_fp32<<<batch, 512>>>(input_ptr, row_stride, size, dev_idx);
+    argmax_kernel_batch<<<batch, 512>>>(input_ptr, row_stride, size, dev_idx);
     cudaMemcpy(out_tokens, dev_idx, static_cast<size_t>(batch) * sizeof(int32_t),
                cudaMemcpyDeviceToHost);
   }

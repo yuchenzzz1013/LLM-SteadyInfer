@@ -191,121 +191,170 @@ void Qwen3Model::create_nonparam_layers() {
       std::make_shared<op::SwiGLULayer>(device_type_, config_->immediate_dim_);
 }
 
-void Qwen3Model::create_param_quant_layers() {}
+void Qwen3Model::create_param_quant_layers() {
+  // Int8 group quantization is not migrated to the HF safetensors loading
+  // path (BF16 replaces it). Loading quantized checkpoints fails loudly.
+  LOG(FATAL) << "Int8 quantized models are not supported by the HF safetensors "
+                "loader; use a BF16 checkpoint.";
+}
 
 void Qwen3Model::create_param_layers() {
+  CHECK(!is_quant_model_);
   CHECK(qwen_layers_ != nullptr);
 
-  size_t pos = 0;
-  int32_t dim = config_->dim_;
-  int32_t kv_dim = config_->kv_dim_;
-  int hidden_dim = config_->hidden_dim_;
-  auto cpu_device_type = base::DeviceType::kDeviceCPU;
-  float* weight_ptr = (float*)raw_model_data_->weight(pos);
+  // Weights come from the HF safetensors checkpoint under the model compute
+  // dtype: BF16 raw bits on CUDA, FP32 (converted at load time) on the CPU
+  // path.
+  const auto cpu_device_type = base::DeviceType::kDeviceCPU;
+  const base::DataType w_dtype = compute_dtype();
 
-  // rmsnorm attention attention, ffn, final
-  for (int32_t i = 0; i < 2 * config_->layer_num_ + 1; ++i) {
-    std::shared_ptr<op::RmsNormLayer> rms_norm_layer =
+  // Qwen3 decouples the attention width from the residual stream: dim_ is the
+  // Q/K/V/O projection width (head_num x head_dim, e.g. 32 x 128 = 4096),
+  // hidden_dim_ the residual width of the embedding / norms / FFN IO (2560),
+  // immediate_dim_ the FFN width (9728).
+  const int32_t dim = config_->dim_;
+  const int32_t kv_dim = config_->kv_dim_;
+  const int32_t hidden_dim = config_->hidden_dim_;
+  const int32_t immediate_dim = config_->immediate_dim_;
+  const int32_t head_size = config_->head_size_;
+  const int32_t vocab = std::abs(config_->vocab_size_);
+  auto block_name = [](int32_t i, const std::string& suffix) {
+    return "model.layers." + std::to_string(i) + "." + suffix;
+  };
+  const std::string attn = "self_attn.";
+
+  // Attention / FFN / final RMSNorm weights. Vector slots follow the engine
+  // convention (see attention_rms / feed_forward / cls_logits):
+  //   [0, layer_num_):                    input_layernorm of layer i
+  //   [layer_num_, 2*layer_num_):         post_attention_layernorm of layer i
+  //   [2*layer_num_]:                     model.norm (final)
+  // The per-head Q/K norms are appended later (see below).
+  for (int32_t i = 0; i < config_->layer_num_; ++i) {
+    std::shared_ptr<op::RmsNormLayer> rms_attn =
         std::make_shared<op::RmsNormLayer>(device_type_, hidden_dim);
-
-    rms_norm_layer->set_weight(0, {hidden_dim}, weight_ptr, cpu_device_type);
-    qwen_layers_->rmsnorm_layers_.push_back(rms_norm_layer);
-    weight_ptr += hidden_dim;
+    const void* w_attn = get_weight_data(block_name(i, "input_layernorm.weight"));
+    CHECK_NE(w_attn, nullptr) << "Qwen3 checkpoint misses "
+                              << block_name(i, "input_layernorm.weight");
+    rms_attn->set_weight(0, {hidden_dim}, w_attn, cpu_device_type, w_dtype);
+    qwen_layers_->rmsnorm_layers_.push_back(rms_attn);
   }
-  pos += (2 * config_->layer_num_ + 1) * hidden_dim;
+  for (int32_t i = 0; i < config_->layer_num_; ++i) {
+    std::shared_ptr<op::RmsNormLayer> rms_ffn =
+        std::make_shared<op::RmsNormLayer>(device_type_, hidden_dim);
+    const void* w_ffn = get_weight_data(block_name(i, "post_attention_layernorm.weight"));
+    CHECK_NE(w_ffn, nullptr) << "Qwen3 checkpoint misses "
+                             << block_name(i, "post_attention_layernorm.weight");
+    rms_ffn->set_weight(0, {hidden_dim}, w_ffn, cpu_device_type, w_dtype);
+    qwen_layers_->rmsnorm_layers_.push_back(rms_ffn);
+  }
+  std::shared_ptr<op::RmsNormLayer> rms_final =
+      std::make_shared<op::RmsNormLayer>(device_type_, hidden_dim);
+  const void* w_final = get_weight_data("model.norm.weight");
+  CHECK_NE(w_final, nullptr) << "Qwen3 checkpoint misses model.norm.weight";
+  rms_final->set_weight(0, {hidden_dim}, w_final, cpu_device_type, w_dtype);
+  qwen_layers_->rmsnorm_layers_.push_back(rms_final);
 
-  // embedding layer
+  // Embedding: model.embed_tokens.weight
   qwen_layers_->embedding_layer_ = std::make_shared<op::EmbeddingLayer>(
-      device_type_, hidden_dim, config_->seq_len_, std::abs(config_->vocab_size_));
-  qwen_layers_->embedding_layer_->set_weight(0, {std::abs(config_->vocab_size_), hidden_dim},
-                                             weight_ptr, cpu_device_type);
-  pos += config_->vocab_size_ * hidden_dim;
+      device_type_, hidden_dim, config_->seq_len_, vocab);
+  const void* weight_embedding = get_weight_data("model.embed_tokens.weight");
+  CHECK_NE(weight_embedding, nullptr) << "Qwen3 checkpoint misses model.embed_tokens.weight";
+  qwen_layers_->embedding_layer_->set_weight(0, {vocab, hidden_dim}, weight_embedding,
+                                             cpu_device_type, w_dtype);
 
-  // query
+  // Query projection. Qwen3 has no QKV bias.
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto wq = std::make_shared<op::MatmulLayer>(device_type_, dim, hidden_dim, false);
-    wq->set_weight(0, {dim, hidden_dim}, this->raw_model_data_->weight(pos), cpu_device_type);
+    auto wq = std::make_shared<op::MatmulLayer>(device_type_, dim, hidden_dim);
+    const void* wq_w = get_weight_data(block_name(i, attn + "q_proj.weight"));
+    CHECK_NE(wq_w, nullptr) << "Qwen3 checkpoint misses " << block_name(i, attn + "q_proj.weight");
+    wq->set_weight(0, {dim, hidden_dim}, wq_w, cpu_device_type, w_dtype);
     qwen_layers_->wq_layers_.push_back(wq);
-    pos = pos + hidden_dim * dim;
   }
 
-  // query norm
+  // Query norm (Qwen3 specific): per-head RMSNorm applied to [.., head_dim]
+  // rows; the checkpoint stores one shared head_dim vector (self_attn.q_norm).
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    std::shared_ptr<op::RmsNormLayer> rms_norm_layer =
-        std::make_shared<op::RmsNormLayer>(device_type_, config_->head_size_);
-    rms_norm_layer->set_weight(0, {config_->head_size_}, this->raw_model_data_->weight(pos),
-                               cpu_device_type);
-    qwen_layers_->rmsnorm_layers_.push_back(rms_norm_layer);
-    pos = pos + config_->head_size_;
+    std::shared_ptr<op::RmsNormLayer> q_norm =
+        std::make_shared<op::RmsNormLayer>(device_type_, head_size);
+    const void* w_qn = get_weight_data(block_name(i, attn + "q_norm.weight"));
+    CHECK_NE(w_qn, nullptr) << "Qwen3 checkpoint misses " << block_name(i, attn + "q_norm.weight");
+    q_norm->set_weight(0, {head_size}, w_qn, cpu_device_type, w_dtype);
+    qwen_layers_->rmsnorm_layers_.push_back(q_norm);
   }
 
-  // key
+  // Key projection
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto wk = std::make_shared<op::MatmulLayer>(device_type_, kv_dim, hidden_dim, false);
-    wk->set_weight(0, {kv_dim, hidden_dim}, this->raw_model_data_->weight(pos), cpu_device_type);
+    auto wk = std::make_shared<op::MatmulLayer>(device_type_, kv_dim, hidden_dim);
+    const void* wk_w = get_weight_data(block_name(i, attn + "k_proj.weight"));
+    CHECK_NE(wk_w, nullptr) << "Qwen3 checkpoint misses " << block_name(i, attn + "k_proj.weight");
+    wk->set_weight(0, {kv_dim, hidden_dim}, wk_w, cpu_device_type, w_dtype);
     qwen_layers_->wk_layers_.push_back(wk);
-    pos = pos + hidden_dim * kv_dim;
   }
 
-  // key norm
+  // Key norm (Qwen3 specific), same convention as the query norm.
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    std::shared_ptr<op::RmsNormLayer> rms_norm_layer =
-        std::make_shared<op::RmsNormLayer>(device_type_, config_->head_size_);
-    rms_norm_layer->set_weight(0, {config_->head_size_}, this->raw_model_data_->weight(pos),
-                               cpu_device_type);
-    qwen_layers_->rmsnorm_layers_.push_back(rms_norm_layer);
-    pos = pos + config_->head_size_;
+    std::shared_ptr<op::RmsNormLayer> k_norm =
+        std::make_shared<op::RmsNormLayer>(device_type_, head_size);
+    const void* w_kn = get_weight_data(block_name(i, attn + "k_norm.weight"));
+    CHECK_NE(w_kn, nullptr) << "Qwen3 checkpoint misses " << block_name(i, attn + "k_norm.weight");
+    k_norm->set_weight(0, {head_size}, w_kn, cpu_device_type, w_dtype);
+    qwen_layers_->rmsnorm_layers_.push_back(k_norm);
   }
 
-  // value
+  // Value projection
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto wv = std::make_shared<op::MatmulLayer>(device_type_, kv_dim, hidden_dim, false);
-    wv->set_weight(0, {kv_dim, hidden_dim}, this->raw_model_data_->weight(pos), cpu_device_type);
+    auto wv = std::make_shared<op::MatmulLayer>(device_type_, kv_dim, hidden_dim);
+    const void* wv_w = get_weight_data(block_name(i, attn + "v_proj.weight"));
+    CHECK_NE(wv_w, nullptr) << "Qwen3 checkpoint misses " << block_name(i, attn + "v_proj.weight");
+    wv->set_weight(0, {kv_dim, hidden_dim}, wv_w, cpu_device_type, w_dtype);
     qwen_layers_->wv_layers_.push_back(wv);
-    pos += kv_dim * hidden_dim;
   }
 
-  // output
+  // Output projection
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto wo = std::make_shared<op::MatmulLayer>(device_type_, hidden_dim, dim, false);
-    wo->set_weight(0, {hidden_dim, dim}, this->raw_model_data_->weight(pos), cpu_device_type);
+    auto wo = std::make_shared<op::MatmulLayer>(device_type_, hidden_dim, dim);
+    const void* wo_w = get_weight_data(block_name(i, attn + "o_proj.weight"));
+    CHECK_NE(wo_w, nullptr) << "Qwen3 checkpoint misses " << block_name(i, attn + "o_proj.weight");
+    wo->set_weight(0, {hidden_dim, dim}, wo_w, cpu_device_type, w_dtype);
     qwen_layers_->wo_layers_.push_back(wo);
-    pos = pos + dim * hidden_dim;
   }
 
-  // w1 layers
-  int32_t immediate_dim = config_->immediate_dim_;
+  // FFN: SwiGLU computes silu(w1_out) * w3_out (kernel convention), so w1
+  // takes mlp.gate_proj.weight and w3 takes mlp.up_proj.weight.
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto w1 = std::make_shared<op::MatmulLayer>(device_type_, immediate_dim, hidden_dim, false);
-    w1->set_weight(0, {immediate_dim, hidden_dim}, this->raw_model_data_->weight(pos),
-                   cpu_device_type);
+    auto w1 = std::make_shared<op::MatmulLayer>(device_type_, immediate_dim, hidden_dim);
+    const void* w1_w = get_weight_data(block_name(i, "mlp.gate_proj.weight"));
+    CHECK_NE(w1_w, nullptr) << "Qwen3 checkpoint misses "
+                            << block_name(i, "mlp.gate_proj.weight");
+    w1->set_weight(0, {immediate_dim, hidden_dim}, w1_w, cpu_device_type, w_dtype);
     qwen_layers_->w1_layers_.push_back(w1);
-    pos = pos + hidden_dim * immediate_dim;
-  }
 
-  // w2 layers
-  for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto w2 = std::make_shared<op::MatmulLayer>(device_type_, hidden_dim, immediate_dim, false);
-    w2->set_weight(0, {hidden_dim, immediate_dim}, this->raw_model_data_->weight(pos),
-                   cpu_device_type);
+    auto w2 = std::make_shared<op::MatmulLayer>(device_type_, hidden_dim, immediate_dim);
+    const void* w2_w = get_weight_data(block_name(i, "mlp.down_proj.weight"));
+    CHECK_NE(w2_w, nullptr) << "Qwen3 checkpoint misses "
+                            << block_name(i, "mlp.down_proj.weight");
+    w2->set_weight(0, {hidden_dim, immediate_dim}, w2_w, cpu_device_type, w_dtype);
     qwen_layers_->w2_layers_.push_back(w2);
-    pos = pos + immediate_dim * hidden_dim;
-  }
 
-  // w3 layers
-  for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto w3 = std::make_shared<op::MatmulLayer>(device_type_, immediate_dim, hidden_dim, false);
-    w3->set_weight(0, {immediate_dim, hidden_dim}, this->raw_model_data_->weight(pos),
-                   cpu_device_type);
+    auto w3 = std::make_shared<op::MatmulLayer>(device_type_, immediate_dim, hidden_dim);
+    const void* w3_w = get_weight_data(block_name(i, "mlp.up_proj.weight"));
+    CHECK_NE(w3_w, nullptr) << "Qwen3 checkpoint misses " << block_name(i, "mlp.up_proj.weight");
+    w3->set_weight(0, {immediate_dim, hidden_dim}, w3_w, cpu_device_type, w_dtype);
     qwen_layers_->w3_layers_.push_back(w3);
-    pos = pos + immediate_dim * hidden_dim;
   }
 
-  auto lm_head = std::make_shared<op::MatmulLayer>(device_type_, config_->vocab_size_,
-                                                   config_->hidden_dim_, false);
-  lm_head->set_weight(0, {config_->vocab_size_, config_->hidden_dim_},
-                      this->raw_model_data_->weight(pos), cpu_device_type);
-  qwen_layers_->cls_layer_ = lm_head;
+  // LM head: tied in Qwen3 (tie_word_embeddings) — lm_head.weight is absent
+  // from the shards and the embedding rows are reused. Matches the classic
+  // Llama/Qwen convention when an untied lm_head.weight does exist.
+  qwen_layers_->cls_layer_ = std::make_shared<op::MatmulLayer>(device_type_, vocab, hidden_dim);
+  if (config_->is_shared_weight_ || !weight_map_.count("lm_head.weight")) {
+    qwen_layers_->cls_layer_->set_weight(0, {vocab, hidden_dim}, weight_embedding,
+                                         cpu_device_type, w_dtype);
+  } else {
+    qwen_layers_->cls_layer_->set_weight(0, {vocab, hidden_dim},
+                                         get_weight_data("lm_head.weight"), cpu_device_type,
+                                         w_dtype);
+  }
 }
 
 void Qwen3Model::build_fused_qkv_layers() {
@@ -323,8 +372,14 @@ void Qwen3Model::build_fused_qkv_layers() {
   const int32_t hidden_dim = config_->hidden_dim_;
   const int32_t fused_dim = dim + 2 * kv_dim;
   const int32_t num_layers = config_->layer_num_;
-  const size_t w_block_q = static_cast<size_t>(dim) * hidden_dim * 4;
-  const size_t w_block_kv = static_cast<size_t>(kv_dim) * hidden_dim * 4;
+  // The stacked weight buffer adopts the model compute dtype (BF16 on CUDA,
+  // FP32 on CPU runs); the sources are on the target device already
+  // (to_cuda ran before build_fused_qkv_layers). Every source block is
+  // K-major ([K, M] row-major) so each is one contiguous byte memcpy.
+  const base::DataType dtype = compute_dtype();
+  const size_t elem = base::DataTypeSize(dtype);
+  const size_t w_block_q = static_cast<size_t>(dim) * hidden_dim * elem;
+  const size_t w_block_kv = static_cast<size_t>(kv_dim) * hidden_dim * elem;
 
   std::shared_ptr<base::DeviceAllocator> alloc;
   if (device_type_ == base::DeviceType::kDeviceCUDA) {
@@ -345,22 +400,20 @@ void Qwen3Model::build_fused_qkv_layers() {
         std::dynamic_pointer_cast<op::MatmulLayer>(qwen_layers_->wv_layers_.at(i))->get_weight(0);
 
     // Stacked weight [q | k | v]: K-major blocks, one contiguous memcpy each.
-    tensor::Tensor fused_w(base::DataType::kDataTypeFp32, fused_dim, hidden_dim, true, alloc);
+    tensor::Tensor fused_w(dtype, fused_dim, hidden_dim, true, alloc);
     if (device_type_ == base::DeviceType::kDeviceCUDA) {
       cudaStream_t stream = cuda_config_->stream;
-      cudaMemcpyAsync(fused_w.ptr<float>(), wq_w.ptr<float>(), w_block_q,
+      cudaMemcpyAsync(fused_w.ptr<uint8_t>(), wq_w.ptr<uint8_t>(), w_block_q,
                       cudaMemcpyDeviceToDevice, stream);
-      cudaMemcpyAsync(fused_w.ptr<float>(static_cast<int64_t>(dim) * hidden_dim),
-                      wk_w.ptr<float>(), w_block_kv, cudaMemcpyDeviceToDevice, stream);
-      cudaMemcpyAsync(fused_w.ptr<float>(static_cast<int64_t>(dim + kv_dim) * hidden_dim),
-                      wv_w.ptr<float>(), w_block_kv, cudaMemcpyDeviceToDevice, stream);
+      cudaMemcpyAsync(fused_w.ptr<uint8_t>(w_block_q), wk_w.ptr<uint8_t>(), w_block_kv,
+                      cudaMemcpyDeviceToDevice, stream);
+      cudaMemcpyAsync(fused_w.ptr<uint8_t>(w_block_q + w_block_kv), wv_w.ptr<uint8_t>(),
+                      w_block_kv, cudaMemcpyDeviceToDevice, stream);
       cudaStreamSynchronize(stream);  // init-time only: weights must be ready pre-forward
     } else {
-      std::memcpy(fused_w.ptr<float>(), wq_w.ptr<float>(), w_block_q);
-      std::memcpy(fused_w.ptr<float>(static_cast<int64_t>(dim) * hidden_dim),
-                  wk_w.ptr<float>(), w_block_kv);
-      std::memcpy(fused_w.ptr<float>(static_cast<int64_t>(dim + kv_dim) * hidden_dim),
-                  wv_w.ptr<float>(), w_block_kv);
+      std::memcpy(fused_w.ptr<uint8_t>(), wq_w.ptr<uint8_t>(), w_block_q);
+      std::memcpy(fused_w.ptr<uint8_t>(w_block_q), wk_w.ptr<uint8_t>(), w_block_kv);
+      std::memcpy(fused_w.ptr<uint8_t>(w_block_q + w_block_kv), wv_w.ptr<uint8_t>(), w_block_kv);
     }
 
     // Qwen3 has no QKV bias (unlike Qwen2).
@@ -371,6 +424,7 @@ void Qwen3Model::build_fused_qkv_layers() {
       fused->set_cuda_config(cuda_config_);
     }
     qwen_layers_->fused_qkv_layers_.push_back(fused);
+    // Keep-alive holder: set_weight stores a non-owning view into this buffer.
     qwen_layers_->fused_qkv_weight_src_.push_back(fused_w);
   }
   qwen_layers_->fused_qkv_enabled_ = true;
@@ -398,16 +452,16 @@ void Qwen3Model::init_mem() {
 
   std::shared_ptr<base::DeviceAllocator> alloc_cpu =
       base::CPUDeviceAllocatorFactory::get_instance();
-  std::shared_ptr<base::DeviceAllocator> alloc_cu =
-      base::CUDADeviceAllocatorFactory::get_instance();
+
+  // Activations, caches and the RoPE sin/cos tables follow the model compute
+  // dtype (BF16 on CUDA, FP32 on the CPU fallback): the CUDA fill kernel
+  // stores bf16-rounded values, the CPU fill keeps fp32.
+  const base::DataType dtype = compute_dtype();
 
   tensor::Tensor input_tokens(base::DataType::kDataTypeInt32, 1, true, alloc_cpu);
-  tensor::Tensor input_embeddings(base::DataType::kDataTypeFp32, 1, config_->hidden_dim_, true,
-                                  alloc);
-  tensor::Tensor sin_cache(base::DataType::kDataTypeFp32, config_->head_size_ * config_->seq_len_,
-                           true, alloc);
-  tensor::Tensor cos_cache(base::DataType::kDataTypeFp32, config_->head_size_ * config_->seq_len_,
-                           true, alloc);
+  tensor::Tensor input_embeddings(dtype, 1, config_->hidden_dim_, true, alloc);
+  tensor::Tensor sin_cache(dtype, config_->head_size_ * config_->seq_len_, true, alloc);
+  tensor::Tensor cos_cache(dtype, config_->head_size_ * config_->seq_len_, true, alloc);
 
   CHECK(insert_buffer(ModelBufferType::kSinCache, sin_cache));
   CHECK(insert_buffer(ModelBufferType::kCosCache, cos_cache));
@@ -415,52 +469,47 @@ void Qwen3Model::init_mem() {
   CHECK(insert_buffer(ModelBufferType::kInputTokens, input_tokens));
   CHECK(insert_buffer(ModelBufferType::kInputEmbeddings, input_embeddings));
 
-  tensor::Tensor rms_output(base::DataType::kDataTypeFp32, config_->hidden_dim_, true, alloc);
-  tensor::Tensor out_mha(base::DataType::kDataTypeFp32, config_->dim_, true, alloc);
+  tensor::Tensor rms_output(dtype, config_->hidden_dim_, true, alloc);
+  tensor::Tensor out_mha(dtype, config_->dim_, true, alloc);
 
   CHECK(insert_buffer(ModelBufferType::kOutputRMSNorm, rms_output));
   CHECK(insert_buffer(ModelBufferType::kOutputMHA, out_mha));
   CHECK(insert_buffer(ModelBufferType::kW2Output, rms_output));
   CHECK(insert_buffer(ModelBufferType::kFFNRMSNorm, rms_output));
 
-  tensor::Tensor w1_output(base::DataType::kDataTypeFp32, config_->immediate_dim_, true, alloc);
-  tensor::Tensor w3_output(base::DataType::kDataTypeFp32, config_->immediate_dim_, true, alloc);
+  tensor::Tensor w1_output(dtype, config_->immediate_dim_, true, alloc);
+  tensor::Tensor w3_output(dtype, config_->immediate_dim_, true, alloc);
 
   CHECK(insert_buffer(ModelBufferType::kW1Output, w1_output));
   CHECK(insert_buffer(ModelBufferType::kW3Output, w3_output));
 
   // kv cache
-  tensor::Tensor key_cache(base::DataType::kDataTypeFp32, config_->layer_num_, config_->seq_len_,
-                           config_->kv_dim_, true, alloc);
-  tensor::Tensor value_cache(base::DataType::kDataTypeFp32, config_->layer_num_, config_->seq_len_,
-                             config_->kv_dim_, true, alloc);
+  tensor::Tensor key_cache(dtype, config_->layer_num_, config_->seq_len_, config_->kv_dim_, true,
+                           alloc);
+  tensor::Tensor value_cache(dtype, config_->layer_num_, config_->seq_len_, config_->kv_dim_, true,
+                             alloc);
 
   CHECK(insert_buffer(ModelBufferType::kKeyCache, key_cache));
   CHECK(insert_buffer(ModelBufferType::kValueCache, value_cache));
 
   // Wq query output
-  tensor::Tensor query(base::DataType::kDataTypeFp32, config_->dim_, true, alloc);
+  tensor::Tensor query(dtype, config_->dim_, true, alloc);
   CHECK(insert_buffer(ModelBufferType::kQuery, query));
 
   // Pos tensor
   tensor::Tensor pos_tensor(base::DataType::kDataTypeInt32, 1, true, alloc_cpu);
   CHECK(insert_buffer(ModelBufferType::kInputPos, pos_tensor));
 
-  // Attention output
-  tensor::Tensor attn(base::DataType::kDataTypeFp32, config_->head_num_, config_->seq_len_, true,
-                      alloc);
+  // Attention score scratch [head_num, seq_len]: dtype follows the model so
+  // the (single-sequence) MHA op runs one uniform kernel family per dtype.
+  tensor::Tensor attn(dtype, config_->head_num_, config_->seq_len_, true, alloc);
   CHECK(insert_buffer(ModelBufferType::kScoreStorage, attn));
-  tensor::Tensor attn_output(base::DataType::kDataTypeFp32, config_->hidden_dim_, true, alloc);
+  tensor::Tensor attn_output(dtype, config_->hidden_dim_, true, alloc);
   CHECK(insert_buffer(ModelBufferType::kAttnOutput, attn_output));
 
-  // final forward output
-  tensor::Tensor forward_output(base::DataType::kDataTypeFp32, config_->vocab_size_, true, alloc);
-  if (device_type_ == base::DeviceType::kDeviceCUDA) {
-    tensor::Tensor forward_output_cpu(base::DataType::kDataTypeFp32, config_->vocab_size_, true,
-                                      alloc_cpu);
-    CHECK(insert_buffer(ModelBufferType::kForwardOutputCPU, forward_output_cpu));
-  }
-
+  // Final forward output (logits): BF16 on CUDA — the sampler reads raw
+  // bfloat16 bits on the device (see post_processing).
+  tensor::Tensor forward_output(dtype, config_->vocab_size_, true, alloc);
   CHECK(insert_buffer(ModelBufferType::kForwardOutput, forward_output));
 }
 
@@ -473,7 +522,7 @@ base::Status Qwen3Model::create_layers() {
   if (!is_quant_model_) {
     create_param_layers();
   } else {
-    return error::FunctionNotImplement("");
+    create_param_quant_layers();
   }
   create_nonparam_layers();
 
@@ -718,7 +767,6 @@ void Qwen3Model::cls_logits(const tensor::Tensor& input) const {
 
 int32_t Qwen3Model::post_processing(const tensor::Tensor& pos, bool is_prompt) const {
   tensor::Tensor forward_output = get_buffer(ModelBufferType::kForwardOutput);
-  const float* forward_logits = forward_output.ptr<float>();
 
   int32_t next = 0;
   if (is_prompt) {
@@ -730,8 +778,15 @@ int32_t Qwen3Model::post_processing(const tensor::Tensor& pos, bool is_prompt) c
     if (encode_layer_ && encode_layer_->vocab_size() > 0) {
       sample_size = std::min(sample_size, static_cast<size_t>(encode_layer_->vocab_size()));
     }
-    next = static_cast<int32_t>(sampler_->sample(
-        forward_logits, sample_size, cuda_config_ ? cuda_config_->stream : nullptr));
+    void* stream = cuda_config_ ? cuda_config_->stream : nullptr;
+    if (forward_output.data_type() == base::DataType::kDataTypeBF16) {
+      // BF16 logits (CUDA): the sampler converts raw bfloat16 bits to float.
+      next = static_cast<int32_t>(
+          sampler_->sample_bf16(forward_output.ptr<uint16_t>(), sample_size, stream));
+    } else {
+      next = static_cast<int32_t>(
+          sampler_->sample(forward_output.ptr<float>(), sample_size, stream));
+    }
   }
   return next;
 }
@@ -787,7 +842,7 @@ base::Status Qwen3Model::forward_batch(
   if (scratch) {
     scratch->ensure(batch, hidden_dim, dim, kv_dim, config_->immediate_dim_,
                     config_->head_num_, config_->head_size_, max_seq_len, table_stride,
-                    device_type_, alloc);
+                    device_type_, compute_dtype(), alloc);
     hidden = scratch->hidden;
     rms_out = scratch->rms_out;
     q_batch = scratch->q_batch;
@@ -802,25 +857,27 @@ base::Status Qwen3Model::forward_batch(
     partial_batch = scratch->partial_batch;
     qkv_out = scratch->qkv_out;
   } else {
-    hidden = tensor::Tensor(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
-    rms_out = tensor::Tensor(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
-    q_batch = tensor::Tensor(base::DataType::kDataTypeFp32, batch, dim, true, alloc);
-    mha_out_batch = tensor::Tensor(base::DataType::kDataTypeFp32, batch, dim, true, alloc);
-    attn_out = tensor::Tensor(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
-    ffn_norm_out = tensor::Tensor(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
-    w1_out = tensor::Tensor(base::DataType::kDataTypeFp32, batch, config_->immediate_dim_, true, alloc);
-    w3_out = tensor::Tensor(base::DataType::kDataTypeFp32, batch, config_->immediate_dim_, true, alloc);
-    w2_out = tensor::Tensor(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
-    key_batch = tensor::Tensor(base::DataType::kDataTypeFp32, batch, kv_dim, true, alloc);
-    val_batch = tensor::Tensor(base::DataType::kDataTypeFp32, batch, kv_dim, true, alloc);
-    qkv_out = tensor::Tensor(base::DataType::kDataTypeFp32, batch,
-                             config_->dim_ + 2 * kv_dim, true, alloc);
+    // Pooled allocations (prefill path): same element counts as the scratch
+    // buffers but at the model compute dtype (BF16 on CUDA).
+    const base::DataType dtype = compute_dtype();
+    hidden = tensor::Tensor(dtype, batch, hidden_dim, true, alloc);
+    rms_out = tensor::Tensor(dtype, batch, hidden_dim, true, alloc);
+    q_batch = tensor::Tensor(dtype, batch, dim, true, alloc);
+    mha_out_batch = tensor::Tensor(dtype, batch, dim, true, alloc);
+    attn_out = tensor::Tensor(dtype, batch, hidden_dim, true, alloc);
+    ffn_norm_out = tensor::Tensor(dtype, batch, hidden_dim, true, alloc);
+    w1_out = tensor::Tensor(dtype, batch, config_->immediate_dim_, true, alloc);
+    w3_out = tensor::Tensor(dtype, batch, config_->immediate_dim_, true, alloc);
+    w2_out = tensor::Tensor(dtype, batch, hidden_dim, true, alloc);
+    key_batch = tensor::Tensor(dtype, batch, kv_dim, true, alloc);
+    val_batch = tensor::Tensor(dtype, batch, kv_dim, true, alloc);
+    qkv_out = tensor::Tensor(dtype, batch, config_->dim_ + 2 * kv_dim, true, alloc);
     if (device_type_ == base::DeviceType::kDeviceCUDA) {
       int32_t num_splits = kernel::flash_decoding_num_splits(max_seq_len);
+      // Score rows of head_size floats; BF16 splits keep the same row count.
       partial_batch = tensor::Tensor(
-          base::DataType::kDataTypeFp32,
-          static_cast<int64_t>(batch) * config_->head_num_ * num_splits *
-              (config_->head_size_ + 2),
+          dtype, static_cast<int64_t>(batch) * config_->head_num_ * num_splits *
+                     (config_->head_size_ + 2),
           true, alloc);
     }
   }
@@ -904,13 +961,17 @@ base::Status Qwen3Model::forward_batch(
       auto& fused = qwen_layers_->fused_qkv_layers_.at(layer_idx);
       std::dynamic_pointer_cast<op::MatmulLayer>(fused)->set_batch_size(batch);
       STATUS_CHECK(fused->forward(rms_out, qkv_out));
-      // Views into the fused output row blocks: [q | k | v].
-      q_batch = tensor::Tensor(base::DataType::kDataTypeFp32, batch, dim,
-                               false, nullptr, qkv_out.ptr<float>());
-      key_batch = tensor::Tensor(base::DataType::kDataTypeFp32, batch, kv_dim,
-                                 false, nullptr, qkv_out.ptr<float>(dim));
-      val_batch = tensor::Tensor(base::DataType::kDataTypeFp32, batch, kv_dim,
-                                 false, nullptr, qkv_out.ptr<float>(dim + kv_dim));
+      // Views into the fused output row blocks: [q | k | v], dtype of the
+      // fused GEMM output (BF16 on CUDA).
+      const base::DataType v_dtype = qkv_out.data_type();
+      const auto row_ptr = [&](int64_t elem_off) -> void* {
+        return (v_dtype == base::DataType::kDataTypeBF16)
+                   ? static_cast<void*>(qkv_out.ptr<uint16_t>(elem_off))
+                   : static_cast<void*>(qkv_out.ptr<float>(elem_off));
+      };
+      q_batch = tensor::Tensor(v_dtype, batch, dim, false, nullptr, row_ptr(0));
+      key_batch = tensor::Tensor(v_dtype, batch, kv_dim, false, nullptr, row_ptr(dim));
+      val_batch = tensor::Tensor(v_dtype, batch, kv_dim, false, nullptr, row_ptr(dim + kv_dim));
       q_batch.set_device_type(device_type_);
       key_batch.set_device_type(device_type_);
       val_batch.set_device_type(device_type_);

@@ -22,7 +22,8 @@ base::Status BaseLayer::set_weight(int32_t idx, const tensor::Tensor& weight) {
 }
 
 base::Status BaseLayer::set_weight(int32_t idx, const std::vector<int32_t>& dims,
-                                   const void* weight_ptr, base::DeviceType device_type) {
+                                   const void* weight_ptr, base::DeviceType device_type,
+                                   base::DataType data_type) {
   return base::error::FunctionNotImplement();
 }
 
@@ -157,11 +158,16 @@ LayerParam::LayerParam(base::DeviceType device_type, LayerType layer_type, bool 
 base::Status LayerParam::set_weight(int32_t idx, const tensor::Tensor& weight) {
   CHECK_GE(idx, 0);
   CHECK_LT(idx, weights_.size());
-  CHECK(weight.data_type() == base::DataType::kDataTypeFp32);
+  CHECK(weight.data_type() == base::DataType::kDataTypeFp32 ||
+        weight.data_type() == base::DataType::kDataTypeBF16);
   if (!weight.is_empty()) {
     CHECK(weight.device_type() == device_type_);
   }
   weights_.at(idx) = weight;
+  if (!is_quant_layer_) {
+    // The layer computes in its weight dtype (BF16 on CUDA, FP32 on CPU).
+    data_type_ = weight.data_type();
+  }
   return base::error::Success();
 }
 
@@ -182,12 +188,16 @@ void LayerParam::to_cuda() {
 }
 
 base::Status LayerParam::set_weight(int32_t idx, const std::vector<int32_t>& dims,
-                                    const void* weight_ptr, base::DeviceType device_type) {
+                                    const void* weight_ptr, base::DeviceType device_type,
+                                    base::DataType data_type) {
   CHECK_GE(idx, 0);
   CHECK_LT(idx, weights_.size());
   CHECK_NE(weight_ptr, nullptr);
+  CHECK(data_type == base::DataType::kDataTypeFp32 ||
+        data_type == base::DataType::kDataTypeBF16);
 
-  size_t size = std::accumulate(dims.begin(), dims.end(), sizeof(float), std::multiplies<>());
+  size_t size = std::accumulate(dims.begin(), dims.end(), base::DataTypeSize(data_type),
+                                std::multiplies<>());
   std::shared_ptr<base::Buffer> buffer =
       std::make_shared<base::Buffer>(size, nullptr, const_cast<void*>(weight_ptr), true);
   if (device_type != base::DeviceType::kDeviceUnknown) {
@@ -195,10 +205,14 @@ base::Status LayerParam::set_weight(int32_t idx, const std::vector<int32_t>& dim
   }
 
   if (!is_quant_layer_) {
-    tensor::Tensor weight(base::DataType::kDataTypeFp32, dims);
+    // Non-owning view over the caller's weight storage (weight_map_ / HF
+    // tensors, raw bfloat16 bits when data_type == kDataTypeBF16).
+    tensor::Tensor weight(data_type, dims);
     weight.set_device_type(device_type);
     CHECK(weight.assign(buffer));
     weights_.at(idx) = weight;
+    // The layer computes in its weight dtype (BF16 on CUDA, FP32 on CPU).
+    data_type_ = data_type;
   } else {
     // is quant layer
     tensor::Tensor weight(base::DataType::kDataTypeInt8, dims);

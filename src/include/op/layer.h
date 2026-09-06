@@ -73,7 +73,8 @@ class BaseLayer {
 
   virtual base::Status set_weight(int32_t idx, const std::vector<int32_t>& dims,
                                   const void* weight_ptr,
-                                  base::DeviceType device_type = base::DeviceType::kDeviceUnknown);
+                                  base::DeviceType device_type = base::DeviceType::kDeviceUnknown,
+                                  base::DataType data_type = base::DataType::kDataTypeFp32);
 
   const std::string& get_layer_name() const;
 
@@ -172,7 +173,8 @@ class LayerParam : public Layer {
   base::Status set_weight(int32_t idx, const tensor::Tensor& weight) override;
 
   base::Status set_weight(int32_t idx, const std::vector<int32_t>& dims, const void* weight_ptr,
-                          base::DeviceType device_type = base::DeviceType::kDeviceUnknown) override;
+                          base::DeviceType device_type = base::DeviceType::kDeviceUnknown,
+                          base::DataType data_type = base::DataType::kDataTypeFp32) override;
 
   void set_scales(const tensor::Tensor& scales);
 

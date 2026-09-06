@@ -2,6 +2,8 @@
 #define SRC_SOURCE_OP_KERNELS_CUDA_MHA_KERNEL_CUH
 #include <algorithm>
 namespace kernel {
+// CUDA MHA kernels operate on raw bfloat16 q / KV caches / output / partials
+// (see mha_kernel_bf16.cu); internal score arithmetic stays in fp32.
 void mha_kernel_cu(int32_t pos, int32_t head_num, int32_t layer_index, int32_t seq_len,
                    int32_t kv_dim, int32_t kv_head_num, int32_t head_size,
                    const tensor::Tensor& mha_out, const tensor::Tensor& query_tensor,
@@ -26,10 +28,11 @@ inline int flash_decoding_num_splits(int32_t max_seq_len) {
 //   query_batch [batch, dim] (dim = head_num * head_size)
 //   score_batch scratch, must hold
 //     batch * head_num * flash_decoding_num_splits(max_seq_len) * (head_size + 2)
-//     floats for the partials (o | m | l) of every split.
+//     elements of the model dtype for the partials (o | m | l) of every split.
 //   mha_out     [batch, dim]
 //   key/value_cache [num_layers, num_slots, kv_dim, max_seq_len] (head-dim
 //   contiguous layout: cache[layer][slot][d][pos])
+// All q / KV caches / output are raw bfloat16 (see mha_kernel_bf16.cu).
 void mha_kernel_cu_batch(int32_t head_num, int32_t layer_idx, int32_t num_slots,
                          int32_t max_seq_len, int32_t kv_dim, int32_t kv_head_num,
                          int32_t head_size, const tensor::Tensor& positions,

@@ -191,243 +191,112 @@ void LLamaModel::create_nonparam_layers() {
 }
 
 void LLamaModel::create_param_quant_layers() {
-  CHECK(is_quant_model_);
-  CHECK(llama_layers_ != nullptr);
-
-  size_t pos = 0;
-  int32_t dim = config_->dim_;
-  auto cpu_device_type = base::DeviceType::kDeviceCPU;
-
-  // query
-  for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto wq = std::make_shared<op::MatmulLayer>(device_type_, dim, dim, true);
-    wq->set_group_size(group_size_);
-    wq->set_weight(0, {dim, dim}, this->raw_model_data_->weight(pos), cpu_device_type);
-    llama_layers_->wq_layers_.push_back(wq);
-    pos = pos + dim * dim + wq->get_scale_num() * sizeof(float);
-  }
-
-  // key
-  for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto wk = std::make_shared<op::MatmulLayer>(device_type_, config_->kv_dim_, dim, true);
-    wk->set_group_size(group_size_);
-    wk->set_weight(0, {config_->kv_dim_, dim}, this->raw_model_data_->weight(pos), cpu_device_type);
-    llama_layers_->wk_layers_.push_back(wk);
-    pos = pos + config_->kv_dim_ * dim + wk->get_scale_num() * sizeof(float);
-  }
-
-  // value
-  for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto wv = std::make_shared<op::MatmulLayer>(device_type_, config_->kv_dim_, dim, true);
-    wv->set_group_size(group_size_);
-    wv->set_weight(0, {config_->kv_dim_, dim}, this->raw_model_data_->weight(pos), cpu_device_type);
-    llama_layers_->wv_layers_.push_back(wv);
-    pos += config_->kv_dim_ * dim + wv->get_scale_num() * sizeof(float);
-  }
-
-  // output
-  for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto wo = std::make_shared<op::MatmulLayer>(device_type_, dim, dim, true);
-    wo->set_group_size(group_size_);
-    wo->set_weight(0, {dim, dim}, this->raw_model_data_->weight(pos), cpu_device_type);
-    llama_layers_->wo_layers_.push_back(wo);
-    pos = pos + dim * dim + wo->get_scale_num() * sizeof(float);
-  }
-
-  // w1 layers
-  int32_t hidden_dim = config_->hidden_dim_;
-  for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto w1 = std::make_shared<op::MatmulLayer>(device_type_, hidden_dim, dim, true);
-    w1->set_group_size(group_size_);
-    w1->set_weight(0, {hidden_dim, dim}, this->raw_model_data_->weight(pos), cpu_device_type);
-    llama_layers_->w1_layers_.push_back(w1);
-    pos = pos + dim * hidden_dim + w1->get_scale_num() * sizeof(float);
-  }
-
-  // w2 layers
-  for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto w2 = std::make_shared<op::MatmulLayer>(device_type_, dim, hidden_dim, true);
-    w2->set_group_size(group_size_);
-    w2->set_weight(0, {dim, hidden_dim}, this->raw_model_data_->weight(pos), cpu_device_type);
-    llama_layers_->w2_layers_.push_back(w2);
-    pos = pos + dim * hidden_dim + w2->get_scale_num() * sizeof(float);
-  }
-
-  // w3 layers
-  for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto w3 = std::make_shared<op::MatmulLayer>(device_type_, hidden_dim, dim, true);
-    w3->set_group_size(group_size_);
-    w3->set_weight(0, {hidden_dim, dim}, this->raw_model_data_->weight(pos), cpu_device_type);
-    llama_layers_->w3_layers_.push_back(w3);
-    pos = pos + dim * hidden_dim + w3->get_scale_num() * sizeof(float);
-  }
-
-  // wcls layer
-  auto cls_layer = std::make_shared<op::MatmulLayer>(device_type_, config_->vocab_size_, dim, true);
-  cls_layer->set_group_size(group_size_);
-  if (config_->is_shared_weight_) {
-    // using token embedding weight
-    cls_layer->set_weight(0, {config_->vocab_size_, dim}, this->raw_model_data_->weight(pos),
-                          cpu_device_type);
-  } else {
-    // no shared
-    cls_layer->set_weight(0, {config_->vocab_size_, dim}, this->raw_model_data_->weight(pos),
-                          cpu_device_type);
-    pos = pos + config_->vocab_size_ * dim + cls_layer->get_scale_num() * sizeof(float);
-  }
-  llama_layers_->cls_layer_ = cls_layer;
-
-  // embedding layer
-  float* weight_ptr = (float*)raw_model_data_->weight(pos);
-  llama_layers_->embedding_layer_ = std::make_shared<op::EmbeddingLayer>(
-      device_type_, config_->dim_, config_->seq_len_, std::abs(config_->vocab_size_));
-  llama_layers_->embedding_layer_->set_weight(0, {std::abs(config_->vocab_size_), dim}, weight_ptr,
-                                              cpu_device_type);
-  weight_ptr += config_->vocab_size_ * dim;
-
-  // rmsnorm attention attention,ffn,final
-  for (int32_t i = 0; i < 2 * config_->layer_num_ + 1; ++i) {
-    std::shared_ptr<op::RmsNormLayer> rms_norm_layer =
-        std::make_shared<op::RmsNormLayer>(device_type_, dim);
-
-    rms_norm_layer->set_weight(0, {dim}, weight_ptr, cpu_device_type);
-    llama_layers_->rmsnorm_layers_.push_back(rms_norm_layer);
-    weight_ptr += dim;
-  }
+  // Int8 group quantization is not migrated to the HF safetensors loading
+  // path (BF16 replaces it). Loading quantized checkpoints fails loudly.
+  LOG(FATAL) << "Int8 quantized models are not supported by the HF safetensors "
+                "loader; use a BF16 checkpoint.";
 }
 
 void LLamaModel::create_param_layers() {
   CHECK(!is_quant_model_);
   CHECK(llama_layers_ != nullptr);
+  // Weights are loaded from the HF safetensors checkpoint under the model's
+  // compute dtype: BF16 raw bits on CUDA, FP32 (converted at load time,
+  // see get_weight_data()) on the CPU path.
+  const auto cpu_device_type = base::DeviceType::kDeviceCPU;
+  const base::DataType w_dtype = compute_dtype();
+  const int32_t dim = config_->dim_;
+  const int32_t kv_dim = config_->kv_dim_;
+  const int32_t ffn_dim = config_->hidden_dim_;  // LLaMA: FFN width
+  const int32_t vocab = std::abs(config_->vocab_size_);
+  const std::string emb_name = "model.embed_tokens.weight";
+
+  // HF tensor name for one transformer layer block:
+  //   model.layers.<i>.self_attn.{q,k,v,o}_proj.weight
+  //   model.layers.<i>.mlp.{gate,up,down}_proj.weight
+  //   model.layers.<i>.{input,post_attention}_layernorm.weight
+  const auto block = [](int32_t i, const char* suffix) {
+    return "model.layers." + std::to_string(i) + "." + suffix;
+  };
+
   // The embedding layer
-  auto cpu_device_type = base::DeviceType::kDeviceCPU;
   llama_layers_->embedding_layer_ = std::make_shared<op::EmbeddingLayer>(
-      device_type_, config_->dim_, config_->seq_len_, std::abs(config_->vocab_size_));
+      device_type_, dim, config_->seq_len_, vocab);
+  llama_layers_->embedding_layer_->set_weight(
+      0, {vocab, dim}, get_weight_data(emb_name), cpu_device_type, w_dtype);
 
-  const void* weight_embedding = raw_model_data_->weight(0);
-  llama_layers_->embedding_layer_->set_weight(0, {std::abs(config_->vocab_size_), config_->dim_},
-                                              weight_embedding, cpu_device_type);
-
-  // create all matmul layer
-  int32_t dim = config_->dim_;
-  size_t pos = dim * std::abs(config_->vocab_size_) + dim * config_->layer_num_;
-  // create weight matrix for query
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
+    // attention projections (no QKV bias for LLaMA)
     auto wq = std::make_shared<op::MatmulLayer>(device_type_, dim, dim);
-    wq->set_weight(0, {dim, dim}, this->raw_model_data_->weight(pos), cpu_device_type);
+    wq->set_weight(0, {dim, dim}, get_weight_data(block(i, "self_attn.q_proj.weight")),
+                   cpu_device_type, w_dtype);
     llama_layers_->wq_layers_.push_back(wq);
-    pos += dim * dim;
-  }
 
-  // create weight matrix for key
-  for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto wk = std::make_shared<op::MatmulLayer>(device_type_, config_->kv_dim_, dim);
-    wk->set_weight(0, {config_->kv_dim_, dim}, this->raw_model_data_->weight(pos), cpu_device_type);
+    auto wk = std::make_shared<op::MatmulLayer>(device_type_, kv_dim, dim);
+    wk->set_weight(0, {kv_dim, dim}, get_weight_data(block(i, "self_attn.k_proj.weight")),
+                   cpu_device_type, w_dtype);
     llama_layers_->wk_layers_.push_back(wk);
-    pos += config_->kv_dim_ * dim;
-  }
 
-  // create weight matrix for value
-  for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto wv = std::make_shared<op::MatmulLayer>(device_type_, config_->kv_dim_, dim);
-    wv->set_weight(0, {config_->kv_dim_, dim}, this->raw_model_data_->weight(pos), cpu_device_type);
+    auto wv = std::make_shared<op::MatmulLayer>(device_type_, kv_dim, dim);
+    wv->set_weight(0, {kv_dim, dim}, get_weight_data(block(i, "self_attn.v_proj.weight")),
+                   cpu_device_type, w_dtype);
     llama_layers_->wv_layers_.push_back(wv);
-    pos += config_->kv_dim_ * dim;
-  }
 
-  // create weight matrix for output
-  for (int32_t i = 0; i < config_->layer_num_; ++i) {
     auto wo = std::make_shared<op::MatmulLayer>(device_type_, dim, dim);
-    wo->set_weight(0, {dim, dim}, this->raw_model_data_->weight(pos), cpu_device_type);
+    wo->set_weight(0, {dim, dim}, get_weight_data(block(i, "self_attn.o_proj.weight")),
+                   cpu_device_type, w_dtype);
     llama_layers_->wo_layers_.push_back(wo);
-    pos += dim * dim;
-  }
 
-  // skip ffn rmsnorm
-  pos += config_->layer_num_ * dim;
-
-  // w1 layers
-  int32_t hidden_dim = config_->hidden_dim_;
-  for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto w1 = std::make_shared<op::MatmulLayer>(device_type_, hidden_dim, dim);
-    w1->set_weight(0, {hidden_dim, dim}, this->raw_model_data_->weight(pos), cpu_device_type);
+    // FFN: gate_proj -> silu(gate) * up_proj -> down_proj. The engine computes
+    // silu(w1_out) * w3_out (see the SwiGLU kernel), so w1 = gate_proj and
+    // w3 = up_proj.
+    auto w1 = std::make_shared<op::MatmulLayer>(device_type_, ffn_dim, dim);
+    w1->set_weight(0, {ffn_dim, dim}, get_weight_data(block(i, "mlp.gate_proj.weight")),
+                   cpu_device_type, w_dtype);
     llama_layers_->w1_layers_.push_back(w1);
-    pos += dim * hidden_dim;
-  }
 
-  // w2 layers
-  for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto w2 = std::make_shared<op::MatmulLayer>(device_type_, dim, hidden_dim);
-    w2->set_weight(0, {dim, hidden_dim}, this->raw_model_data_->weight(pos), cpu_device_type);
+    auto w2 = std::make_shared<op::MatmulLayer>(device_type_, dim, ffn_dim);
+    w2->set_weight(0, {dim, ffn_dim}, get_weight_data(block(i, "mlp.down_proj.weight")),
+                   cpu_device_type, w_dtype);
     llama_layers_->w2_layers_.push_back(w2);
-    pos += dim * hidden_dim;
-  }
 
-  // w3 layers
-  for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto w3 = std::make_shared<op::MatmulLayer>(device_type_, hidden_dim, dim);
-    w3->set_weight(0, {hidden_dim, dim}, this->raw_model_data_->weight(pos), cpu_device_type);
+    auto w3 = std::make_shared<op::MatmulLayer>(device_type_, ffn_dim, dim);
+    w3->set_weight(0, {ffn_dim, dim}, get_weight_data(block(i, "mlp.up_proj.weight")),
+                   cpu_device_type, w_dtype);
     llama_layers_->w3_layers_.push_back(w3);
-    pos += dim * hidden_dim;
   }
 
-  // skip final rms weight
-  pos += dim;
-  // skip freqs_cos and freqs_sin weight
-  pos += config_->seq_len_ * config_->head_size_;
-
-  llama_layers_->cls_layer_ =
-      std::make_shared<op::MatmulLayer>(device_type_, config_->vocab_size_, dim);
-  if (config_->is_shared_weight_) {
-    // using token embedding weight
-    llama_layers_->cls_layer_->set_weight(0, {config_->vocab_size_, dim},
-                                          this->raw_model_data_->weight(0), cpu_device_type);
+  // Classification head: tied weights reuse the embedding table.
+  llama_layers_->cls_layer_ = std::make_shared<op::MatmulLayer>(device_type_, vocab, dim);
+  if (config_->is_shared_weight_ || !weight_map_.count("lm_head.weight")) {
+    llama_layers_->cls_layer_->set_weight(0, {vocab, dim}, get_weight_data(emb_name),
+                                          cpu_device_type, w_dtype);
   } else {
-    llama_layers_->cls_layer_->set_weight(0, {config_->vocab_size_, dim},
-                                          this->raw_model_data_->weight(pos), cpu_device_type);
+    llama_layers_->cls_layer_->set_weight(0, {vocab, dim}, get_weight_data("lm_head.weight"),
+                                          cpu_device_type, w_dtype);
   }
 
-  // create rmsnorm layer
-  size_t rmsnorm_pos = config_->dim_ * std::abs(config_->vocab_size_);
-
+  // RMSNorm weights. Vector slots follow the engine convention
+  // (see attention_rms / feed_forward / cls_logits):
+  //   [0, layer_num_):          model.layers.<i>.input_layernorm
+  //   [layer_num_, 2*layer_num_) model.layers.<i>.post_attention_layernorm
+  //   [2*layer_num_]            model.norm (final)
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    std::shared_ptr<op::RmsNormLayer> rms_norm_layer =
-        std::make_shared<op::RmsNormLayer>(device_type_, config_->dim_);
-
-    const void* weight_rmsnorm = raw_model_data_->weight(rmsnorm_pos);
-    rms_norm_layer->set_weight(0, {config_->dim_}, weight_rmsnorm, cpu_device_type);
+    auto rms_norm_layer = std::make_shared<op::RmsNormLayer>(device_type_, dim);
+    rms_norm_layer->set_weight(0, {dim}, get_weight_data(block(i, "input_layernorm.weight")),
+                               cpu_device_type, w_dtype);
     llama_layers_->rmsnorm_layers_.push_back(rms_norm_layer);
-    rmsnorm_pos += config_->dim_;
   }
-
-  // skip attention.wq attention.wk attention.wv attention.wo
-  rmsnorm_pos += config_->layer_num_ * config_->dim_ * config_->dim_;
-  rmsnorm_pos +=
-      config_->layer_num_ * config_->dim_ * (config_->kv_head_num_ * config_->head_size_);
-  rmsnorm_pos +=
-      config_->layer_num_ * config_->dim_ * (config_->kv_head_num_ * config_->head_size_);
-  rmsnorm_pos += config_->layer_num_ * config_->dim_ * config_->dim_;
-
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    std::shared_ptr<op::RmsNormLayer> rms_norm_layer =
-        std::make_shared<op::RmsNormLayer>(device_type_, config_->dim_);
-    const void* weight_rmsnorm = raw_model_data_->weight(rmsnorm_pos);
-    rms_norm_layer->set_weight(0, {config_->dim_}, weight_rmsnorm, cpu_device_type);
+    auto rms_norm_layer = std::make_shared<op::RmsNormLayer>(device_type_, dim);
+    rms_norm_layer->set_weight(
+        0, {dim}, get_weight_data(block(i, "post_attention_layernorm.weight")),
+        cpu_device_type, w_dtype);
     llama_layers_->rmsnorm_layers_.push_back(rms_norm_layer);
-
-    rmsnorm_pos += config_->dim_;
   }
-
-  // skip ffn.w1 ffn.w2 ffn.w3
-  rmsnorm_pos += config_->layer_num_ * config_->hidden_dim_ * config_->dim_;
-  rmsnorm_pos += config_->layer_num_ * config_->hidden_dim_ * config_->dim_;
-  rmsnorm_pos += config_->layer_num_ * config_->hidden_dim_ * config_->dim_;
-
-  std::shared_ptr<op::RmsNormLayer> rms_final_layer =
-      std::make_shared<op::RmsNormLayer>(device_type_, config_->dim_);
-
-  const void* weight_rmsnorm_final = raw_model_data_->weight(rmsnorm_pos);
-  rms_final_layer->set_weight(0, {config_->dim_}, weight_rmsnorm_final, cpu_device_type);
+  auto rms_final_layer = std::make_shared<op::RmsNormLayer>(device_type_, dim);
+  rms_final_layer->set_weight(0, {dim}, get_weight_data("model.norm.weight"), cpu_device_type,
+                              w_dtype);
   llama_layers_->rmsnorm_layers_.push_back(rms_final_layer);
 }
 
@@ -445,8 +314,12 @@ void LLamaModel::build_fused_qkv_layers() {
   const int32_t kv_dim = config_->kv_dim_;
   const int32_t fused_dim = dim + 2 * kv_dim;
   const int32_t num_layers = config_->layer_num_;
-  const size_t w_block_q = static_cast<size_t>(dim) * dim * 4;
-  const size_t w_block_kv = static_cast<size_t>(kv_dim) * dim * 4;
+  // The stacked weight buffers adopt the model compute dtype (BF16 on CUDA,
+  // FP32 on CPU runs); the source blocks are contiguous byte ranges.
+  const base::DataType dtype = compute_dtype();
+  const size_t elem = base::DataTypeSize(dtype);
+  const size_t w_block_q = static_cast<size_t>(dim) * dim * elem;
+  const size_t w_block_kv = static_cast<size_t>(kv_dim) * dim * elem;
 
   std::shared_ptr<base::DeviceAllocator> alloc;
   if (device_type_ == base::DeviceType::kDeviceCUDA) {
@@ -467,22 +340,20 @@ void LLamaModel::build_fused_qkv_layers() {
         std::dynamic_pointer_cast<op::MatmulLayer>(llama_layers_->wv_layers_.at(i))->get_weight(0);
 
     // Stacked weight [q | k | v]: K-major blocks, one contiguous memcpy each.
-    tensor::Tensor fused_w(base::DataType::kDataTypeFp32, fused_dim, dim, true, alloc);
+    tensor::Tensor fused_w(dtype, fused_dim, dim, true, alloc);
     if (device_type_ == base::DeviceType::kDeviceCUDA) {
       cudaStream_t stream = cuda_config_->stream;
-      cudaMemcpyAsync(fused_w.ptr<float>(), wq_w.ptr<float>(), w_block_q,
+      cudaMemcpyAsync(fused_w.ptr<uint8_t>(), wq_w.ptr<uint8_t>(), w_block_q,
                       cudaMemcpyDeviceToDevice, stream);
-      cudaMemcpyAsync(fused_w.ptr<float>(static_cast<int64_t>(dim) * dim), wk_w.ptr<float>(),
+      cudaMemcpyAsync(fused_w.ptr<uint8_t>(w_block_q), wk_w.ptr<uint8_t>(), w_block_kv,
+                      cudaMemcpyDeviceToDevice, stream);
+      cudaMemcpyAsync(fused_w.ptr<uint8_t>(w_block_q + w_block_kv), wv_w.ptr<uint8_t>(),
                       w_block_kv, cudaMemcpyDeviceToDevice, stream);
-      cudaMemcpyAsync(fused_w.ptr<float>(static_cast<int64_t>(dim + kv_dim) * dim),
-                      wv_w.ptr<float>(), w_block_kv, cudaMemcpyDeviceToDevice, stream);
       cudaStreamSynchronize(stream);  // init-time only: weights must be ready pre-forward
     } else {
-      std::memcpy(fused_w.ptr<float>(), wq_w.ptr<float>(), w_block_q);
-      std::memcpy(fused_w.ptr<float>(static_cast<int64_t>(dim) * dim), wk_w.ptr<float>(),
-                  w_block_kv);
-      std::memcpy(fused_w.ptr<float>(static_cast<int64_t>(dim + kv_dim) * dim),
-                  wv_w.ptr<float>(), w_block_kv);
+      std::memcpy(fused_w.ptr<uint8_t>(), wq_w.ptr<uint8_t>(), w_block_q);
+      std::memcpy(fused_w.ptr<uint8_t>(w_block_q), wk_w.ptr<uint8_t>(), w_block_kv);
+      std::memcpy(fused_w.ptr<uint8_t>(w_block_q + w_block_kv), wv_w.ptr<uint8_t>(), w_block_kv);
     }
 
     // LLaMA has no QKV bias (unlike Qwen2).
@@ -519,15 +390,16 @@ void LLamaModel::init_mem() {
 
   std::shared_ptr<base::DeviceAllocator> alloc_cpu =
       base::CPUDeviceAllocatorFactory::get_instance();
-  std::shared_ptr<base::DeviceAllocator> alloc_cu =
-      base::CUDADeviceAllocatorFactory::get_instance();
+
+  // Activation / KV buffers and the RoPE sin/cos tables all carry the model
+  // compute dtype (BF16 on CUDA, FP32 on CPU): the CUDA fill kernel stores
+  // bf16-rounded values, the CPU fill keeps fp32.
+  const base::DataType dtype = compute_dtype();
 
   tensor::Tensor input_tokens(base::DataType::kDataTypeInt32, 1, true, alloc_cpu);
-  tensor::Tensor input_embeddings(base::DataType::kDataTypeFp32, 1, config_->dim_, true, alloc);
-  tensor::Tensor sin_cache(base::DataType::kDataTypeFp32, config_->head_size_ * config_->seq_len_,
-                           true, alloc);
-  tensor::Tensor cos_cache(base::DataType::kDataTypeFp32, config_->head_size_ * config_->seq_len_,
-                           true, alloc);
+  tensor::Tensor input_embeddings(dtype, 1, config_->dim_, true, alloc);
+  tensor::Tensor sin_cache(dtype, config_->head_size_ * config_->seq_len_, true, alloc);
+  tensor::Tensor cos_cache(dtype, config_->head_size_ * config_->seq_len_, true, alloc);
 
   CHECK(insert_buffer(ModelBufferType::kSinCache, sin_cache));
   CHECK(insert_buffer(ModelBufferType::kCosCache, cos_cache));
@@ -535,49 +407,43 @@ void LLamaModel::init_mem() {
   CHECK(insert_buffer(ModelBufferType::kInputTokens, input_tokens));
   CHECK(insert_buffer(ModelBufferType::kInputEmbeddings, input_embeddings));
 
-  tensor::Tensor rms_output(base::DataType::kDataTypeFp32, config_->dim_, true, alloc);
+  tensor::Tensor rms_output(dtype, config_->dim_, true, alloc);
   CHECK(insert_buffer(ModelBufferType::kOutputRMSNorm, rms_output));
   CHECK(insert_buffer(ModelBufferType::kOutputMHA, rms_output));
   CHECK(insert_buffer(ModelBufferType::kW2Output, rms_output));
   CHECK(insert_buffer(ModelBufferType::kFFNRMSNorm, rms_output));
 
-  tensor::Tensor w1_output(base::DataType::kDataTypeFp32, config_->hidden_dim_, true, alloc);
-  tensor::Tensor w3_output(base::DataType::kDataTypeFp32, config_->hidden_dim_, true, alloc);
+  tensor::Tensor w1_output(dtype, config_->hidden_dim_, true, alloc);
+  tensor::Tensor w3_output(dtype, config_->hidden_dim_, true, alloc);
 
   CHECK(insert_buffer(ModelBufferType::kW1Output, w1_output));
   CHECK(insert_buffer(ModelBufferType::kW3Output, w3_output));
 
   // kv cache
-  tensor::Tensor key_cache(base::DataType::kDataTypeFp32, config_->layer_num_, config_->seq_len_,
-                           config_->kv_dim_, true, alloc);
-  tensor::Tensor value_cache(base::DataType::kDataTypeFp32, config_->layer_num_, config_->seq_len_,
-                             config_->kv_dim_, true, alloc);
+  tensor::Tensor key_cache(dtype, config_->layer_num_, config_->seq_len_, config_->kv_dim_, true,
+                           alloc);
+  tensor::Tensor value_cache(dtype, config_->layer_num_, config_->seq_len_, config_->kv_dim_, true,
+                             alloc);
 
   CHECK(insert_buffer(ModelBufferType::kKeyCache, key_cache));
   CHECK(insert_buffer(ModelBufferType::kValueCache, value_cache));
 
   // Wq query output
-  tensor::Tensor query(base::DataType::kDataTypeFp32, config_->dim_, true, alloc);
+  tensor::Tensor query(dtype, config_->dim_, true, alloc);
   CHECK(insert_buffer(ModelBufferType::kQuery, query));
 
   // Pos tensor
   tensor::Tensor pos_tensor(base::DataType::kDataTypeInt32, 1, true, alloc_cpu);
   CHECK(insert_buffer(ModelBufferType::kInputPos, pos_tensor));
 
-  // Attention output
-  tensor::Tensor attn(base::DataType::kDataTypeFp32, config_->head_num_, config_->seq_len_, true,
-                      alloc);
+  // Attention score scratch: [head_num, seq_len]; dtype follows the model so
+  // the (single-sequence) MHA op runs one uniform kernel family per dtype.
+  tensor::Tensor attn(dtype, config_->head_num_, config_->seq_len_, true, alloc);
   CHECK(insert_buffer(ModelBufferType::kScoreStorage, attn));
   CHECK(insert_buffer(ModelBufferType::kAttnOutput, query));
 
-  // final forward output
-  tensor::Tensor forward_output(base::DataType::kDataTypeFp32, config_->vocab_size_, true, alloc);
-  if (device_type_ == base::DeviceType::kDeviceCUDA) {
-    tensor::Tensor forward_output_cpu(base::DataType::kDataTypeFp32, config_->vocab_size_, true,
-                                      alloc_cpu);
-    CHECK(insert_buffer(ModelBufferType::kForwardOutputCPU, forward_output_cpu));
-  }
-
+  // final forward output (logits; argmax sampling reads it on the device)
+  tensor::Tensor forward_output(dtype, config_->vocab_size_, true, alloc);
   CHECK(insert_buffer(ModelBufferType::kForwardOutput, forward_output));
 }
 
@@ -820,20 +686,25 @@ void LLamaModel::cls_logits(const tensor::Tensor& input) const {
 
 int32_t LLamaModel::post_processing(const tensor::Tensor& pos, bool is_prompt) const {
   tensor::Tensor forward_output = get_buffer(ModelBufferType::kForwardOutput);
-  const float* forward_logits = forward_output.ptr<float>();
 
   int32_t next = 0;
   if (is_prompt) {
     next = -1;
   } else {
     // Restrict sampling to the tokenizer's vocab range (see
-    // post_processing_batch): header vocab may be larger than the tokenizer's.
+    // post_processing_batch): config vocab may be larger than the tokenizer's.
     size_t sample_size = static_cast<size_t>(forward_output.size());
     if (encode_layer_ && encode_layer_->vocab_size() > 0) {
       sample_size = std::min(sample_size, static_cast<size_t>(encode_layer_->vocab_size()));
     }
-    next = static_cast<int32_t>(sampler_->sample(
-        forward_logits, sample_size, cuda_config_ ? cuda_config_->stream : nullptr));
+    void* stream = cuda_config_ ? cuda_config_->stream : nullptr;
+    if (forward_output.data_type() == base::DataType::kDataTypeBF16) {
+      next = static_cast<int32_t>(sampler_->sample_bf16(forward_output.ptr<uint16_t>(),
+                                                        sample_size, stream));
+    } else {
+      next = static_cast<int32_t>(
+          sampler_->sample(forward_output.ptr<float>(), sample_size, stream));
+    }
   }
   return next;
 }
@@ -889,7 +760,7 @@ base::Status LLamaModel::forward_batch(
   if (scratch) {
     scratch->ensure(batch, hidden_dim, config_->dim_, kv_dim, config_->hidden_dim_,
                     config_->head_num_, config_->head_size_, max_seq_len, table_stride,
-                    device_type_, alloc);
+                    device_type_, compute_dtype(), alloc);
     hidden = scratch->hidden;
     rms_out = scratch->rms_out;
     q_batch = scratch->q_batch;
@@ -904,25 +775,27 @@ base::Status LLamaModel::forward_batch(
     partial_batch = scratch->partial_batch;
     qkv_out = scratch->qkv_out;
   } else {
-    hidden = tensor::Tensor(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
-    rms_out = tensor::Tensor(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
-    q_batch = tensor::Tensor(base::DataType::kDataTypeFp32, batch, config_->dim_, true, alloc);
-    mha_out_batch = tensor::Tensor(base::DataType::kDataTypeFp32, batch, config_->dim_, true, alloc);
-    attn_out = tensor::Tensor(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
-    ffn_norm_out = tensor::Tensor(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
-    w1_out = tensor::Tensor(base::DataType::kDataTypeFp32, batch, config_->hidden_dim_, true, alloc);
-    w3_out = tensor::Tensor(base::DataType::kDataTypeFp32, batch, config_->hidden_dim_, true, alloc);
-    w2_out = tensor::Tensor(base::DataType::kDataTypeFp32, batch, hidden_dim, true, alloc);
-    key_batch = tensor::Tensor(base::DataType::kDataTypeFp32, batch, kv_dim, true, alloc);
-    val_batch = tensor::Tensor(base::DataType::kDataTypeFp32, batch, kv_dim, true, alloc);
-    qkv_out = tensor::Tensor(base::DataType::kDataTypeFp32, batch,
-                             config_->dim_ + 2 * kv_dim, true, alloc);
+    // Pooled allocations (prefill path): same element counts as the scratch
+    // buffers but at the model compute dtype (BF16 on CUDA).
+    const base::DataType dtype = compute_dtype();
+    hidden = tensor::Tensor(dtype, batch, hidden_dim, true, alloc);
+    rms_out = tensor::Tensor(dtype, batch, hidden_dim, true, alloc);
+    q_batch = tensor::Tensor(dtype, batch, config_->dim_, true, alloc);
+    mha_out_batch = tensor::Tensor(dtype, batch, config_->dim_, true, alloc);
+    attn_out = tensor::Tensor(dtype, batch, hidden_dim, true, alloc);
+    ffn_norm_out = tensor::Tensor(dtype, batch, hidden_dim, true, alloc);
+    w1_out = tensor::Tensor(dtype, batch, config_->hidden_dim_, true, alloc);
+    w3_out = tensor::Tensor(dtype, batch, config_->hidden_dim_, true, alloc);
+    w2_out = tensor::Tensor(dtype, batch, hidden_dim, true, alloc);
+    key_batch = tensor::Tensor(dtype, batch, kv_dim, true, alloc);
+    val_batch = tensor::Tensor(dtype, batch, kv_dim, true, alloc);
+    qkv_out = tensor::Tensor(dtype, batch, config_->dim_ + 2 * kv_dim, true, alloc);
     if (device_type_ == base::DeviceType::kDeviceCUDA) {
       int32_t num_splits = kernel::flash_decoding_num_splits(max_seq_len);
+      // Score rows of head_size floats; BF16 splits keep the same row count.
       partial_batch = tensor::Tensor(
-          base::DataType::kDataTypeFp32,
-          static_cast<int64_t>(batch) * config_->head_num_ * num_splits *
-              (config_->head_size_ + 2),
+          dtype, static_cast<int64_t>(batch) * config_->head_num_ * num_splits *
+                     (config_->head_size_ + 2),
           true, alloc);
     }
   }
@@ -1007,13 +880,19 @@ base::Status LLamaModel::forward_batch(
       auto& fused = llama_layers_->fused_qkv_layers_.at(layer_idx);
       std::dynamic_pointer_cast<op::MatmulLayer>(fused)->set_batch_size(batch);
       STATUS_CHECK(fused->forward(rms_out, qkv_out));
-      // Views into the fused output row blocks: [q | k | v].
-      q_batch = tensor::Tensor(base::DataType::kDataTypeFp32, batch, config_->dim_,
-                               false, nullptr, qkv_out.ptr<float>());
-      key_batch = tensor::Tensor(base::DataType::kDataTypeFp32, batch, kv_dim,
-                                 false, nullptr, qkv_out.ptr<float>(config_->dim_));
-      val_batch = tensor::Tensor(base::DataType::kDataTypeFp32, batch, kv_dim,
-                                 false, nullptr, qkv_out.ptr<float>(config_->dim_ + kv_dim));
+      // Views into the fused output row blocks: [q | k | v]. Element offsets
+      // and the view dtype follow the buffer dtype (BF16: 2 bytes/element).
+      const base::DataType v_dtype = qkv_out.data_type();
+      const auto row_ptr = [&](int64_t elem_off) -> void* {
+        return (v_dtype == base::DataType::kDataTypeBF16)
+                   ? static_cast<void*>(qkv_out.ptr<uint16_t>(elem_off))
+                   : static_cast<void*>(qkv_out.ptr<float>(elem_off));
+      };
+      q_batch = tensor::Tensor(v_dtype, batch, config_->dim_, false, nullptr, row_ptr(0));
+      key_batch = tensor::Tensor(v_dtype, batch, kv_dim, false, nullptr,
+                                 row_ptr(config_->dim_));
+      val_batch = tensor::Tensor(v_dtype, batch, kv_dim, false, nullptr,
+                                 row_ptr(config_->dim_ + kv_dim));
       q_batch.set_device_type(device_type_);
       key_batch.set_device_type(device_type_);
       val_batch.set_device_type(device_type_);

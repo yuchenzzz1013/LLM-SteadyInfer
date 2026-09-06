@@ -1,6 +1,20 @@
 #ifndef SRC_INCLUDE_MODEL_CONFIG_H_
 #define SRC_INCLUDE_MODEL_CONFIG_H_
 namespace model {
+// Fields consumed from an HF config.json (Qwen2/Qwen3/Llama families).
+struct HfConfig {
+  int64_t hidden_size = 0;
+  int64_t intermediate_size = 0;
+  int64_t num_hidden_layers = 0;
+  int64_t num_attention_heads = 0;
+  int64_t num_key_value_heads = 0;  // absent in HF -> defaults to num_attention_heads
+  int64_t vocab_size = 0;
+  int64_t max_position_embeddings = 0;
+  int64_t head_dim = 0;  // absent -> hidden_size / num_attention_heads
+  float rope_theta = 1000000.0f;
+  bool tie_word_embeddings = false;
+};
+
 struct ModelConfig {
   int32_t dim = 0;
   int32_t hidden_dim = 0;

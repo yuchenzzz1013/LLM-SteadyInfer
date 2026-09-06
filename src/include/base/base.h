@@ -57,6 +57,7 @@ enum class DataType : uint8_t {
   kDataTypeFp32 = 1,
   kDataTypeInt8 = 2,
   kDataTypeInt32 = 3,
+  kDataTypeBF16 = 4,  // bfloat16: 2 bytes/element (uint16_t host, __nv_bfloat16 CUDA)
 };
 
 enum class ModelType : uint8_t {
@@ -73,6 +74,8 @@ inline size_t DataTypeSize(DataType data_type) {
     return sizeof(int8_t);
   } else if (data_type == DataType::kDataTypeInt32) {
     return sizeof(int32_t);
+  } else if (data_type == DataType::kDataTypeBF16) {
+    return sizeof(uint16_t);
   } else {
     return 0;
   }

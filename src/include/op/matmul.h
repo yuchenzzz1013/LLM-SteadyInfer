@@ -12,8 +12,9 @@ class MatmulLayer : public LayerParam {
 
   base::Status forward() override;
 
-  base::Status set_bias(int32_t idx, int32_t& dims, const void* bias_ptr,
-                          base::DeviceType device_type);
+  base::Status set_bias(int32_t idx, int32_t dims, const void* bias_ptr,
+                        base::DeviceType device_type,
+                        base::DataType data_type = base::DataType::kDataTypeFp32);
 
   tensor::Tensor& get_bias(int32_t idx);
 

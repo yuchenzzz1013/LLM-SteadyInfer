@@ -52,12 +52,11 @@ MatmulKernel get_matmul_kernel(base::DeviceType device_type) {
 }
 
 MatmulKernelQuant get_matmul_kernel_quant8(base::DeviceType device_type) {
-  if (device_type == base::DeviceType::kDeviceCUDA) {
-    return matmul_kernel_cu_qint8;
-  } else {
-    LOG(FATAL) << "Unknown device type for get an matmul kernel.";
-    return nullptr;
-  }
+  // INT8 group-wise quantization was disabled during the BF16 migration; the
+  // CUDA INT8 kernel is gone with the FP32 files.
+  UNUSED(device_type);
+  LOG(FATAL) << "INT8 quantization is not supported after the BF16 migration.";
+  return nullptr;
 }
 
 MHAKernel get_mha_kernel(base::DeviceType device_type) {

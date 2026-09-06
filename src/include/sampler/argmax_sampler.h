@@ -11,6 +11,11 @@ class ArgmaxSampler : public Sampler {
 
   void sample_batch(const float* logits, size_t row_stride, size_t size, int32_t batch,
                     int32_t* out_tokens, void* stream) override;
+
+  size_t sample_bf16(const uint16_t* logits, size_t size, void* stream) override;
+
+  void sample_batch_bf16(const uint16_t* logits, size_t row_stride, size_t size, int32_t batch,
+                         int32_t* out_tokens, void* stream) override;
 };
 }  // namespace sampler
 #endif 

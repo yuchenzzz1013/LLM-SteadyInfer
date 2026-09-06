@@ -40,6 +40,9 @@ base::Status VecAddLayer::check() const {
 }
 
 base::Status VecAddLayer::forward() {
+  // The effective compute dtype follows the inputs (BF16 on CUDA, FP32
+  // fallback); weightless layer, so data_type_ is not weight-driven.
+  data_type_ = get_input(0).data_type();
   auto status = this->check();
   if (!status) {
     return status;

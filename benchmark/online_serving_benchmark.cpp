@@ -12,8 +12,8 @@
 //
 // 用法:
 //   ./build/benchmark/online_serving_benchmark \
-//       --model-type qwen2 --checkpoint Qwen2.5-0.5B.bin \
-//       --tokenizer Qwen/Qwen2.5-0.5B/tokenizer.json \
+//       --model-type qwen3 --model-dir Qwen3-4B \
+//       --tokenizer Qwen3-4B/tokenizer.json \
 //       --dataset ShareGPT_prompts.jsonl \
 //       --request-rate 8 --num-requests 256 --max-batch 32 --max-gen 256 \
 //       --duration 60 --ttft-sla-ms 2000 --tpot-sla-ms 100
@@ -53,11 +53,11 @@ using namespace bench;  // get_arg/has_arg/resolve_default/load_dataset/percenti
 // ============================== 参数解析 ==============================
 
 struct Args {
-  std::string model_type = "qwen2";  // qwen2 | qwen3 | llama (引擎内三模型均已编译进 lib)
+  // HF safetensors 模型目录(config.json + *.safetensors,BF16 权重)。
+  std::string model_type = "qwen3";  // qwen2 | qwen3 | llama (引擎内三模型均已编译进 lib)
   std::string dataset = "ShareGPT_prompts.jsonl";
-  std::string checkpoint = "Qwen2.5-0.5B.bin";
-  std::string tokenizer = "Qwen/Qwen2.5-0.5B/tokenizer.json";
-  std::string model_config = "Qwen/Qwen2.5-0.5B/config.json";
+  std::string model_dir = "Qwen3-4B";
+  std::string tokenizer = "Qwen3-4B/tokenizer.json";
   std::string output_csv = "results/serving_metrics.csv";
   int num_requests = 512;  // 0 = 使用全部样本
   int max_batch = 32;
@@ -84,11 +84,11 @@ static double parse_double_arg(const std::string& s) {
 static Args parse_args(int argc, char** argv) {
   Args a;
   // 兼容 benchmark 的位置参数风格(第一个参数不以 "--" 开头时生效):
-  //   <checkpoint> <tokenizer> <num_requests> <max_batch> <max_gen>
+  //   <model-dir> <tokenizer> <num_requests> <max_batch> <max_gen>
   //   [output_csv] [iterations]
   bool positional = argc > 1 && std::string(argv[1]).rfind("--", 0) != 0;
   if (positional) {
-    if (argc > 1) a.checkpoint = argv[1];
+    if (argc > 1) a.model_dir = argv[1];
     if (argc > 2) a.tokenizer = argv[2];
     if (argc > 3) a.num_requests = std::stoi(argv[3]);
     if (argc > 4) a.max_batch = std::stoi(argv[4]);
@@ -102,12 +102,10 @@ static Args parse_args(int argc, char** argv) {
     a.model_type = get_arg(argc, argv, "--model-type");
   if (has_arg(argc, argv, "--dataset"))
     a.dataset = get_arg(argc, argv, "--dataset");
-  if (has_arg(argc, argv, "--checkpoint"))
-    a.checkpoint = get_arg(argc, argv, "--checkpoint");
+  if (has_arg(argc, argv, "--model-dir"))
+    a.model_dir = get_arg(argc, argv, "--model-dir");
   if (has_arg(argc, argv, "--tokenizer"))
     a.tokenizer = get_arg(argc, argv, "--tokenizer");
-  if (has_arg(argc, argv, "--model-config"))
-    a.model_config = get_arg(argc, argv, "--model-config");
   if (has_arg(argc, argv, "--output-csv"))
     a.output_csv = get_arg(argc, argv, "--output-csv");
   if (has_arg(argc, argv, "--num-requests"))
@@ -144,21 +142,21 @@ static Args parse_args(int argc, char** argv) {
 static void print_usage(const char* prog) {
   std::cout
       << "用法 1(与 offline_batch_benchmark 相同的调用方式,位置参数):\n"
-      << "  " << prog << " <checkpoint> <tokenizer> <num_requests> <max_batch>"
+      << "  " << prog << " <model-dir> <tokenizer> <num_requests> <max_batch>"
       << " <max_gen> [output_csv] [iterations]\n"
       << "  例: ./build/benchmark/online_serving_benchmark"
-      << " Qwen2.5-0.5B.bin Qwen/Qwen2.5-0.5B/tokenizer.json"
+      << " Qwen3-4B Qwen3-4B/tokenizer.json"
       << " 512 32 256 results/serving_metrics.csv\n"
       << "  在线负载参数(如 --request-rate)需用 --flag 方式追加\n\n"
       << "用法 2(--flag 风格,默认值见括号):\n"
       << "  " << prog << " [选项]\n"
-      << "  --model-type <type>    模型类型: qwen2(默认) | qwen3 | llama\n"
+      << "  --model-type <type>    模型类型: qwen3(默认) | qwen2 | llama\n"
       << "                         (llama 等价 llama3;三模型均已编译进引擎,运行时选择)\n"
       << "  --dataset <path>       ShareGPT_prompts.jsonl 路径(默认自动探测)\n"
-      << "  --checkpoint <path>    模型权重 .bin 路径(默认 Qwen2.5-0.5B.bin)\n"
+      << "  --model-dir <path>     HF safetensors 模型目录(config.json + *.safetensors,\n"
+      << "                         BF16;默认 Qwen3-4B)\n"
       << "  --tokenizer <path>     tokenizer 路径(qwen2/qwen3 为 tokenizer.json,\n"
-      << "                         llama 为 sentencepiece 模型;默认 Qwen/Qwen2.5-0.5B/tokenizer.json)\n"
-      << "  --model-config <path>  config.json 路径,用于计算 MFU(默认 Qwen/Qwen2.5-0.5B/config.json)\n"
+      << "                         llama 为 sentencepiece 模型;默认 Qwen3-4B/tokenizer.json)\n"
       << "  --num-requests <N>     压测请求总数,0 表示全部(默认 512)\n"
       << "  --max-batch <N>        最大 batch size(默认 32)\n"
       << "  --max-gen <N>          每个请求最大生成 token 数(默认 256)\n"
@@ -496,7 +494,7 @@ static void write_csv(const std::string& path,
        "kv_cache_util_global,kv_cache_frag_global,kv_cache_frag_per_seq,"
        "avg_busy_kv_slots,peak_busy_kv_slots,"
        "avg_batch_size,avg_batch_reconstruct_ms,p99_batch_reconstruct_ms,"
-       "mfu,peak_fp32_tflops,gpu_sm_util_pct,gpu_mem_util_pct,gpu_mem_used_mb\n";
+       "mfu,peak_tflops,gpu_sm_util_pct,gpu_mem_util_pct,gpu_mem_used_mb\n";
   f << std::fixed << std::setprecision(6);
   for (const auto& r : results) {
     f << r.run_id << "," << r.request_rate << "," << r.burstiness << ","
@@ -584,7 +582,7 @@ static void print_report(const ServingMetrics& r, const Args& args) {
             << " ms  p99=" << r.p99_batch_reconstruct_ms << " ms\n";
   std::cout << std::setprecision(2);
   std::cout << "MFU:                                    " << pct(r.mfu)
-            << "%  (peak " << r.peak_tflops << " TFLOPS FP32)\n";
+            << "%  (按计算 dtype 的 peak " << r.peak_tflops << " TFLOPS)\n";
   std::cout << "GPU SM util (NVML):                     " << r.gpu_sm_util_pct << "%\n";
   std::cout << "GPU mem util (NVML):                    " << r.gpu_mem_util_pct
             << "%  (used " << r.gpu_mem_used_mb << " MB)\n";
@@ -621,9 +619,8 @@ int main(int argc, char* argv[]) {
     }
   }
   args.dataset = resolve_default(args.dataset, exe_root);
-  args.checkpoint = resolve_default(args.checkpoint, exe_root);
+  args.model_dir = resolve_default(args.model_dir, exe_root);
   args.tokenizer = resolve_default(args.tokenizer, exe_root);
-  args.model_config = resolve_default(args.model_config, exe_root);
 
   // ---- 数据集 ----
   std::vector<Request> dataset = load_dataset(args.dataset);
@@ -647,15 +644,15 @@ int main(int argc, char* argv[]) {
     if (mt == "qwen2") {
       tt = base::TokenizerType::kEncodeBpe;
       model = std::make_shared<model::Qwen2Model>(tt, args.tokenizer,
-                                                  args.checkpoint, false);
+                                                  args.model_dir, false);
     } else if (mt == "qwen3") {
       tt = base::TokenizerType::kEncodeBpe;
       model = std::make_shared<model::Qwen3Model>(tt, args.tokenizer,
-                                                  args.checkpoint, false);
+                                                  args.model_dir, false);
     } else if (mt == "llama" || mt == "llama3") {
       tt = base::TokenizerType::kEncodeSpe;
       model = std::make_shared<model::LLamaModel>(tt, args.tokenizer,
-                                                  args.checkpoint, false);
+                                                  args.model_dir, false);
     } else {
       LOG(ERROR) << "未知 --model-type: " << mt
                  << " (支持: qwen2 | qwen3 | llama)";
@@ -684,14 +681,23 @@ int main(int argc, char* argv[]) {
   }
 
   // ---- 模型结构 / 算力 ----
+  // load_model_dims 从 HF 模型目录读取 config.json(hidden/intermediate/head_dim
+  // 等),flops_per_token 以 head_num*head_dim 计 attention 宽度,对 Qwen3 的
+  // 解耦注意力(residual 2560 ≠ attn 4096)同样成立。
   ModelDims dims;
   double flops_per_tok = 0;
-  if (load_model_dims(args.model_config, dims)) {
+  if (load_model_dims(args.model_dir, dims)) {
     flops_per_tok = flops_per_token(dims);
   } else {
-    LOG(WARNING) << "无法读取 model config,MFU 将不可用: " << args.model_config;
+    LOG(WARNING) << "无法读取 model config,MFU 将不可用: " << args.model_dir;
   }
+  // MFU 峰值按模型计算 dtype 选择:CUDA 模型恒为 BF16,用 Tensor Core 理论
+  // 峰值;无 BF16 TC 的架构(或 CPU 运行)回退到 FP32 CUDA core 峰值。
   double peak_tflops = peak_fp32_tflops();
+  if (model->compute_dtype() == base::DataType::kDataTypeBF16) {
+    const double bf16_peak = peak_bf16_tflops();
+    if (bf16_peak > 0) peak_tflops = bf16_peak;
+  }
 
   // ---- 正式压测 ----
   // 多轮迭代可安全复用同一 Model(同 offline,decode_step 会校验并重捕获 CUDA graph)
