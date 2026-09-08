@@ -7,6 +7,8 @@
 namespace tensor {
 template <typename T, typename Tp>
 static size_t reduce_dimension(T begin, T end, Tp init) {
+  // NOTE: Tp must be 64-bit; dims_ stores int32 and element counts can
+  // exceed 2^31 (e.g. the paged KV cache at max_batch >= 128).
   if (begin >= end) {
     return 0;
   }
@@ -56,7 +58,7 @@ Tensor::Tensor(base::DataType data_type, int32_t dim0, int32_t dim1, bool need_a
     : data_type_(data_type) {
   dims_.push_back(dim0);
   dims_.push_back(dim1);
-  size_ = dim0 * dim1;
+  size_ = static_cast<int64_t>(dim0) * dim1;
   if (need_alloc && alloc) {
     allocate(alloc);
   } else {
@@ -70,7 +72,7 @@ Tensor::Tensor(base::DataType data_type, int32_t dim0, int32_t dim1, int32_t dim
   dims_.push_back(dim0);
   dims_.push_back(dim1);
   dims_.push_back(dim2);
-  size_ = dim0 * dim1 * dim2;
+  size_ = static_cast<int64_t>(dim0) * dim1 * dim2;
   if (need_alloc && alloc) {
     allocate(alloc);
   } else {
@@ -85,7 +87,7 @@ Tensor::Tensor(base::DataType data_type, int32_t dim0, int32_t dim1, int32_t dim
   dims_.push_back(dim1);
   dims_.push_back(dim2);
   dims_.push_back(dim3);
-  size_ = dim0 * dim1 * dim2 * dim3;
+  size_ = static_cast<int64_t>(dim0) * dim1 * dim2 * dim3;
   if (need_alloc && alloc) {
     allocate(alloc);
   } else {
@@ -96,7 +98,7 @@ Tensor::Tensor(base::DataType data_type, int32_t dim0, int32_t dim1, int32_t dim
 Tensor::Tensor(base::DataType data_type, std::vector<int32_t> dims, bool need_alloc,
                std::shared_ptr<base::DeviceAllocator> alloc, void* ptr)
     : dims_(std::move(dims)), data_type_(data_type) {
-  size_ = reduce_dimension(dims_.begin(), dims_.end(), 1);
+  size_ = reduce_dimension(dims_.begin(), dims_.end(), 1LL);
   if (need_alloc && alloc) {
     allocate(alloc);
   } else {
@@ -216,7 +218,7 @@ void Tensor::set_device_type(base::DeviceType device_type) const {
 void Tensor::reset(base::DataType data_type, const std::vector<int32_t>& dims) {
   this->data_type_ = data_type;
   this->dims_ = dims;
-  this->size_ = reduce_dimension(dims.begin(), dims.end(), 1);
+  this->size_ = reduce_dimension(dims.begin(), dims.end(), 1LL);
   this->buffer_ = nullptr;
 }
 

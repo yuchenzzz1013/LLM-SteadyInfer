@@ -38,6 +38,14 @@ KVManager::KVManager(int num_layers, int max_batch, int max_seq_len, int kv_dim,
 #endif
   }
 
+  // All CUDA kernels (scatter / attention / decode) address the cache as
+  // raw bf16, so allocate BF16 on CUDA and keep FP32 only on the CPU path
+  // (whose FP32 fallback kernels read float pointers). This halves KV
+  // memory on device.
+  const base::DataType kv_dtype =
+      (device == base::DeviceType::kDeviceCUDA) ? base::DataType::kDataTypeBF16
+                                                : base::DataType::kDataTypeFp32;
+
   if (paged_) {
     // Element (layer, block, pos_in_block, d) at
     //   layer * (num_blocks * block_size * kv_dim)
@@ -45,21 +53,17 @@ KVManager::KVManager(int num_layers, int max_batch, int max_seq_len, int kv_dim,
     // + pos_in_block * kv_dim + d
     // d-innermost within a page: the flash-decoding kernels walk consecutive
     // positions contiguously, crossing page boundaries through block_table.
-    key_cache_ = tensor::Tensor(base::DataType::kDataTypeFp32,
-                                 num_layers_, num_blocks_, block_size_, kv_dim_,
-                                 true, alloc);
-    value_cache_ = tensor::Tensor(base::DataType::kDataTypeFp32,
-                                   num_layers_, num_blocks_, block_size_, kv_dim_,
-                                   true, alloc);
+    key_cache_ = tensor::Tensor(kv_dtype, num_layers_, num_blocks_, block_size_, kv_dim_,
+                                true, alloc);
+    value_cache_ = tensor::Tensor(kv_dtype, num_layers_, num_blocks_, block_size_, kv_dim_,
+                                  true, alloc);
   } else {
     // Head-dim-contiguous layout: cache[layer][slot][d][pos], position
     // innermost so decode MHA reads coalesce across consecutive positions.
-    key_cache_ = tensor::Tensor(base::DataType::kDataTypeFp32,
-                                 num_layers_, max_batch_, kv_dim_, max_seq_len_,
-                                 true, alloc);
-    value_cache_ = tensor::Tensor(base::DataType::kDataTypeFp32,
-                                   num_layers_, max_batch_, kv_dim_, max_seq_len_,
-                                   true, alloc);
+    key_cache_ = tensor::Tensor(kv_dtype, num_layers_, max_batch_, kv_dim_, max_seq_len_,
+                                true, alloc);
+    value_cache_ = tensor::Tensor(kv_dtype, num_layers_, max_batch_, kv_dim_, max_seq_len_,
+                                  true, alloc);
   }
 }
 
