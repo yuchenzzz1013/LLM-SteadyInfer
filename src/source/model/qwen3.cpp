@@ -7,7 +7,30 @@
 #include <sentencepiece_processor.h>
 #include <algorithm>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
+#include <vector>
+
+// [SECT] diagnostic section timer (LLAMA_SECT=1): per-call CUDA events
+// bracketing forward_batch sections so a step's per-layer cost can be split
+// into proj / kv+rope+scatter / attention / wo / ffn / lm_head. Events are
+// re-created per call so decode CUDA graphs never reuse a live-recorded
+// event. Requires live streams: pair with LLAMA_NO_GRAPH=1 to time decode
+// steps (pure prefill / mixed steps are never captured).
+namespace {
+struct SectTimer {
+  bool on = false;
+  std::vector<cudaEvent_t> ev;
+  void record(int idx, cudaStream_t st) {
+    if (on) cudaEventRecord(ev[idx], st);
+  }
+};
+SectTimer& sect_timer() {
+  static SectTimer t;
+  return t;
+}
+}  // namespace
+#define SECT_REC(idx) sect_timer().record((idx), cuda_config_->stream)
 #include <string>
 #include <utility>
 #include "../op/kernels/cpu/mha_kernel.h"
@@ -947,7 +970,32 @@ base::Status Qwen3Model::forward_batch(
     }
   }
 
+  // [SECT] per-call fresh event pool (created on the first timed call).
+  {
+    SectTimer& st = sect_timer();
+    if (!st.on && device_type_ == base::DeviceType::kDeviceCUDA) {
+      const char* e = std::getenv("LLAMA_SECT");
+      if (e && e[0] == '1') {
+        // Events must live on a non-capturing stream (sync inside capture is
+        // illegal): if a CUDA-graph capture is active, stay dark this call.
+        cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+        cudaStreamGetCaptureInfo(cuda_config_->stream, &cap_status, nullptr, nullptr, nullptr);
+        if (cap_status == cudaStreamCaptureStatusNone) {
+          st.ev.resize(config_->layer_num_ * 6 + 2);
+          for (auto& ev : st.ev) {
+            cudaEventCreateWithFlags(&ev, 0);
+          }
+          st.on = true;
+        }
+      }
+    }
+  }
+
   for (int32_t layer_idx = 0; layer_idx < config_->layer_num_; ++layer_idx) {
+    // [SECT] diagnostic: per-layer CUDA-event section breakdown of one
+    // forward_batch call (LLAMA_SECT=1; combine with LLAMA_NO_GRAPH=1 to
+    // time decode steps on live streams). No-op when disabled.
+    SECT_REC(layer_idx * 6 + 0);
     // a. RMSNorm
     {
       auto& rmsnorm = qwen_layers_->rmsnorm_layers_.at(layer_idx);
@@ -992,6 +1040,7 @@ base::Status Qwen3Model::forward_batch(
       STATUS_CHECK(q_norm->forward(q_batch, q_batch));
       q_batch.reshape({batch, dim});
     }
+    SECT_REC(layer_idx * 6 + 1);
 
     // c/d/e: K, V projections (skipped under fused QKV) + RoPE + cache write
     if (device_type_ == base::DeviceType::kDeviceCUDA) {
@@ -1036,6 +1085,7 @@ base::Status Qwen3Model::forward_batch(
                                   num_blocks, block_size, layer_idx, cuda_config_->stream);
       kernel::paged_kv_scatter_cu(val_batch, value_cache, block_table_cu, positions_cu, kv_dim,
                                   num_blocks, block_size, layer_idx, cuda_config_->stream);
+      SECT_REC(layer_idx * 6 + 2);
 
       // f. MHA: Paged Flash Decoding — split-KV pass + reduce pass, one
       // launch pair per layer for the whole batch.
@@ -1043,6 +1093,7 @@ base::Status Qwen3Model::forward_batch(
                                        kv_dim, config_->kv_head_num_, config_->head_size_,
                                        positions_cu, block_table_cu, q_batch, partial_batch,
                                        mha_out_batch, key_cache, value_cache, cuda_config_.get());
+      SECT_REC(layer_idx * 6 + 3);
 #else
       // Write this layer's K/V rows into each sequence's KV cache slot
       // (head-dim-contiguous layout: cache[layer][slot][d][pos]).
@@ -1050,6 +1101,7 @@ base::Status Qwen3Model::forward_batch(
                             max_seq_len, layer_idx, cuda_config_->stream);
       kernel::kv_scatter_cu(val_batch, value_cache, block_table_cu, positions_cu, kv_dim, num_slots,
                             max_seq_len, layer_idx, cuda_config_->stream);
+      SECT_REC(layer_idx * 6 + 2);
 
       // f. MHA: Flash Decoding — split-KV pass + reduce pass, one launch pair
       // per layer for the whole batch.
@@ -1057,6 +1109,7 @@ base::Status Qwen3Model::forward_batch(
                                   config_->kv_head_num_, config_->head_size_, positions_cu,
                                   block_table_cu, q_batch, partial_batch, mha_out_batch, key_cache,
                                   value_cache, cuda_config_.get());
+      SECT_REC(layer_idx * 6 + 3);
 #endif
     } else {
       // CPU path: batched K/V GEMM (one GEMM per weight matrix, NOT a
@@ -1131,6 +1184,7 @@ base::Status Qwen3Model::forward_batch(
 
     // h. Residual add
     STATUS_CHECK(qwen_layers_->add_layer_->forward(hidden, attn_out, hidden));
+    SECT_REC(layer_idx * 6 + 4);
 
     // i. FFN
     {
@@ -1159,10 +1213,12 @@ base::Status Qwen3Model::forward_batch(
 
       STATUS_CHECK(qwen_layers_->add_layer_->forward(hidden, w2_out, hidden));
     }
+    SECT_REC(layer_idx * 6 + 5);
   }
 
   // 3. Final RMSNorm + LM Head (skipped for prefill chunks: only the first
   // generated token, produced by a decode step, needs logits)
+  SECT_REC(config_->layer_num_ * 6);
   if (need_logits) {
     auto& final_norm = qwen_layers_->rmsnorm_layers_.at(2 * config_->layer_num_);
     STATUS_CHECK(final_norm->forward(hidden, hidden));
@@ -1171,6 +1227,46 @@ base::Status Qwen3Model::forward_batch(
     auto& cls = qwen_layers_->cls_layer_;
     std::dynamic_pointer_cast<op::MatmulLayer>(cls)->set_batch_size(batch);
     STATUS_CHECK(cls->forward(hidden, logits));
+  }
+  SECT_REC(config_->layer_num_ * 6 + 1);
+
+  // [SECT] finish: sync, print per-layer section averages, tear down.
+  if (sect_timer().on) {
+    SectTimer& st = sect_timer();
+    const int L = config_->layer_num_;
+    const int last = need_logits ? (L * 6 + 1) : ((L - 1) * 6 + 5);
+    cudaEventSynchronize(st.ev[last]);
+    static int printed = 0;
+    double s[5] = {0, 0, 0, 0, 0};
+    for (int l = 0; l < L; ++l) {
+      for (int k = 0; k < 5; ++k) {
+        float ms = 0;
+        if (cudaEventElapsedTime(&ms, st.ev[l * 6 + k], st.ev[l * 6 + k + 1]) ==
+            cudaSuccess) {
+          s[k] += ms;
+        }
+      }
+    }
+    float lm_ms = 0;
+    float tot_ms = 0;
+    for (int k = 0; k < 5; ++k) tot_ms += static_cast<float>(s[k]);
+    if (need_logits && cudaEventElapsedTime(&lm_ms, st.ev[L * 6], st.ev[L * 6 + 1]) !=
+                           cudaSuccess) {
+      lm_ms = 0;
+    }
+    if (printed++ < 600) {
+      std::fprintf(stderr,
+                   "[SECT] batch=%d logits=%d step=%.2fms per-layer-us: proj=%.1f "
+                   "kvrope=%.1f attn=%.1f wo=%.1f ffn=%.1f | lm=%.2fms\n",
+                   batch, need_logits ? 1 : 0, tot_ms + lm_ms, s[0] / L * 1000.f,
+                   s[1] / L * 1000.f, s[2] / L * 1000.f, s[3] / L * 1000.f,
+                   s[4] / L * 1000.f, lm_ms);
+    }
+    for (auto& ev : st.ev) {
+      cudaEventDestroy(ev);
+    }
+    st.ev.clear();
+    st.on = false;
   }
 
   // No stream sync here: the caller (Scheduler) syncs via sync_stream()

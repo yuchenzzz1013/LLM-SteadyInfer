@@ -168,6 +168,19 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
                      static_cast<void*>(logits.ptr<uint8_t>()));
   entry->logits_view.set_device_type(base::DeviceType::kDeviceCUDA);
 
+  // Diagnostic: run decode steps through the direct (non-captured) path so
+  // forward_batch's LLAMA_SECT section timers stay on live streams.
+  {
+    static const bool no_graph = []() {
+      const char* e = std::getenv("LLAMA_NO_GRAPH");
+      return e && e[0] == '1';
+    }();
+    if (no_graph) {
+      return forward_batch(stage_ids, stage_pos, stage_bt, key_cache, value_cache,
+                           entry->logits_view, true, entry->scratch.get());
+    }
+  }
+
   cudaStream_t stream = cuda_config_->stream;
 
   // Validate the Scheduler-owned pointers baked into the graph at capture

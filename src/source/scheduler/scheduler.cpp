@@ -1,5 +1,7 @@
 #include "scheduler/scheduler.h"
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cuda_runtime_api.h>
 #include <glog/logging.h>
@@ -12,6 +14,16 @@ int Scheduler::resolve_block_size(long long avg_prompt_len) {
   if (avg_prompt_len < 64) return 8;    // short prompts: smaller pages, less waste
   if (avg_prompt_len > 1024) return 32; // long prompts: larger pages, better locality
   return 16;
+}
+
+// Max token-rows a single forward_batch step may carry (decode rows +
+// prefill chunk rows, each row = one token). max_batch_size_ only bounds the
+// decode side; prefill rows are decoupled from it (see build_batch_rows).
+// At max_batch >= 256 the KV pool already fills ~40 GB and the logits buffer
+// must stay at max_batch rows, so no decoupling there. The logits buffer and
+// this cap must stay in sync (both sized via row_cap_for).
+int Scheduler::row_cap_for(int max_batch_size) {
+  return max_batch_size >= 256 ? max_batch_size : 512;
 }
 
 Scheduler::Scheduler(std::shared_ptr<model::Model> model,
@@ -70,7 +82,10 @@ Scheduler::Scheduler(std::shared_ptr<model::Model> model,
                << " invalid — model file/tokenizer mismatch";
   }
   const base::DataType logits_dtype = model_->compute_dtype();
-  logits_ = tensor::Tensor(logits_dtype, max_batch_size, vocab_size, true, alloc);
+  // Logits rows cover the largest possible mixed step (decode + prefill
+  // rows), not just max_batch decode rows — prefill-only forward_batch calls
+  // never use the buffer, but mixed steps compute the LM head over every row.
+  logits_ = tensor::Tensor(logits_dtype, row_cap_for(max_batch_size), vocab_size, true, alloc);
   const bool logits_ok =
       logits_dtype == base::DataType::kDataTypeBF16 ? logits_.ptr<uint16_t>() != nullptr
                                                     : logits_.ptr<float>() != nullptr;
@@ -466,16 +481,27 @@ std::vector<Scheduler::BatchRow> Scheduler::build_batch_rows() {
 #endif
     }
 
+    // Rows are tokens here, and every row pays a fixed per-layer cost
+    // (~5-9 ms per step at small batch: ~17 kernel launches x 36 layers with
+    // no concurrency to hide them). Capping rows at max_batch_size_ made a
+    // short prompt's prefill serialize into prompt_len/max_batch steps —
+    // with a max_batch=1 config a 140-token prompt took 140 steps and its
+    // TTFT looked like decode speed (measured 1224 ms). max_batch_size_ only
+    // bounds the number of DECODE rows (logits sampling alignment, decode
+    // CUDA graphs), so chunk rows may fill the whole step up to
+    // row_cap_for(max_batch_size_) — a short prompt then prefills in a
+    // single step even when the step also carries decode rows.
+    const int max_rows_this_step = row_cap_for(max_batch_size_);
     int prefill_taken = 0;
     for (auto& seq : running_sequences_) {
       if (seq.state != SeqState::RUNNING || seq.is_finished) continue;
       if (seq.is_prefill_complete) continue;
       if (prefill_taken >= prefill_token_budget_) break;
-      if (static_cast<int>(rows.size()) >= max_batch_size_) break;
+      if (static_cast<int>(rows.size()) >= max_rows_this_step) break;
 
       int remaining = seq.num_prompt_tokens - seq.next_prefill_chunk_start;
       int take = std::min(remaining, prefill_token_budget_ - prefill_taken);
-      take = std::min(take, max_batch_size_ - static_cast<int>(rows.size()));
+      take = std::min(take, max_rows_this_step - static_cast<int>(rows.size()));
       if (take <= 0) break;
 
       // Lazy growth for the whole chunk up front (its highest position needs
@@ -585,6 +611,15 @@ void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
   if (!any_prefill) {
     // Pure-decode step: the CUDA-graph path (decode_step) with its
     // per-batch-size graph pool.
+    // Diagnostic (LLAMA_HOSTLOG=1): split the host-side step into
+    // build/launch/GPU-wait/sample/bookkeep so decode cadence gaps are
+    // attributable (forward_batch's SECT timers cover only the GPU part).
+    static const bool hostlog = []() {
+      const char* e = std::getenv("LLAMA_HOSTLOG");
+      return e && e[0] == '1';
+    }();
+    static int hostlog_count = 0;
+    auto h_launch = std::chrono::steady_clock::now();
     auto recon_start = std::chrono::steady_clock::now();
 
     // View into the preallocated logits buffer (no per-step allocation);
@@ -609,6 +644,7 @@ void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
                                       kv_manager_->key_cache(),
                                       kv_manager_->value_cache(),
                                       logits_view);
+    auto h_sync = std::chrono::steady_clock::now();
     if (!status) {
       force_finish_all("batch decode failed");
       return;
@@ -623,10 +659,22 @@ void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
     // The sampling kernels run on the default stream, so the model stream
     // must be drained before they read the logits.
     model_->sync_stream();
+    auto h_sample = std::chrono::steady_clock::now();
     auto next_tokens = model_->post_processing_batch(logits_view);
 
     // Update sequences
     auto now = std::chrono::steady_clock::now();
+    if (hostlog && hostlog_count++ < 3000) {
+      double d_build = std::chrono::duration<double, std::milli>(h_sync - h_launch).count();
+      double d_wait = std::chrono::duration<double, std::milli>(h_sample - h_sync).count();
+      double d_post = std::chrono::duration<double, std::milli>(now - h_sample).count();
+      static auto t_first = now;
+      double d_cad = std::chrono::duration<double, std::milli>(now - t_first).count();
+      fprintf(stderr,
+              "[HOSTLOG] dec=%d t=%.1f launch_gap=%.3f gpu_wait=%.3f sample_post=%.3f "
+              "ms\n",
+              batch, d_cad, d_build, d_wait, d_post);
+    }
     for (int i = 0; i < batch; ++i) {
       Sequence* seq = rows[i].seq;
       if (seq->generated_tokens.empty()) {
@@ -705,6 +753,23 @@ void Scheduler::update_sequences() {
     }
 
     if (it->num_generated_tokens >= it->max_gen_len) {
+      static const bool hostlog = []() {
+        const char* e = std::getenv("LLAMA_HOSTLOG");
+        return e && e[0] == '1';
+      }();
+      if (hostlog && !it->token_timestamps_ms.empty()) {
+        double t0 = std::chrono::duration<double, std::milli>(
+                        it->first_token_time - it->arrival_time).count();
+        double t1 = std::chrono::duration<double, std::milli>(
+                        now - it->first_token_time).count();
+        double max_itl = 0;
+        for (double x : it->token_timestamps_ms) max_itl = std::max(max_itl, x);
+        fprintf(stderr, "[SEQ] id=%d prompt=%d gen=%d ttft=%.0f post=%.0f "
+                        "n_itl=%zu avg_itl=%.1f max_itl=%.0f ms\n",
+                it->id, it->num_prompt_tokens, it->num_generated_tokens, t0, t1,
+                it->token_timestamps_ms.size(),
+                t1 / std::max(1, it->num_generated_tokens - 1), max_itl);
+      }
       it->is_finished = true;
       it->state = SeqState::FINISHED;
       it->finish_time = now;

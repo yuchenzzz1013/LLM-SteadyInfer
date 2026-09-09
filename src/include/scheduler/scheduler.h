@@ -53,6 +53,12 @@ class Scheduler {
   // get better locality with large pages.
   static int resolve_block_size(long long avg_prompt_len);
 
+  // Max token-rows in one forward_batch step (decode rows + prefill chunk
+  // rows). Decoupled from max_batch_size_ except at max_batch >= 256, where
+  // the logits buffer must stay at max_batch rows to fit KV memory. Must be
+  // called with the scheduler's max_batch_size_.
+  static int row_cap_for(int max_batch_size);
+
  private:
   // One flattened batch row: a decode token or one chunked-prefill token.
   struct BatchRow {

@@ -80,7 +80,7 @@ LLM-SteadyInfer 是一个基于 **C++ / CUDA C++** 实现的轻量级大语言�
 精度支持：
 
 - BF16（CUDA:全链路权重 / 激活 / KV Cache / RoPE sin-cos 表均 BF16）
-- FP32（后备:仅 CPU 设备,权重加载时转换）
+- FP32（后备:仅 CPU 设备,权重加载时转换;CUDA 侧不保留任何 FP32 算子）
 - INT8 Group-wise Quantization（LLaMA / Qwen2,未随 BF16 迁移,已禁用）
 
 ---
