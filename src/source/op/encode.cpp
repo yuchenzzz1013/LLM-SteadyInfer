@@ -103,10 +103,13 @@ BpeEncodeLayer::BpeEncodeLayer(std::string token_model_path, bool has_bos, bool 
 
 std::vector<int32_t> BpeEncodeLayer::encode(const std::string& sentence) const {
   CHECK(this->tiktoken_ != nullptr);
-  std::map<std::string, std::string> replacements;
-  replacements[" "] = "Ġ";
-  std::string s = absl::StrReplaceAll(sentence, replacements);
-  auto input_ids = this->tiktoken_->encode(s);
+  // The encoder is keyed by raw bytes: the vocab keys are byte-level strings
+  // that were mapped back to bytes via unicode_utf8_to_byte, so the input must
+  // be passed through unchanged as raw bytes as well. Rewriting " " to "Ġ"
+  // here double-applies the byte-level mapping, which splits every space into
+  // its own piece and leaves the following word without its leading-space
+  // token (" is" -> "Ġ" + "is" instead of " is").
+  auto input_ids = this->tiktoken_->encode(sentence);
 
   if (has_bos_) {
     input_ids.insert(input_ids.begin(), bos_id_);
@@ -121,11 +124,10 @@ std::string BpeEncodeLayer::decode(int32_t token_id) const { return ""; }
 
 std::string BpeEncodeLayer::decode(const std::vector<int32_t>& token_ids) const {
   CHECK(this->tiktoken_ != nullptr);
-  auto s = tiktoken_->decode(token_ids);
-  std::map<std::string, std::string> reverse_replacements;
-  reverse_replacements["Ġ"] = " ";
-  const std::string& sentence = absl::StrReplaceAll(s, reverse_replacements);
-  return sentence;
+  // Symmetric with encode(): the ids decode back to raw bytes, so no reverse
+  // "Ġ" -> " " pass is needed (that pass would corrupt any token whose bytes
+  // happen to be the UTF-8 encoding of "Ġ").
+  return tiktoken_->decode(token_ids);
 }
 
 bool BpeEncodeLayer::is_sentence_ending(int32_t token_id) const {

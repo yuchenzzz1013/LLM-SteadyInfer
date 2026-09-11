@@ -333,7 +333,11 @@ __global__ void paged_kv_scatter_kernel_bf16(const __nv_bfloat16* src, __nv_bflo
   const int pos = positions[b];
   const int32_t* table_row = block_table + static_cast<int64_t>(b) * table_stride;
   const int block_id = __ldg(table_row + (pos / block_size));
-  const int off = pos - block_id * block_size;  // pos % block_size
+  // Offset within the page. NOT `pos - block_id * block_size`: block_id is the
+  // *physical* page from the table, so that expression only equals pos %
+  // block_size when the table happens to be the identity, and otherwise
+  // cancels the page term out of the address entirely.
+  const int off = pos % block_size;
   const int64_t layer_base = static_cast<int64_t>(layer_idx) * num_blocks * block_size * kv_dim;
   const int64_t base = layer_base + static_cast<int64_t>(block_id) * (block_size * kv_dim) +
                        static_cast<int64_t>(off) * kv_dim;
@@ -447,7 +451,7 @@ __global__ void paged_flash_decoding_kernel_bf16(const int32_t* positions,
   if (d < head_size) {
     int pos_v = tile_start;
     int block_v = __ldg(table_row + (pos_v / block_size));
-    int off_v = pos_v - block_v * block_size;  // pos_v % block_size
+    int off_v = pos_v % block_size;  // counter, wraps to the next page
     const __nv_bfloat16* v_base = value_cache + layer_base + head_offset + d;
     for (int tt = 0; tt < tile_len; ++tt) {
       acc += s_p[tt] * __bfloat162float(v_base[static_cast<int64_t>(block_v) *
@@ -542,10 +546,10 @@ constexpr int kPagedTileStride = 130;  // head_size (<= 128) + 2 pad elems
 // the memory/issue limit instead.
 __global__ void paged_attn_warp_kernel_bf16(
     const int32_t* positions, const int32_t* block_table, int32_t table_stride,
-    int32_t num_blocks, int32_t block_size, int32_t layer_idx, int32_t dim,
-    const __nv_bfloat16* query, __nv_bfloat16* output, const __nv_bfloat16* key_cache,
-    const __nv_bfloat16* value_cache, int32_t kv_dim, int32_t kv_head_num, int32_t head_num,
-    int32_t head_size) {
+    int32_t num_blocks, int32_t block_size, int32_t block_shift, int32_t layer_idx,
+    int32_t dim, const __nv_bfloat16* query, __nv_bfloat16* output,
+    const __nv_bfloat16* key_cache, const __nv_bfloat16* value_cache, int32_t kv_dim,
+    int32_t kv_head_num, int32_t head_num, int32_t head_size) {
   constexpr int kColsPerLane = 4;  // head_size == 128, one warp per head
   const int warp_id = (blockIdx.x * (blockDim.x >> 5)) + (threadIdx.x >> 5);
   const int lane = threadIdx.x & 31;
@@ -583,9 +587,9 @@ __global__ void paged_attn_warp_kernel_bf16(
   for (; gpos + kPosGroup <= seq; gpos += kPosGroup) {
 #pragma unroll
     for (int j = 0; j < kPosGroup; ++j) {
-      const int32_t pg = __ldg(table_row + ((gpos + j) >> 4));
+      const int32_t pg = __ldg(table_row + ((gpos + j) >> block_shift));
       row[j] = layer_base + static_cast<int64_t>(pg) * (block_size * kv_dim) + head_offset +
-               static_cast<int64_t>(gpos + j - pg * block_size) * kv_dim;
+               static_cast<int64_t>((gpos + j) & (block_size - 1)) * kv_dim;
     }
 #pragma unroll
     for (int j = 0; j < kPosGroup; ++j) {
@@ -620,9 +624,9 @@ __global__ void paged_attn_warp_kernel_bf16(
     }
   }
   for (; gpos <= pos; ++gpos) {
-    const int32_t pg = __ldg(table_row + (gpos >> 4));
+    const int32_t pg = __ldg(table_row + (gpos >> block_shift));
     const int64_t row_tail = layer_base + static_cast<int64_t>(pg) * (block_size * kv_dim) +
-                             head_offset + static_cast<int64_t>(gpos - pg * block_size) * kv_dim;
+                             head_offset + static_cast<int64_t>(gpos & (block_size - 1)) * kv_dim;
     float s = 0.f;
 #pragma unroll
     for (int c = 0; c < kColsPerLane; ++c) {
@@ -651,6 +655,155 @@ __global__ void paged_attn_warp_kernel_bf16(
   for (int c = 0; c < kColsPerLane; ++c) {
     output[out_base + c * 32 + lane] = __float2bfloat16(acc[c] * inv_l);
   }
+}
+
+// ========== Paged decode attention, vectorized + grouped softmax ==========
+// Same one-warp-per-(batch row, q head) shape as the kernel above, but the
+// per-position critical path is much shorter:
+//   * each lane owns 4 CONTIGUOUS head dims (lane*4 .. lane*4+3) instead of
+//     the lane-strided c*32+lane, so a whole K or V row costs ONE 8-byte load
+//     per lane (2 loads per position instead of 8);
+//   * the online softmax update runs once per GROUP of 4 positions: the four
+//     score reductions are independent and pipeline together, and the
+//     expf/rescale chain that serializes the walk is 4x less frequent;
+//   * the block-table lookup is hoisted to the group: every supported block
+//     size is a multiple of 4, so a 4-aligned group never crosses a page;
+//   * the page index uses the block shift, where the v1 kernel hardcodes
+//     ">> 4" (correct only for block_size == 16).
+// Warp-uniform scores are kept (5-shuffle all-reduce per position) so the
+// q*warp-softmax structure of v1 is preserved for numeric comparison.
+__global__ void paged_attn_warp2_kernel_bf16(
+    const int32_t* positions, const int32_t* block_table, int32_t table_stride,
+    int32_t num_blocks, int32_t block_size, int32_t block_shift, int32_t layer_idx,
+    int32_t dim, const __nv_bfloat16* query, __nv_bfloat16* output,
+    const __nv_bfloat16* key_cache, const __nv_bfloat16* value_cache, int32_t kv_dim,
+    int32_t kv_head_num, int32_t head_num, int32_t head_size) {
+  constexpr int kVec = 4;  // head dims per lane; head_size == 128
+  constexpr int kGroup = 4;
+  const int warp_id = (blockIdx.x * (blockDim.x >> 5)) + (threadIdx.x >> 5);
+  const int lane = threadIdx.x & 31;
+  const int b = warp_id / head_num;
+  const int head = warp_id - b * head_num;
+  const int pos = positions[b];
+  const float scale = 1.f / sqrtf(static_cast<float>(head_size));
+  const int head_offset = (head * kv_head_num / head_num) * head_size;
+  const int32_t* table_row = block_table + static_cast<int64_t>(b) * table_stride;
+  const int64_t layer_base =
+      static_cast<int64_t>(layer_idx) * num_blocks * block_size * kv_dim;
+  const __nv_bfloat16* q_head = query + static_cast<int64_t>(b) * dim + head * head_size;
+  const int64_t out_base = static_cast<int64_t>(b) * dim + head * head_size;
+  const int d0 = lane * kVec;
+
+  // Fold the softmax scale into q once; the dot then needs no extra multiply.
+  float q[kVec];
+  {
+    const uint2 raw = *reinterpret_cast<const uint2*>(q_head + d0);
+    const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&raw);
+    q[0] = __bfloat162float(h[0].x) * scale;
+    q[1] = __bfloat162float(h[0].y) * scale;
+    q[2] = __bfloat162float(h[1].x) * scale;
+    q[3] = __bfloat162float(h[1].y) * scale;
+  }
+
+  float m_i = -FLT_MAX;  // online flash stats (warp-uniform)
+  float l_i = 0.f;
+  float acc[kVec] = {0.f, 0.f, 0.f, 0.f};
+
+  const int seq = pos + 1;
+  int64_t row[kGroup];
+  int gpos = 0;
+  for (; gpos + kGroup <= seq; gpos += kGroup) {
+    // kGroup divides block_size (both are powers of two, block_size >= 4 here)
+    // and gpos is a multiple of kGroup, so a kGroup-wide run never straddles a
+    // page: one page lookup per group, and the positions sit at a fixed kv_dim
+    // stride inside the page.
+    const int32_t pg = __ldg(table_row + (gpos >> block_shift));
+    const int32_t off = gpos & (block_size - 1);
+    const int64_t row0 = layer_base + static_cast<int64_t>(pg) * (block_size * kv_dim) +
+                         head_offset + static_cast<int64_t>(off) * kv_dim + d0;
+#pragma unroll
+    for (int j = 0; j < kGroup; ++j) {
+      row[j] = row0 + static_cast<int64_t>(j) * kv_dim;
+    }
+    float s[kGroup];
+    float v_reg[kGroup][kVec];
+#pragma unroll
+    for (int j = 0; j < kGroup; ++j) {
+      const uint2 kraw = *reinterpret_cast<const uint2*>(key_cache + row[j]);
+      const __nv_bfloat162* kh = reinterpret_cast<const __nv_bfloat162*>(&kraw);
+      s[j] = q[0] * __bfloat162float(kh[0].x) + q[1] * __bfloat162float(kh[0].y) +
+             q[2] * __bfloat162float(kh[1].x) + q[3] * __bfloat162float(kh[1].y);
+      const uint2 vraw = *reinterpret_cast<const uint2*>(value_cache + row[j]);
+      const __nv_bfloat162* vh = reinterpret_cast<const __nv_bfloat162*>(&vraw);
+      v_reg[j][0] = __bfloat162float(vh[0].x);
+      v_reg[j][1] = __bfloat162float(vh[0].y);
+      v_reg[j][2] = __bfloat162float(vh[1].x);
+      v_reg[j][3] = __bfloat162float(vh[1].y);
+    }
+    // Independent across j, so the four reductions overlap.
+#pragma unroll
+    for (int j = 0; j < kGroup; ++j) {
+#pragma unroll
+      for (int off = 16; off; off >>= 1) {
+        s[j] += __shfl_xor_sync(0xffffffffu, s[j], off);
+      }
+    }
+    float m_new = m_i;
+#pragma unroll
+    for (int j = 0; j < kGroup; ++j) {
+      m_new = fmaxf(m_new, s[j]);
+    }
+    const float alpha = __expf(m_i - m_new);
+    float l_new = l_i * alpha;
+    float p[kGroup];
+#pragma unroll
+    for (int j = 0; j < kGroup; ++j) {
+      p[j] = __expf(s[j] - m_new);
+      l_new += p[j];
+    }
+#pragma unroll
+    for (int c = 0; c < kVec; ++c) {
+      float a = acc[c] * alpha;
+#pragma unroll
+      for (int j = 0; j < kGroup; ++j) {
+        a += p[j] * v_reg[j][c];
+      }
+      acc[c] = a;
+    }
+    m_i = m_new;
+    l_i = l_new;
+  }
+  for (; gpos <= pos; ++gpos) {
+    const int32_t pg = __ldg(table_row + (gpos >> block_shift));
+    const int64_t row = layer_base + static_cast<int64_t>(pg) * (block_size * kv_dim) +
+                        head_offset +
+                        static_cast<int64_t>(gpos & (block_size - 1)) * kv_dim + d0;
+    const uint2 kraw = *reinterpret_cast<const uint2*>(key_cache + row);
+    const __nv_bfloat162* kh = reinterpret_cast<const __nv_bfloat162*>(&kraw);
+    float s = q[0] * __bfloat162float(kh[0].x) + q[1] * __bfloat162float(kh[0].y) +
+              q[2] * __bfloat162float(kh[1].x) + q[3] * __bfloat162float(kh[1].y);
+#pragma unroll
+    for (int off = 16; off; off >>= 1) {
+      s += __shfl_xor_sync(0xffffffffu, s, off);
+    }
+    const float m_new = fmaxf(m_i, s);
+    const float alpha = __expf(m_i - m_new);
+    const float p = __expf(s - m_new);
+    l_i = l_i * alpha + p;
+    const uint2 vraw = *reinterpret_cast<const uint2*>(value_cache + row);
+    const __nv_bfloat162* vh = reinterpret_cast<const __nv_bfloat162*>(&vraw);
+    acc[0] = acc[0] * alpha + p * __bfloat162float(vh[0].x);
+    acc[1] = acc[1] * alpha + p * __bfloat162float(vh[0].y);
+    acc[2] = acc[2] * alpha + p * __bfloat162float(vh[1].x);
+    acc[3] = acc[3] * alpha + p * __bfloat162float(vh[1].y);
+    m_i = m_new;
+  }
+
+  const float inv_l = 1.f / l_i;
+  __nv_bfloat162 o[2];
+  o[0] = __floats2bfloat162_rn(acc[0] * inv_l, acc[1] * inv_l);
+  o[1] = __floats2bfloat162_rn(acc[2] * inv_l, acc[3] * inv_l);
+  *reinterpret_cast<uint2*>(output + out_base + d0) = *reinterpret_cast<const uint2*>(o);
 }
 
 // ========== Paged decode attention, KV-group shared smem (default path) ==
@@ -795,7 +948,7 @@ __global__ void paged_attn_decode_tiled_kernel_bf16(
     if (tid < tile_len) {
       const int32_t gpos = c0 + tid;
       const int32_t block_id = __ldg(table_row + gpos / block_size);
-      const int32_t off = gpos - block_id * block_size;
+      const int32_t off = gpos % block_size;
       s_base[tid] = block_id * (block_size * kv_dim) + off * kv_dim + head_offset;
     }
     __syncthreads();
@@ -889,6 +1042,15 @@ __global__ void paged_attn_decode_tiled_kernel_bf16(
   }
 }
 
+// Paged kernels map a token position to its page with `pos >> block_shift`;
+// the block_size CHECK in paged_attention_cu_batch already guarantees a power
+// of two, so a shift is exact (and cheaper than the divide).
+static int block_shift_for(int32_t block_size) {
+  int shift = 0;
+  while ((1 << shift) < block_size) ++shift;
+  return shift;
+}
+
 void paged_attention_cu_batch(int32_t head_num, int32_t layer_idx, int32_t num_blocks,
                                    int32_t block_size, int32_t kv_dim, int32_t kv_head_num,
                                    int32_t head_size, const tensor::Tensor& positions,
@@ -923,15 +1085,24 @@ void paged_attention_cu_batch(int32_t head_num, int32_t layer_idx, int32_t num_b
   // memory-traffic floor; group-shared smem staging measured 2.5x slower
   // (page loads serialize behind __syncthreads) and the old split-partials
   // path ~2.6x slower. LLAMA_ATTN_LEGACY=1 restores the split partials +
-  // combine path (used for A/B and as a numeric reference).
+  // combine path (used for A/B and as a numeric reference); LLAMA_ATTN_V1=1
+  // keeps the scalar warp kernel, which the vectorized one below supersedes.
   if (!getenv("LLAMA_ATTN_LEGACY") && head_size == 128 && table_stride > 0) {
     const int warps_per_block = 256 / 32;
     const int total_warps = batch * head_num;
-    paged_attn_warp_kernel_bf16<<<(total_warps + warps_per_block - 1) / warps_per_block, 256, 0,
-                                  stream>>>(
+    const int block_shift = block_shift_for(block_size);
+    const unsigned grid = (total_warps + warps_per_block - 1) / warps_per_block;
+    if (!getenv("LLAMA_ATTN_V1") && block_size >= 4) {
+      paged_attn_warp2_kernel_bf16<<<grid, 256, 0, stream>>>(
+          positions.ptr<int32_t>(), block_table.ptr<int32_t>(), table_stride, num_blocks,
+          block_size, block_shift, layer_idx, dim, query, output, kcache, vcache, kv_dim,
+          kv_head_num, head_num, head_size);
+      return;
+    }
+    paged_attn_warp_kernel_bf16<<<grid, 256, 0, stream>>>(
         positions.ptr<int32_t>(), block_table.ptr<int32_t>(), table_stride, num_blocks,
-        block_size, layer_idx, dim, query, output, kcache, vcache, kv_dim, kv_head_num,
-        head_num, head_size);
+        block_size, block_shift, layer_idx, dim, query, output, kcache, vcache, kv_dim,
+        kv_head_num, head_num, head_size);
     return;
   }
   // s_p must hold the largest tile any split can own.

@@ -60,7 +60,8 @@ struct Args {
   std::string tokenizer = "Qwen3-4B/tokenizer.json";
   std::string output_csv = "results/serving_metrics.csv";
   int num_requests = 512;  // 0 = 使用全部样本
-  int max_batch = 32;
+  int max_batch = 32;      // 未显式指定时由空闲显存自动放大,见 serve_once
+  bool max_batch_explicit = false;  // --max-batch / 位置参数是否给了值
   int max_gen = 256;
   int iterations = 1;
   int seed = 42;
@@ -91,7 +92,10 @@ static Args parse_args(int argc, char** argv) {
     if (argc > 1) a.model_dir = argv[1];
     if (argc > 2) a.tokenizer = argv[2];
     if (argc > 3) a.num_requests = std::stoi(argv[3]);
-    if (argc > 4) a.max_batch = std::stoi(argv[4]);
+    if (argc > 4) {
+      a.max_batch = std::stoi(argv[4]);
+      a.max_batch_explicit = true;
+    }
     if (argc > 5) a.max_gen = std::stoi(argv[5]);
     if (argc > 6) a.output_csv = argv[6];
     if (argc > 7) a.iterations = std::stoi(argv[7]);
@@ -110,8 +114,10 @@ static Args parse_args(int argc, char** argv) {
     a.output_csv = get_arg(argc, argv, "--output-csv");
   if (has_arg(argc, argv, "--num-requests"))
     a.num_requests = std::stoi(get_arg(argc, argv, "--num-requests"));
-  if (has_arg(argc, argv, "--max-batch"))
+  if (has_arg(argc, argv, "--max-batch")) {
     a.max_batch = std::stoi(get_arg(argc, argv, "--max-batch"));
+    a.max_batch_explicit = true;
+  }
   if (has_arg(argc, argv, "--max-gen"))
     a.max_gen = std::stoi(get_arg(argc, argv, "--max-gen"));
   if (has_arg(argc, argv, "--iterations"))
@@ -247,8 +253,47 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
   // 分页块大小按工作负载平均 prompt 长度自适应(短文本 8/长文本 32/默认 16)。
   const long long avg_prompt_len =
       prompt_tokens.empty() ? 0 : prompt_len_sum / static_cast<long long>(prompt_tokens.size());
-  Scheduler sched(model, args.max_batch, max_total_seq_len, args.max_gen,
-                  Scheduler::resolve_block_size(avg_prompt_len));
+  const int block_size = Scheduler::resolve_block_size(avg_prompt_len);
+
+  // ---- 自适应 max_batch ----
+  // KV 池按 max_batch * ceil(max_seq_len/block_size) 个块整块预分配(每个
+  // sequence 在接纳时就占满整行),所以并发度直接受空闲显存约束。默认的 32
+  // 远低于本机可容纳量:批量变大时每步耗时几乎不变(decode 主要是把权重从
+  // HBM 流一遍,与 batch 基本无关),所以吞吐近似线性增长,而 TTFT 的绝大部分
+  // 是排队等待——32 的默认值在突发负载下会把 TTFT 推到几十秒。
+  const int requested_batch = args.max_batch;
+  int max_batch = requested_batch;
+  {
+    const int64_t blocks_per_seq = (max_total_seq_len + block_size - 1) / block_size;
+    // bf16 x [num_layers, num_blocks, block_size, kv_dim] x {K,V}
+    const int64_t bytes_per_seq = static_cast<int64_t>(model->layer_num()) * blocks_per_seq *
+                                  block_size * model->kv_dim() * 2 * 2;
+    size_t free_b = 0, total_b = 0;
+    if (bytes_per_seq > 0 && cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+      // 预留给 logits 缓冲、每步临时张量、显存碎片,以及最容易被低估的一块:
+      // decode CUDA graph 是按 batch 大小逐个捕获的,每个图都带一份私有的
+      // 中间张量内存池(实测 max_batch=256 时图池累计约 6 GB,且是在本函数
+      // 之后才增长的,所以必须按比例预留而不是按固定值)。
+      const int64_t reserve = std::max<int64_t>(3LL << 30,
+                                                static_cast<int64_t>(total_b * 0.15));
+      const int64_t budget = static_cast<int64_t>(free_b) - reserve;
+      const int fit = static_cast<int>(budget / bytes_per_seq);
+      if (!args.max_batch_explicit) {
+        max_batch = std::clamp(fit, 1, 256);
+        std::cout << "[AUTOBATCH] max_batch 未显式指定,按空闲显存自动取 " << max_batch
+                  << " (每 sequence KV " << (bytes_per_seq >> 20) << " MB, 空闲 "
+                  << (free_b >> 30) << " GB, 预留 " << (reserve >> 30) << " GB)\n";
+      } else if (requested_batch > fit) {
+        max_batch = std::max(1, fit);
+        std::cout << "[AUTOBATCH] 警告:--max-batch " << requested_batch << " 需要 "
+                  << ((bytes_per_seq * requested_batch) >> 30) << " GB KV,超出可用显存 "
+                  << (free_b >> 30) << " GB;下调为 " << max_batch << "\n";
+      }
+    } else if (!args.max_batch_explicit) {
+      max_batch = requested_batch;
+    }
+  }
+  Scheduler sched(model, max_batch, max_total_seq_len, args.max_gen, block_size);
 
   // ---- 预热:与正式压测共用同一 Scheduler(同 offline,统计中跳过) ----
   // 每轮提交 warmup_requests(默认 = max_batch)个相同 prompt,请求同步完成
@@ -256,9 +301,8 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
   // warmup_iterations 轮完整 prefill + decode 稳定 GPU 频率并预热内存池。
   std::set<int> warm_ids;
   {
-    int warm_requests = args.warmup_requests > 0 ? args.warmup_requests
-                                                 : args.max_batch;
-    warm_requests = std::min(warm_requests, args.max_batch);
+    int warm_requests = args.warmup_requests > 0 ? args.warmup_requests : max_batch;
+    warm_requests = std::min(warm_requests, max_batch);
     int warm_iterations = std::max(1, args.warmup_iterations);
 
     auto t = model->encode("This is a warm-up prompt for stabilizing GPU "

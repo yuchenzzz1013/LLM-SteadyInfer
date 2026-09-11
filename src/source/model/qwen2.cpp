@@ -948,21 +948,11 @@ base::Status Qwen2Model::forward_batch(
       auto& fused = qwen_layers_->fused_qkv_layers_.at(layer_idx);
       std::dynamic_pointer_cast<op::MatmulLayer>(fused)->set_batch_size(batch);
       STATUS_CHECK(fused->forward(rms_out, qkv_out));
-      // Views into the fused output row blocks: [q | k | v], dtype of the
-      // fused GEMM output (BF16 on CUDA).
-      const base::DataType v_dtype = qkv_out.data_type();
-      const auto row_ptr = [&](int64_t elem_off) -> void* {
-        return (v_dtype == base::DataType::kDataTypeBF16)
-                   ? static_cast<void*>(qkv_out.ptr<uint16_t>(elem_off))
-                   : static_cast<void*>(qkv_out.ptr<float>(elem_off));
-      };
-      q_batch = tensor::Tensor(v_dtype, batch, config_->dim_, false, nullptr, row_ptr(0));
-      key_batch = tensor::Tensor(v_dtype, batch, kv_dim, false, nullptr, row_ptr(config_->dim_));
-      val_batch = tensor::Tensor(v_dtype, batch, kv_dim, false, nullptr,
-                                 row_ptr(config_->dim_ + kv_dim));
-      q_batch.set_device_type(device_type_);
-      key_batch.set_device_type(device_type_);
-      val_batch.set_device_type(device_type_);
+      // The fused row blocks are [q | k | v]: de-interleave into the contiguous
+      // q/k/v scratch (zero-copy views only hold for a single row).
+      split_fused_qkv_output(qkv_out, batch, config_->dim_, kv_dim, device_type_,
+                             cuda_config_ ? cuda_config_->stream : nullptr, q_batch, key_batch,
+                             val_batch);
     } else {
       // b. Q projection
       {

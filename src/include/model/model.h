@@ -3,6 +3,7 @@
 #include <op/embedding.h>
 #include <cuda_runtime_api.h>
 #include <cstdint>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <string>
@@ -144,6 +145,64 @@ inline tensor::Tensor cpu_slot_offsets(const tensor::Tensor& block_table, int32_
   UNUSED(batch);
   return block_table;
 #endif
+}
+
+// De-interleave the fused-QKV GEMM output (row layout [q | k | v], row width
+// dim + 2*kv_dim) into the caller's contiguous q/k/v scratch buffers. A
+// zero-copy view of one block is only valid for batch == 1: every q/k/v
+// consumer indexes its buffer as [b * width + i], so with more rows the k block
+// of row 0 would be read back as row 1 of q. Prefill chunks run with
+// batch == prompt length, so the copy runs for every multi-token prompt; decode
+// (batch rows of one token each) keeps the views and pays nothing.
+inline void split_fused_qkv_output(tensor::Tensor& qkv_out, int32_t batch, int32_t dim,
+                                   int32_t kv_dim, base::DeviceType device_type,
+                                   cudaStream_t stream, tensor::Tensor& q_batch,
+                                   tensor::Tensor& key_batch, tensor::Tensor& val_batch) {
+  const base::DataType dtype = qkv_out.data_type();
+  const auto row_ptr = [&](int64_t elem_off) -> void* {
+    return (dtype == base::DataType::kDataTypeBF16)
+               ? static_cast<void*>(qkv_out.ptr<uint16_t>(elem_off))
+               : static_cast<void*>(qkv_out.ptr<float>(elem_off));
+  };
+  if (batch == 1) {
+    q_batch = tensor::Tensor(dtype, batch, dim, false, nullptr, row_ptr(0));
+    key_batch = tensor::Tensor(dtype, batch, kv_dim, false, nullptr, row_ptr(dim));
+    val_batch = tensor::Tensor(dtype, batch, kv_dim, false, nullptr, row_ptr(dim + kv_dim));
+    q_batch.set_device_type(device_type);
+    key_batch.set_device_type(device_type);
+    val_batch.set_device_type(device_type);
+    return;
+  }
+  CHECK(q_batch.ptr<uint8_t>() != nullptr && key_batch.ptr<uint8_t>() != nullptr &&
+        val_batch.ptr<uint8_t>() != nullptr)
+      << "split_fused_qkv_output needs pre-allocated q/k/v scratch (see init_mem).";
+  const size_t elem = base::DataTypeSize(dtype);
+  const size_t row_bytes = static_cast<size_t>(dim + 2 * kv_dim) * elem;
+  const uint8_t* src = qkv_out.ptr<uint8_t>();
+  uint8_t* dst_q = q_batch.ptr<uint8_t>();
+  uint8_t* dst_k = key_batch.ptr<uint8_t>();
+  uint8_t* dst_v = val_batch.ptr<uint8_t>();
+  if (device_type == base::DeviceType::kDeviceCUDA) {
+    cudaMemcpy2DAsync(dst_q, static_cast<size_t>(dim) * elem, src, row_bytes,
+                      static_cast<size_t>(dim) * elem, batch, cudaMemcpyDeviceToDevice, stream);
+    cudaMemcpy2DAsync(dst_k, static_cast<size_t>(kv_dim) * elem,
+                      src + static_cast<size_t>(dim) * elem, row_bytes,
+                      static_cast<size_t>(kv_dim) * elem, batch, cudaMemcpyDeviceToDevice, stream);
+    cudaMemcpy2DAsync(dst_v, static_cast<size_t>(kv_dim) * elem,
+                      src + static_cast<size_t>(dim + kv_dim) * elem, row_bytes,
+                      static_cast<size_t>(kv_dim) * elem, batch, cudaMemcpyDeviceToDevice, stream);
+  } else {
+    for (int32_t b = 0; b < batch; ++b) {
+      const uint8_t* row = src + static_cast<size_t>(b) * row_bytes;
+      std::memcpy(dst_q + static_cast<size_t>(b) * dim * elem, row,
+                  static_cast<size_t>(dim) * elem);
+      std::memcpy(dst_k + static_cast<size_t>(b) * kv_dim * elem,
+                  row + static_cast<size_t>(dim) * elem, static_cast<size_t>(kv_dim) * elem);
+      std::memcpy(dst_v + static_cast<size_t>(b) * kv_dim * elem,
+                  row + static_cast<size_t>(dim + kv_dim) * elem,
+                  static_cast<size_t>(kv_dim) * elem);
+    }
+  }
 }
 
 class Model {

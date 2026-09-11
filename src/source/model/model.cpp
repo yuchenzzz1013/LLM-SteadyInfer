@@ -254,6 +254,17 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
     entry->captured_key_blocks = dims.num_blocks;
     entry->captured_block_size = dims.block_size;
     entry->captured_table_stride = table_stride;
+    // Capture only *records* the decode kernels — the stream is in capture
+    // mode, so nothing above has actually run. Launch once so this step still
+    // writes its KV row and produces logits; otherwise the first decode step
+    // of every batch size is silently dropped and the sampler reads stale
+    // logits while that position never reaches the cache.
+    const cudaError_t first_launch = cudaGraphLaunch(entry->exec, stream);
+    if (first_launch != cudaSuccess) {
+      LOG(ERROR) << "[GRAPH] cudaGraphLaunch failed after capture: "
+                 << cudaGetErrorString(first_launch);
+      return base::error::InternalError("CUDA graph launch failed for the decode step.");
+    }
     return status;
   }
 
