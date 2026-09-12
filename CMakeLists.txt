@@ -42,6 +42,8 @@ if(USE_CPM)
   CPMAddPackage(
     NAME Armadillo
     URL "file://${DEPS_DIR}/armadillo-code-14.0.1.tar.gz"
+    # Armadillo 自带的 smoke_test 与引擎无关,关掉可省一次编译/链接
+    OPTIONS "BUILD_SMOKE_TEST Off" "BUILD_TESTING Off"
   )
 
   CPMAddPackage(
@@ -109,3 +111,9 @@ endif()
 set_target_properties(llama PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 # 统一基准目录:offline_batch_benchmark / online_serving_benchmark / verify_tokens
 add_subdirectory(benchmark)
+
+# 示例目录:chat_demo(连续对话,可关:BUILD_DEMO=OFF)
+option(BUILD_DEMO "Build the demo examples (demo/)" ON)
+if(BUILD_DEMO)
+  add_subdirectory(demo)
+endif()
