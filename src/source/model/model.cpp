@@ -81,7 +81,10 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
                                 tensor::Tensor& logits) {
   const bool use_graph = device_type_ == base::DeviceType::kDeviceCUDA && use_cuda_graphs_;
   if (!use_graph) {
-    return forward_batch(input_ids, positions, block_table, key_cache, value_cache, logits, true);
+    // Pure decode: every row is a decode row (num_decode_rows == batch), no prefill
+    // row map is needed.
+    return forward_batch(input_ids, positions, block_table, key_cache, value_cache, logits,
+                         true, input_ids.get_dim(0), nullptr, 0);
   }
 
   const int32_t batch = input_ids.get_dim(0);
@@ -177,7 +180,8 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
     }();
     if (no_graph) {
       return forward_batch(stage_ids, stage_pos, stage_bt, key_cache, value_cache,
-                           entry->logits_view, true, entry->scratch.get());
+                           entry->logits_view, true, batch, nullptr, 0,
+                           entry->scratch.get());
     }
   }
 
@@ -213,11 +217,13 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
       LOG(WARNING) << "[GRAPH] cudaStreamBeginCapture failed (" << cudaGetErrorString(cap_err)
                    << "); falling back to direct decode for batch=" << batch;
       return forward_batch(stage_ids, stage_pos, stage_bt, key_cache, value_cache,
-                           entry->logits_view, true, entry->scratch.get());
+                           entry->logits_view, true, batch, nullptr, 0,
+                           entry->scratch.get());
     }
 
     auto status = forward_batch(stage_ids, stage_pos, stage_bt, key_cache, value_cache,
-                                entry->logits_view, true, entry->scratch.get());
+                                entry->logits_view, true, batch, nullptr, 0,
+                           entry->scratch.get());
     cudaGraph_t graph = nullptr;
     cap_err = cudaStreamEndCapture(stream, &graph);
     if (cap_err != cudaSuccess || !status || graph == nullptr) {
@@ -232,7 +238,8 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
       LOG(WARNING) << "[GRAPH] Capture failed for batch=" << batch
                    << "; falling back to direct decode.";
       return forward_batch(stage_ids, stage_pos, stage_bt, key_cache, value_cache,
-                           entry->logits_view, true, entry->scratch.get());
+                           entry->logits_view, true, batch, nullptr, 0,
+                           entry->scratch.get());
     }
 
     cap_err = cudaGraphInstantiate(&entry->exec, graph, 0);
@@ -242,7 +249,8 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
       LOG(WARNING) << "[GRAPH] cudaGraphInstantiate failed (" << cudaGetErrorString(cap_err)
                    << "); falling back to direct decode for batch=" << batch;
       return forward_batch(stage_ids, stage_pos, stage_bt, key_cache, value_cache,
-                           entry->logits_view, true, entry->scratch.get());
+                           entry->logits_view, true, batch, nullptr, 0,
+                           entry->scratch.get());
     }
     // Snapshot the Scheduler-owned buffers baked into the graph; replay is
     // validated against these on every subsequent decode step.
@@ -280,7 +288,8 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
 
   // capture_failed forever: direct batched forward with the stable scratch.
   return forward_batch(stage_ids, stage_pos, stage_bt, key_cache, value_cache,
-                       entry->logits_view, true, entry->scratch.get());
+                       entry->logits_view, true, batch, nullptr, 0,
+                           entry->scratch.get());
 }
 
 base::ModelType Model::model_type() const { return model_type_; }

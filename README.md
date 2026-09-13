@@ -81,7 +81,6 @@ LLM-SteadyInfer 是一个基于 **C++ / CUDA C++** 实现的轻量级大语言�
 
 - BF16（CUDA:全链路权重 / 激活 / KV Cache / RoPE sin-cos 表均 BF16）
 - FP32（后备:仅 CPU 设备,权重加载时转换;CUDA 侧不保留任何 FP32 算子）
-- INT8 Group-wise Quantization（LLaMA / Qwen2,未随 BF16 迁移,已禁用）
 
 ---
 
@@ -140,7 +139,7 @@ make -j$(nproc)
 
 ## Demo
 
-### 连续对话（命令行实时 Chat）
+### 连续对话
 
 `demo/chat_demo.cpp` 是一个最小可跑的连续对话示例：ChatML 模板拼 prompt →
 `model->encode` → `Scheduler::add_request` → `step()` → 逐 token 流式打印。
@@ -152,23 +151,6 @@ make -j$(nproc)
 ./build/demo/chat_demo --questions "你好|讲个笑话"   # 非交互,依次提问
 ./build/demo/chat_demo --help               # 全部参数(模型类型 / 目录 / 设备 / 思考模式…)
 ```
-
-常用参数：
-
-* `--model-type qwen3|qwen2|llama`、`--model-dir <目录>`、`--tokenizer <文件>`：选择模型
-* `--max-seq-len`（默认 0 = 自适应）：上下文容量，同时容纳历史与生成长度。
-  自适应取「模型窗口」与「显存放得下」的较小值，启动时会打印 KV 池大小与整卡占用
-* `--max-batch`（默认 1）：调度器槽位数；KV 池按 `max_batch × max_seq_len` 整块预分配，
-  想多占显存就调大（例如 40G 卡上 `--max-batch 8` 会把 KV 池撑到 ~26 GB，整卡占用约 93%）
-* `--gpu-mem-fraction`（默认 0.9）：KV 池最多占空闲显存的比例
-* `--device cuda|cpu`：推理设备
-
-> 长上下文依赖模型 config 的 `max_position_embeddings`：本仓库 `Qwen3-4B/config.json`
-> 已设为官方值 40960，所以上下文可以开到 40960；更小的窗口模型会自动按窗口截断。
-> 注意单流对话是延迟受限的，显存可以吃满，但 GPU 算力吃不满（要算力得上并发 batching）。
-
-对话中的命令：`/model`（查看或热切换模型）、`/history`、`/clear`、`exit`。
-
 ---
 
 ## 项目结构

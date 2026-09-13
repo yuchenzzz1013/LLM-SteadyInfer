@@ -205,6 +205,20 @@ inline void split_fused_qkv_output(tensor::Tensor& qkv_out, int32_t batch, int32
   }
 }
 
+// Zero-copy row slice of a [rows, width] tensor: the leading `rows` rows of
+// `src`, viewed at the same dtype/device/shape width. The rows of a batch
+// tensor are contiguous, so the slice needs no data movement and keeps the
+// memory layout (and therefore the GEMM result) of the rows it covers. Used
+// by the LM-head slice: only the leading decode rows of a mixed batch produce
+// a token, so the final norm + LM head (the widest GEMM of the step) run on
+// that prefix instead of on every row.
+inline tensor::Tensor row_slice_view(const tensor::Tensor& src, int32_t rows) {
+  tensor::Tensor view(src.data_type(), rows, src.get_dim(1), false, nullptr,
+                      const_cast<uint8_t*>(src.ptr<uint8_t>()));
+  view.set_device_type(src.device_type());
+  return view;
+}
+
 class Model {
  public:
   explicit Model(base::TokenizerType tokenizer_type, base::ModelType model_type,
@@ -234,6 +248,19 @@ class Model {
   // When scratch != nullptr the call reuses its persistent buffers (stable
   // addresses — CUDA-Graph capturable) and reads the staged device inputs
   // (input_ids/positions/block_table must already be CUDA tensors).
+  //
+  // Row layout (mixed steps): the Scheduler sorts the batch so that the
+  // num_decode_rows decode rows come first and the prefill rows follow, each
+  // sequence's chunk forming one contiguous run:
+  //   rows [0, num_decode_rows)            -> decode rows
+  //   rows [num_decode_rows, batch)        -> prefill rows, grouped by sequence
+  // num_decode_rows == 0 is a pure-prefill step (no logits are produced);
+  // num_decode_rows == batch is a pure-decode step.
+  // seq_row_start[s] is the first batch row of the s-th prefill sequence and
+  // seq_row_start[num_prefill_seqs] the end of the last one (sentinel), so the
+  // prefill row range of sequence s is [seq_row_start[s], seq_row_start[s+1]).
+  // It is consumed by the paged-CUDA prefill attention kernel; the CPU and
+  // continuous-CUDA attention paths treat every row independently and ignore it.
   virtual base::Status forward_batch(
       const tensor::Tensor& input_ids,
       const tensor::Tensor& positions,
@@ -242,6 +269,9 @@ class Model {
       tensor::Tensor& value_cache,
       tensor::Tensor& logits,
       bool need_logits = true,
+      int32_t num_decode_rows = 0,
+      const tensor::Tensor* seq_row_start = nullptr,
+      int32_t num_prefill_seqs = 0,
       BatchScratch* scratch = nullptr) const = 0;
 
   // Decode step with a CUDA-Graph pool: the first call for a given batch size
@@ -323,6 +353,11 @@ class Model {
 
   // Synchronize the model's CUDA stream (no-op on CPU or when no stream is set).
   virtual void sync_stream() const {}
+
+  // The model's CUDA stream (nullptr on CPU models / before init). Callers use
+  // it for the small H2D staging copies that must be ordered with the forward
+  // kernels (see Scheduler::execute_batch).
+  cudaStream_t cuda_stream() const { return cuda_config_ ? cuda_config_->stream : nullptr; }
 
  protected:
   virtual base::Status insert_buffer(ModelBufferType buffer_idx, const tensor::Tensor& tensor);

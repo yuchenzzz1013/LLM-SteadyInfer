@@ -95,6 +95,15 @@ class Scheduler {
   // read-only and skips their prefill.
   std::unique_ptr<PrefixCache> prefix_cache_;
   tensor::Tensor logits_;  // preallocated [max_batch_size, vocab_size], model compute dtype
+  // Prefill row map for mixed steps: seq_row_start[i] is the first batch row of
+  // the i-th prefill sequence (prefill rows are contiguous per sequence), the
+  // last entry is the batch size (sentinel). The attention layer dispatches the
+  // prefill rows to the prefill kernel by these groups. Host staging + device
+  // copy live here (not in Model) because the Scheduler owns the row order;
+  // both are sized lazily to row_cap_for(max_batch_size_) + 2 entries and
+  // reused every step (one small H2D per mixed step).
+  tensor::Tensor seq_row_start_host_;
+  tensor::Tensor seq_row_start_cu_;
   std::deque<Sequence> waiting_queue_;  // deque: preempted seqs jump the head
   std::vector<Sequence> running_sequences_;
   std::vector<Sequence> finished_sequences_;

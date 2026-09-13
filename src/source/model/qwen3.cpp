@@ -830,12 +830,19 @@ base::Status Qwen3Model::forward_batch(
     tensor::Tensor& value_cache,
     tensor::Tensor& logits,
     bool need_logits,
+    int32_t num_decode_rows,
+    const tensor::Tensor* seq_row_start,
+    int32_t num_prefill_seqs,
     BatchScratch* scratch) const {
   if (input_ids.is_empty()) {
     return base::error::InvalidArgument("The input_ids tensor is empty.");
   }
 
   int32_t batch = input_ids.get_dim(0);
+  // Rows that need logits: the leading decode rows (see Model::forward_batch).
+  // num_decode_rows == 0 means "the whole batch is decode rows" — the
+  // decode_step / single-sequence callers that predate the split.
+  const int32_t lm_rows = (num_decode_rows > 0) ? num_decode_rows : batch;
   int32_t hidden_dim = config_->hidden_dim_;
   int32_t dim = config_->dim_;
   int32_t kv_dim = config_->kv_dim_;
@@ -895,7 +902,14 @@ base::Status Qwen3Model::forward_batch(
     key_batch = tensor::Tensor(dtype, batch, kv_dim, true, alloc);
     val_batch = tensor::Tensor(dtype, batch, kv_dim, true, alloc);
     qkv_out = tensor::Tensor(dtype, batch, config_->dim_ + 2 * kv_dim, true, alloc);
-    if (device_type_ == base::DeviceType::kDeviceCUDA) {
+    // Split-KV partials are only produced by the fallback attention path
+    // (continuous CUDA layout, or a head_size the warp/prefill kernels do not
+    // cover). The paged warp2 decode kernel and the prefill kernel accumulate
+    // online-softmax state in registers and never touch score_batch, so a
+    // prefill chunk / mixed step skips the allocation entirely — for a
+    // 512-row chunk that is ~35 MB of scratch per layer per step.
+    if (device_type_ == base::DeviceType::kDeviceCUDA &&
+        (!cache_dims.paged || config_->head_size_ != 128)) {
       int32_t num_splits = kernel::flash_decoding_num_splits(max_seq_len);
       // Score rows of head_size floats; BF16 splits keep the same row count.
       partial_batch = tensor::Tensor(
@@ -1079,12 +1093,15 @@ base::Status Qwen3Model::forward_batch(
                                   num_blocks, block_size, layer_idx, cuda_config_->stream);
       SECT_REC(layer_idx * 6 + 2);
 
-      // f. MHA: Paged Flash Decoding — split-KV pass + reduce pass, one
-      // launch pair per layer for the whole batch.
-      kernel::paged_attention_cu_batch(config_->head_num_, layer_idx, num_blocks, block_size,
-                                       kv_dim, config_->kv_head_num_, config_->head_size_,
-                                       positions_cu, block_table_cu, q_batch, partial_batch,
-                                       mha_out_batch, key_cache, value_cache, cuda_config_.get());
+      // f. MHA: decode rows run the warp-per-head decode kernel, prefill rows
+      // the prefill attention kernel (one KV read per (sequence, q-block, kv
+      // head) instead of one per row). Both write disjoint row ranges of
+      // mha_out_batch — see kernel::paged_attention_dispatch.
+      kernel::paged_attention_dispatch(
+          config_->head_num_, layer_idx, num_blocks, block_size, kv_dim, config_->kv_head_num_,
+          config_->head_size_, num_decode_rows, seq_row_start, num_prefill_seqs, positions_cu,
+          block_table_cu, q_batch, partial_batch, mha_out_batch, key_cache, value_cache,
+          cuda_config_.get());
       SECT_REC(layer_idx * 6 + 3);
 #else
       // Write this layer's K/V rows into each sequence's KV cache slot
@@ -1208,17 +1225,28 @@ base::Status Qwen3Model::forward_batch(
     SECT_REC(layer_idx * 6 + 5);
   }
 
-  // 3. Final RMSNorm + LM Head (skipped for prefill chunks: only the first
-  // generated token, produced by a decode step, needs logits)
+  // 3. Final RMSNorm + LM Head, restricted to the leading lm_rows rows: only
+  // decode rows produce a token this step (a prefill chunk's logits would be
+  // thrown away), and the LM head is the widest GEMM of the step — a
+  // 512-row chunk with 32 decode rows now costs 32 x vocab x hidden instead
+  // of 544 x vocab x hidden. The slice is a zero-copy view of the scratch
+  // rows, so the rows that do produce logits are unchanged.
   SECT_REC(config_->layer_num_ * 6);
   if (need_logits) {
+    tensor::Tensor lm_hidden = row_slice_view(hidden, lm_rows);
+    tensor::Tensor lm_logits = row_slice_view(logits, lm_rows);
     auto& final_norm = qwen_layers_->rmsnorm_layers_.at(2 * config_->layer_num_);
-    STATUS_CHECK(final_norm->forward(hidden, hidden));
+    STATUS_CHECK(final_norm->forward(lm_hidden, lm_hidden));
 
-    logits.reshape({batch, config_->vocab_size_});
+    // NOTE: the caller's logits tensor is deliberately NOT reshaped here.
+    // reshape() reallocates when the requested element count exceeds the
+    // tensor's current one, and the two views above would then point into the
+    // released buffer (the LM head's GEMM writing into freed memory). The
+    // views carry the shapes the GEMM and the sampler actually read, so the
+    // caller's dims are left alone.
     auto& cls = qwen_layers_->cls_layer_;
-    std::dynamic_pointer_cast<op::MatmulLayer>(cls)->set_batch_size(batch);
-    STATUS_CHECK(cls->forward(hidden, logits));
+    std::dynamic_pointer_cast<op::MatmulLayer>(cls)->set_batch_size(lm_rows);
+    STATUS_CHECK(cls->forward(lm_hidden, lm_logits));
   }
   SECT_REC(config_->layer_num_ * 6 + 1);
 

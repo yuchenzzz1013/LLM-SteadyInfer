@@ -566,11 +566,44 @@ void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
   if (rows.empty()) return;
 
   const int batch = static_cast<int>(rows.size());
-  int num_decode_rows = 0;
+  // Row order contract with the model (see Model::forward_batch): decode rows
+  // first, then the prefill rows grouped per sequence. build_batch_rows already
+  // emits that order (decode rows from running_sequences_, then one contiguous
+  // chunk run per sequence), so this pass is a stable re-sort that keeps the
+  // contract local to execute_batch instead of spread across the batch builder.
+  std::vector<const BatchRow*> ordered;
+  ordered.reserve(batch);
   for (const auto& r : rows) {
-    if (r.is_decode) ++num_decode_rows;
+    if (r.is_decode) ordered.push_back(&r);
+  }
+  const int num_decode_rows = static_cast<int>(ordered.size());
+  for (const auto& r : rows) {
+    if (!r.is_decode) ordered.push_back(&r);
   }
   const bool any_prefill = num_decode_rows < batch;
+
+  // Prefill sequence groups: seq_row_start[i] = first row of the i-th prefill
+  // sequence, seq_row_start[num_prefill_seqs] = batch (sentinel). Rows of one
+  // sequence are contiguous, so a new group starts wherever the sequence
+  // pointer changes.
+  int num_prefill_seqs = 0;
+  if (any_prefill) {
+    if (seq_row_start_host_.is_empty() || seq_row_start_host_.get_dim(0) < batch + 1) {
+      const int cap = row_cap_for(max_batch_size_) + 2;
+      seq_row_start_host_ =
+          tensor::Tensor(base::DataType::kDataTypeInt32, cap, true,
+                         base::CPUDeviceAllocatorFactory::get_instance());
+    }
+    int32_t* row_start = seq_row_start_host_.ptr<int32_t>();
+    row_start[0] = num_decode_rows;
+    num_prefill_seqs = 1;
+    for (int i = num_decode_rows + 1; i < batch; ++i) {
+      if (ordered[i]->seq != ordered[i - 1]->seq) {
+        row_start[num_prefill_seqs++] = i;
+      }
+    }
+    row_start[num_prefill_seqs] = batch;  // sentinel
+  }
 
   auto alloc_cpu = base::CPUDeviceAllocatorFactory::get_instance();
   tensor::Tensor input_ids(base::DataType::kDataTypeInt32, batch, true, alloc_cpu);
@@ -585,7 +618,7 @@ void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
 #endif
 
   for (int i = 0; i < batch; ++i) {
-    const BatchRow& r = rows[i];
+    const BatchRow& r = *ordered[i];
     input_ids.index<int32_t>(i) = r.token_id;
     positions.index<int32_t>(i) = r.position;
 #ifdef USE_PAGED_ATTENTION
@@ -602,10 +635,28 @@ void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
 #endif
   }
 
+  // Upload the prefill row map (device tensor view) for the attention dispatch.
+  // Only the prefill rows need it, and only the CUDA models read it; the CPU /
+  // continuous paths treat every row independently. Kept in a persistent buffer
+  // so a mixed step pays one small H2D, not an allocation.
+  const tensor::Tensor* seq_row_start_ptr = nullptr;
+  if (any_prefill && model_->device_type() == base::DeviceType::kDeviceCUDA) {
+    const int n = num_prefill_seqs + 1;
+    if (seq_row_start_cu_.is_empty() || seq_row_start_cu_.get_dim(0) < batch + 1) {
+      seq_row_start_cu_ =
+          tensor::Tensor(base::DataType::kDataTypeInt32, row_cap_for(max_batch_size_) + 2, true,
+                         base::CUDADeviceAllocatorFactory::get_instance());
+    }
+    cudaMemcpyAsync(seq_row_start_cu_.ptr<int32_t>(), seq_row_start_host_.ptr<int32_t>(),
+                    n * sizeof(int32_t), cudaMemcpyHostToDevice, model_->cuda_stream());
+    seq_row_start_ptr = &seq_row_start_cu_;
+  }
+
 #ifndef NDEBUG
   VLOG(1) << "[SCHED] batch size=" << batch
           << " decode_rows=" << num_decode_rows
-          << " prefill_rows=" << (batch - num_decode_rows);
+          << " prefill_rows=" << (batch - num_decode_rows)
+          << " prefill_seqs=" << num_prefill_seqs;
 #endif
 
   if (!any_prefill) {
@@ -676,7 +727,7 @@ void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
               batch, d_cad, d_build, d_wait, d_post);
     }
     for (int i = 0; i < batch; ++i) {
-      Sequence* seq = rows[i].seq;
+      Sequence* seq = ordered[i]->seq;
       if (seq->generated_tokens.empty()) {
         seq->first_token_time = now;
       } else {
@@ -692,37 +743,40 @@ void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
   } else {
     // Prefill step (pure, or mixed with decode rows): plain forward_batch —
     // the chunk composition varies per step, so it stays outside the decode
-    // CUDA graphs. With decode rows present, logits are computed for the
-    // whole batch (prefill-row logits are wasted compute but keep the
-    // sampling rows aligned); a pure-prefill step skips the LM head entirely.
+    // CUDA graphs. Only the leading num_decode_rows rows produce logits (the
+    // model slices the LM head accordingly); a pure-prefill step skips the LM
+    // head entirely. The attention layer splits the two row ranges internally
+    // (decode kernel / prefill kernel) — one forward pass, weights read once.
     const bool need_logits = num_decode_rows > 0;
     auto status = model_->forward_batch(input_ids, positions, block_table,
                                         kv_manager_->key_cache(),
                                         kv_manager_->value_cache(),
-                                        logits_, need_logits);
+                                        logits_, need_logits, num_decode_rows,
+                                        seq_row_start_ptr, num_prefill_seqs);
     if (!status) {
       force_finish_all("batch prefill failed");
       return;
     }
 
     if (need_logits) {
-      // Sample only the decode rows: prefill rows produce no token this step.
+      // Sample only the decode rows: prefill rows produce no token this step,
+      // and their logits were never computed — the LM head ran on the
+      // num_decode_rows row prefix (rows 0..num_decode_rows-1 of `ordered`).
       // dtype mirrors the buffer so post_processing_batch picks the BF16 or
       // FP32 argmax path.
       const base::DataType logits_dtype = logits_.data_type();
       void* logits_ptr = logits_dtype == base::DataType::kDataTypeBF16
                              ? static_cast<void*>(logits_.ptr<uint16_t>())
                              : static_cast<void*>(logits_.ptr<float>());
-      tensor::Tensor logits_view(logits_dtype, batch, model_->vocab_size(), false,
+      tensor::Tensor logits_view(logits_dtype, num_decode_rows, model_->vocab_size(), false,
                                  nullptr, logits_ptr);
       logits_view.set_device_type(model_->device_type());
       model_->sync_stream();
       auto next_tokens = model_->post_processing_batch(logits_view);
 
       auto now = std::chrono::steady_clock::now();
-      for (int i = 0; i < batch; ++i) {
-        if (!rows[i].is_decode) continue;
-        Sequence* seq = rows[i].seq;
+      for (int i = 0; i < num_decode_rows; ++i) {
+        Sequence* seq = ordered[i]->seq;
         if (seq->generated_tokens.empty()) {
           seq->first_token_time = now;
         } else {

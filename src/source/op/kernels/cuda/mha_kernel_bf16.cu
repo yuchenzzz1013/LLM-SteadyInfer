@@ -1,6 +1,18 @@
 // CUDA attention kernels (all BF16): continuous-layout Flash Decoding
-// (mha_kernel_cu / mha_kernel_cu_batch), paged KV scatter and paged Flash
-// Decoding (paged_kv_scatter_cu / paged_attention_cu_batch).
+// (mha_kernel_cu / mha_kernel_cu_batch), paged KV scatter and the paged
+// attention family (paged_attention_dispatch / paged_attention_cu_batch /
+// paged_prefill_attention_cu_batch).
+//
+// A step's batch is split by row type: the scheduler puts the decode rows
+// first, and paged_attention_dispatch sends [0, num_decode_rows) to the
+// warp-per-(row, head) decode kernel (paged_attn_warp2_kernel_bf16) and
+// [num_decode_rows, batch) — the prefill rows, grouped per sequence by
+// seq_row_start — to paged_prefill_kernel_bf16, which stages each KV tile into
+// smem once per CTA instead of re-reading the prefix once per (row, head).
+// Both write disjoint row ranges of mha_out, so a mixed step runs one forward
+// pass with the weights read once. Geometry the split kernels do not serve
+// (head_size != 128, unusual page sizes, continuous layout) keeps the whole
+// batch on the split-partials flash decoding path below.
 //
 // All q/k/v/output caches are raw bfloat16 (CUDA __nv_bfloat16, bit-compatible
 // with the uint16_t host representation). Internal score / softmax / output
@@ -15,7 +27,7 @@
 #include <base/cuda_config.h>
 #include <tensor/tensor.h>
 #include <cfloat>
-#include <cstdlib>
+#include <vector>
 #include <cuda_bf16.h>
 #include <cub/cub.cuh>
 #include "mha_kernel.cuh"
@@ -523,7 +535,9 @@ __global__ void paged_flash_decoding_combine_kernel_bf16(const __nv_bfloat16* pa
   }
 }
 
-// ========== Paged decode attention, smem-tiled (default path) ==========
+// ========== Paged decode attention, smem-tiled (not wired up) ==========
+// Unreferenced experiment: the dispatcher below only ever launches warp2 or
+// the prefill kernel, never this one. Kept for reference.
 // One 128-thread block per (batch row, q head). The block walks the row's
 // whole KV prefix in 64-position chunks; each chunk's K/V head-slice is
 // staged in smem with coalesced bf16 loads (head-size row == 256B
@@ -536,142 +550,24 @@ __global__ void paged_flash_decoding_combine_kernel_bf16(const __nv_bfloat16* pa
 constexpr int kPagedTilePos = 64;
 constexpr int kPagedTileStride = 130;  // head_size (<= 128) + 2 pad elems
 
-// ========== Paged decode attention, warp-per-head (default path) ==========
-// One warp (32 lanes) per (batch row, q head); 8 warps per 256-thread block.
-// Softmax is warp-shuffle online (no __syncthreads anywhere), and each K/V
-// head-slice row is read straight from global with per-warp 64B coalesced
-// segments. The grid/latency sweep showed both earlier kernels were bound by
-// per-position block-wide reduce/broadcast rounds (~100-200ns each), not by
-// traffic or launch; removing all block communication lets the kernel run at
-// the memory/issue limit instead.
-__global__ void paged_attn_warp_kernel_bf16(
-    const int32_t* positions, const int32_t* block_table, int32_t table_stride,
-    int32_t num_blocks, int32_t block_size, int32_t block_shift, int32_t layer_idx,
-    int32_t dim, const __nv_bfloat16* query, __nv_bfloat16* output,
-    const __nv_bfloat16* key_cache, const __nv_bfloat16* value_cache, int32_t kv_dim,
-    int32_t kv_head_num, int32_t head_num, int32_t head_size) {
-  constexpr int kColsPerLane = 4;  // head_size == 128, one warp per head
-  const int warp_id = (blockIdx.x * (blockDim.x >> 5)) + (threadIdx.x >> 5);
-  const int lane = threadIdx.x & 31;
-  const int b = warp_id / head_num;
-  const int head = warp_id - b * head_num;
-  const int pos = positions[b];
-  const float scale = 1.f / sqrtf(static_cast<float>(head_size));
-  const int head_offset = (head * kv_head_num / head_num) * head_size;
-  const int32_t* table_row = block_table + static_cast<int64_t>(b) * table_stride;
-  const int64_t layer_base =
-      static_cast<int64_t>(layer_idx) * num_blocks * block_size * kv_dim;
-  const __nv_bfloat16* q_head = query + static_cast<int64_t>(b) * dim + head * head_size;
-  const int64_t out_base = static_cast<int64_t>(b) * dim + head * head_size;
-
-  float q[kColsPerLane];
-#pragma unroll
-  for (int c = 0; c < kColsPerLane; ++c) {
-    q[c] = __bfloat162float(q_head[c * 32 + lane]);
-  }
-
-  float m_i = -FLT_MAX;  // online flash stats (warp-uniform)
-  float l_i = 0.f;
-  float acc[kColsPerLane] = {0.f, 0.f, 0.f, 0.f};
-
-  // Position walk, 4 deep. Per-position loads are independent of the online
-  // update, so issue a whole group's K/V loads first (32 loads in flight per
-  // warp) and only then run the dots + softmax; otherwise every position
-  // pays a full memory round trip on its own (~0.5-1us at decode shapes).
-  constexpr int kPosGroup = 4;
-  float k_reg[kPosGroup][kColsPerLane];
-  float v_reg[kPosGroup][kColsPerLane];
-  int64_t row[kPosGroup];
-  const int seq = pos + 1;
-  int gpos = 0;
-  for (; gpos + kPosGroup <= seq; gpos += kPosGroup) {
-#pragma unroll
-    for (int j = 0; j < kPosGroup; ++j) {
-      const int32_t pg = __ldg(table_row + ((gpos + j) >> block_shift));
-      row[j] = layer_base + static_cast<int64_t>(pg) * (block_size * kv_dim) + head_offset +
-               static_cast<int64_t>((gpos + j) & (block_size - 1)) * kv_dim;
-    }
-#pragma unroll
-    for (int j = 0; j < kPosGroup; ++j) {
-#pragma unroll
-      for (int c = 0; c < kColsPerLane; ++c) {
-        const int col = c * 32 + lane;
-        k_reg[j][c] = __bfloat162float(key_cache[row[j] + col]);
-        v_reg[j][c] = __bfloat162float(value_cache[row[j] + col]);
-      }
-    }
-#pragma unroll
-    for (int j = 0; j < kPosGroup; ++j) {
-      float s = 0.f;
-#pragma unroll
-      for (int c = 0; c < kColsPerLane; ++c) {
-        s += q[c] * k_reg[j][c];
-      }
-      s *= scale;
-#pragma unroll
-      for (int off = 16; off; off >>= 1) {  // warp all-reduce -> uniform score
-        s += __shfl_xor_sync(0xffffffffu, s, off);
-      }
-      const float m_new = fmaxf(m_i, s);
-      const float alpha = __expf(m_i - m_new);
-      const float p = __expf(s - m_new);
-      l_i = l_i * alpha + p;
-#pragma unroll
-      for (int c = 0; c < kColsPerLane; ++c) {
-        acc[c] = acc[c] * alpha + p * v_reg[j][c];
-      }
-      m_i = m_new;
-    }
-  }
-  for (; gpos <= pos; ++gpos) {
-    const int32_t pg = __ldg(table_row + (gpos >> block_shift));
-    const int64_t row_tail = layer_base + static_cast<int64_t>(pg) * (block_size * kv_dim) +
-                             head_offset + static_cast<int64_t>(gpos & (block_size - 1)) * kv_dim;
-    float s = 0.f;
-#pragma unroll
-    for (int c = 0; c < kColsPerLane; ++c) {
-      const int col = c * 32 + lane;
-      s += q[c] * __bfloat162float(key_cache[row_tail + col]);
-    }
-    s *= scale;
-#pragma unroll
-    for (int off = 16; off; off >>= 1) {
-      s += __shfl_xor_sync(0xffffffffu, s, off);
-    }
-    const float m_new = fmaxf(m_i, s);
-    const float alpha = __expf(m_i - m_new);
-    const float p = __expf(s - m_new);
-    l_i = l_i * alpha + p;
-#pragma unroll
-    for (int c = 0; c < kColsPerLane; ++c) {
-      const int col = c * 32 + lane;
-      acc[c] = acc[c] * alpha + p * __bfloat162float(value_cache[row_tail + col]);
-    }
-    m_i = m_new;
-  }
-
-  const float inv_l = 1.f / l_i;
-#pragma unroll
-  for (int c = 0; c < kColsPerLane; ++c) {
-    output[out_base + c * 32 + lane] = __float2bfloat16(acc[c] * inv_l);
-  }
-}
-
 // ========== Paged decode attention, vectorized + grouped softmax ==========
-// Same one-warp-per-(batch row, q head) shape as the kernel above, but the
-// per-position critical path is much shorter:
+// One warp (32 lanes) per (batch row, q head), 8 warps per 256-thread block.
+// This is the decode kernel of record: softmax is warp-shuffle online (no
+// __syncthreads anywhere), and each per-position critical path is short:
 //   * each lane owns 4 CONTIGUOUS head dims (lane*4 .. lane*4+3) instead of
-//     the lane-strided c*32+lane, so a whole K or V row costs ONE 8-byte load
+//     a lane-strided c*32+lane, so a whole K or V row costs ONE 8-byte load
 //     per lane (2 loads per position instead of 8);
 //   * the online softmax update runs once per GROUP of 4 positions: the four
 //     score reductions are independent and pipeline together, and the
 //     expf/rescale chain that serializes the walk is 4x less frequent;
 //   * the block-table lookup is hoisted to the group: every supported block
 //     size is a multiple of 4, so a 4-aligned group never crosses a page;
-//   * the page index uses the block shift, where the v1 kernel hardcodes
-//     ">> 4" (correct only for block_size == 16).
-// Warp-uniform scores are kept (5-shuffle all-reduce per position) so the
-// q*warp-softmax structure of v1 is preserved for numeric comparison.
+//   * the page index uses the block shift (block_size is a power of two),
+//     not a hardcoded ">> 4".
+// The per-position arithmetic here (lane-owned 4 dims, 4-position rescale
+// groups, 5-shuffle warp score reduction, scalar tail for < 4 positions) is
+// the reference that paged_prefill_kernel_bf16 below mirrors op for op, so a
+// prefill row comes out bit-identical whichever of the two kernels runs it.
 __global__ void paged_attn_warp2_kernel_bf16(
     const int32_t* positions, const int32_t* block_table, int32_t table_stride,
     int32_t num_blocks, int32_t block_size, int32_t block_shift, int32_t layer_idx,
@@ -806,7 +702,9 @@ __global__ void paged_attn_warp2_kernel_bf16(
   *reinterpret_cast<uint2*>(output + out_base + d0) = *reinterpret_cast<const uint2*>(o);
 }
 
-// ========== Paged decode attention, KV-group shared smem (default path) ==
+// ========== Paged decode attention, KV-group shared smem (not wired up) ===
+// Unreferenced experiment: the dispatcher below only ever launches warp2 or
+// the prefill kernel, never this one. Kept for reference.
 // One 128-thread block per (batch row, kv head group) with G=4 q heads (the
 // engine's GQA ratio). The 4 warps handle one q head each; every K/V row of
 // the group is staged into smem ONCE per page instead of being re-read by
@@ -1079,32 +977,29 @@ void paged_attention_cu_batch(int32_t head_num, int32_t layer_idx, int32_t num_b
   const __nv_bfloat16* vcache = value_cache.ptr<__nv_bfloat16>();
 
   cudaStream_t stream = config->stream;
-  // Default fast path: warp-per-head flash decoding — one 256-thread block
-  // per (batch row, q head), 4-deep pipelined K/V loads, warp-shuffle online
-  // softmax, no block-wide syncs. At decode shapes this kernel runs at its
-  // memory-traffic floor; group-shared smem staging measured 2.5x slower
-  // (page loads serialize behind __syncthreads) and the old split-partials
-  // path ~2.6x slower. LLAMA_ATTN_LEGACY=1 restores the split partials +
-  // combine path (used for A/B and as a numeric reference); LLAMA_ATTN_V1=1
-  // keeps the scalar warp kernel, which the vectorized one below supersedes.
-  if (!getenv("LLAMA_ATTN_LEGACY") && head_size == 128 && table_stride > 0) {
+  // Decode fast path: paged_attn_warp2_kernel_bf16 — one warp per (batch row,
+  // q head), 4-deep pipelined K/V loads, warp-shuffle online softmax, no
+  // block-wide syncs. At decode shapes it runs at the memory-traffic floor;
+  // group-shared smem staging measured 2.5x slower (page loads serialize
+  // behind __syncthreads) and the split-partials path below ~2.6x slower.
+  // That leaves the split-partials path as the fallback for geometries warp2
+  // does not serve: head_size != 128 (it owns exactly 4 head dims per lane),
+  // the continuous block-table layout (table_stride == 0) and block_size < 4
+  // (its group of 4 positions must stay inside one page).
+  if (head_size == 128 && table_stride > 0 && block_size >= 4) {
     const int warps_per_block = 256 / 32;
     const int total_warps = batch * head_num;
     const int block_shift = block_shift_for(block_size);
     const unsigned grid = (total_warps + warps_per_block - 1) / warps_per_block;
-    if (!getenv("LLAMA_ATTN_V1") && block_size >= 4) {
-      paged_attn_warp2_kernel_bf16<<<grid, 256, 0, stream>>>(
-          positions.ptr<int32_t>(), block_table.ptr<int32_t>(), table_stride, num_blocks,
-          block_size, block_shift, layer_idx, dim, query, output, kcache, vcache, kv_dim,
-          kv_head_num, head_num, head_size);
-      return;
-    }
-    paged_attn_warp_kernel_bf16<<<grid, 256, 0, stream>>>(
+    paged_attn_warp2_kernel_bf16<<<grid, 256, 0, stream>>>(
         positions.ptr<int32_t>(), block_table.ptr<int32_t>(), table_stride, num_blocks,
         block_size, block_shift, layer_idx, dim, query, output, kcache, vcache, kv_dim,
         kv_head_num, head_num, head_size);
     return;
   }
+  // Fallback (any head_size): per (batch row, q head, split) flash decoding
+  // into bf16 split partials, then a combine pass. Needs score_batch sized for
+  // batch * head_num * num_splits splits of (head_size + 2) elements.
   // s_p must hold the largest tile any split can own.
   int max_tile = (max_seq_len + num_splits - 1) / num_splits;
   int smem_bytes = (head_size + max_tile) * sizeof(float);
@@ -1115,6 +1010,428 @@ void paged_attention_cu_batch(int32_t head_num, int32_t layer_idx, int32_t num_b
       num_splits);
   paged_flash_decoding_combine_kernel_bf16<<<batch * head_num, 256, 0, stream>>>(
       partials, output, dim, head_num, head_size, num_splits, batch);
+}
+
+// ========== Paged prefill attention (FA2-style, one KV read per tile) =======
+// One 256-thread block per (q block of B_q = 8 rows, prefill sequence, kv
+// head): warp w owns row q_begin + w and all G = head_num / kv_head_num q
+// heads that read that kv head. The K/V rows of a kv tile are staged into
+// smem once per (CTA, tile) and consumed by every warp and every q head of
+// the group, so a prefill chunk's KV traffic drops from the decode kernel's
+// O(head_num * N^2 / 2) (each row re-reads its whole causal prefix once per q
+// head) to O(kv_head_num * ceil(N / B_q) * N / 2) — for Qwen3-4B (H=32,
+// kv_head=8) and B_q = 8 that is 32x less traffic per layer.
+//
+// The per-(row, head, position) arithmetic is deliberately the same sequence
+// of fp32 ops as paged_attn_warp2_kernel_bf16: 4 contiguous head dims per
+// lane, the softmax scale folded into q, groups of 4 positions sharing one
+// rescale, a 5-step shfl_xor score reduction, and the same < 4-position tail.
+// A prefill row therefore comes out bit-identical whether it ran here or on
+// the decode kernel, which is what lets mixed steps keep the exact same
+// sampled tokens (verify_tokens A/B).
+template <int G>
+__global__ void paged_prefill_kernel_bf16(
+    const int32_t* __restrict__ positions, const int32_t* __restrict__ seq_row_start,
+    const int32_t* __restrict__ block_table, int32_t table_stride, int32_t num_blocks,
+    int32_t block_size, int32_t block_shift, int32_t layer_idx, int32_t dim,
+    const __nv_bfloat16* __restrict__ query, __nv_bfloat16* __restrict__ output,
+    const __nv_bfloat16* __restrict__ key_cache, const __nv_bfloat16* __restrict__ value_cache,
+    int32_t kv_dim, int32_t kv_head_num, int32_t head_num, int32_t head_size) {
+  constexpr int kVec = 4;       // head dims per lane (one uint2 load per row)
+  constexpr int kGroup = 4;     // positions sharing one softmax rescale (as in warp2)
+  constexpr int kTileKv = 64;   // KV rows staged per tile
+  constexpr int kLoadVec = 8;   // bf16 per loader vector (16B, one uint4)
+  constexpr int kChunks = 128 / kLoadVec;  // loader vectors per row (head_size == 128)
+  constexpr int kPad = 136;     // 136 * 2B = 272B: rows stay 16B aligned
+  __shared__ __align__(16) __nv_bfloat16 s_k[kTileKv][kPad];
+  __shared__ __align__(16) __nv_bfloat16 s_v[kTileKv][kPad];
+  __shared__ int s_max_pos;
+
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int nwarps = blockDim.x >> 5;
+
+  const int seq = blockIdx.y;
+  const int kv_head = blockIdx.z;
+  const int row_start = seq_row_start[seq];
+  const int row_end = seq_row_start[seq + 1];
+  const int q_begin = row_start + blockIdx.x * nwarps;  // one q row per warp
+  // grid.x is sized from the batch's total prefill rows, so blocks past a
+  // short sequence's end exist and exit here (a few hundred ns each).
+  if (q_begin >= row_end) return;
+  const int row_stop = min(q_begin + nwarps, row_end);
+  const int my_row = q_begin + warp;
+  const bool active = my_row < row_stop;
+  const int limit = active ? positions[my_row] + 1 : 0;  // positions [0, limit)
+
+  // CTA-wide causal limit: no position beyond this needs to be staged. Rows
+  // are normally consecutive chunk tokens, but nothing guarantees it (a
+  // rewritten sequence can hold stale rows), so take a real max.
+  if (tid == 0) {
+    int m = 0;
+    for (int r = q_begin; r < row_stop; ++r) m = max(m, positions[r] + 1);
+    s_max_pos = m;
+  }
+  __syncthreads();
+  const int tiles = (s_max_pos + kTileKv - 1) / kTileKv;
+
+  const float scale = 1.f / sqrtf(static_cast<float>(head_size));
+  // q heads served by this kv head; G may exceed the exact group size when
+  // head_num is not a multiple of kv_head_num (head_num=36 / 8 -> 5,5,4,...).
+  const int head_begin = (kv_head * head_num + kv_head_num - 1) / kv_head_num;
+  const int head_end = ((kv_head + 1) * head_num + kv_head_num - 1) / kv_head_num;
+  const int heads_here = head_end - head_begin;
+
+  float q[G][kVec];
+  if (active) {
+#pragma unroll
+    for (int i = 0; i < G; ++i) {
+      if (i >= heads_here) break;
+      const __nv_bfloat16* q_head =
+          query + static_cast<int64_t>(my_row) * dim + (head_begin + i) * head_size + lane * kVec;
+      const uint2 raw = *reinterpret_cast<const uint2*>(q_head);
+      const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&raw);
+      q[i][0] = __bfloat162float(h[0].x) * scale;
+      q[i][1] = __bfloat162float(h[0].y) * scale;
+      q[i][2] = __bfloat162float(h[1].x) * scale;
+      q[i][3] = __bfloat162float(h[1].y) * scale;
+    }
+  }
+
+  float m_i[G];
+  float l_i[G];
+  float acc[G][kVec];
+#pragma unroll
+  for (int i = 0; i < G; ++i) {
+    m_i[i] = -FLT_MAX;
+    l_i[i] = 0.f;
+#pragma unroll
+    for (int c = 0; c < kVec; ++c) acc[i][c] = 0.f;
+  }
+
+  // All rows of a prefill sequence share one block table row (the scheduler
+  // writes it per batch row from the sequence's page table), so the CTA reads
+  // the first row's copy.
+  const int32_t* table_row = block_table + static_cast<int64_t>(row_start) * table_stride;
+  const int64_t layer_base = static_cast<int64_t>(layer_idx) * num_blocks * block_size * kv_dim;
+  const int kv_head_off = (head_begin * kv_head_num / head_num) * head_size;
+
+  for (int t = 0; t < tiles; ++t) {
+    // tile_pos is the sequence position of this tile's first KV row; the tile
+    // covers positions [tile_pos, tile_pos + kTileKv) of the sequence.
+    const int tile_pos = t * kTileKv;
+    const int tile_n = min(kTileKv, s_max_pos - tile_pos);
+    // Cooperative load: thread -> (row, 16B chunk of the 128-dim head slice).
+    // kChunks divides the CTA size, so chunk = tid % kChunks addresses like an
+    // AoS store and row_off walks the tile in CTA-wide strides.
+    const int chunk = tid % kChunks;
+    const int row_off = tid / kChunks;
+    const int ch = chunk * kLoadVec;
+    for (int r = row_off; r < tile_n; r += blockDim.x / kChunks) {
+      const int gpos = tile_pos + r;
+      const int32_t pg = __ldg(table_row + (gpos >> block_shift));
+      const int64_t src = layer_base + static_cast<int64_t>(pg) * (block_size * kv_dim) +
+                          static_cast<int64_t>(gpos & (block_size - 1)) * kv_dim + kv_head_off +
+                          ch;
+      *reinterpret_cast<uint4*>(&s_k[r][ch]) =
+          *reinterpret_cast<const uint4*>(key_cache + src);
+      *reinterpret_cast<uint4*>(&s_v[r][ch]) =
+          *reinterpret_cast<const uint4*>(value_cache + src);
+    }
+    __syncthreads();
+
+    if (active) {
+      const int p_end = min(tile_pos + kTileKv, limit);
+      int p = tile_pos;
+      // Complete groups of 4 positions: one rescale per group, exactly the
+      // walk warp2 makes over the same prefix.
+      for (; p + kGroup <= p_end; p += kGroup) {
+        float kf[kGroup][kVec];
+        float vf[kGroup][kVec];
+        const int sp = p - tile_pos;
+#pragma unroll
+        for (int j = 0; j < kGroup; ++j) {
+          // The K/V slice of a kv head is shared by all G q heads, so it is
+          // read once per (position, lane) and reused across the head loop.
+          const uint2 kraw = *reinterpret_cast<const uint2*>(&s_k[sp + j][lane * kVec]);
+          const uint2 vraw = *reinterpret_cast<const uint2*>(&s_v[sp + j][lane * kVec]);
+          const __nv_bfloat162* kh = reinterpret_cast<const __nv_bfloat162*>(&kraw);
+          const __nv_bfloat162* vh = reinterpret_cast<const __nv_bfloat162*>(&vraw);
+          kf[j][0] = __bfloat162float(kh[0].x);
+          kf[j][1] = __bfloat162float(kh[0].y);
+          kf[j][2] = __bfloat162float(kh[1].x);
+          kf[j][3] = __bfloat162float(kh[1].y);
+          vf[j][0] = __bfloat162float(vh[0].x);
+          vf[j][1] = __bfloat162float(vh[0].y);
+          vf[j][2] = __bfloat162float(vh[1].x);
+          vf[j][3] = __bfloat162float(vh[1].y);
+        }
+#pragma unroll
+        for (int i = 0; i < G; ++i) {
+          if (i >= heads_here) break;
+          float s[kGroup];
+#pragma unroll
+          for (int j = 0; j < kGroup; ++j) {
+            s[j] = q[i][0] * kf[j][0] + q[i][1] * kf[j][1] + q[i][2] * kf[j][2] +
+                   q[i][3] * kf[j][3];
+          }
+#pragma unroll
+          for (int j = 0; j < kGroup; ++j) {
+#pragma unroll
+            for (int off = 16; off; off >>= 1) {
+              s[j] += __shfl_xor_sync(0xffffffffu, s[j], off);
+            }
+          }
+          float m_new = m_i[i];
+#pragma unroll
+          for (int j = 0; j < kGroup; ++j) {
+            m_new = fmaxf(m_new, s[j]);
+          }
+          const float alpha = __expf(m_i[i] - m_new);
+          float l_new = l_i[i] * alpha;
+          float pr[kGroup];
+#pragma unroll
+          for (int j = 0; j < kGroup; ++j) {
+            pr[j] = __expf(s[j] - m_new);
+            l_new += pr[j];
+          }
+#pragma unroll
+          for (int c = 0; c < kVec; ++c) {
+            float a = acc[i][c] * alpha;
+#pragma unroll
+            for (int j = 0; j < kGroup; ++j) {
+              a += pr[j] * vf[j][c];
+            }
+            acc[i][c] = a;
+          }
+          m_i[i] = m_new;
+          l_i[i] = l_new;
+        }
+      }
+      // Fewer than 4 positions left in this row's prefix (warp2's tail).
+      for (; p < p_end; ++p) {
+        const int sp = p - tile_pos;
+        const uint2 kraw = *reinterpret_cast<const uint2*>(&s_k[sp][lane * kVec]);
+        const uint2 vraw = *reinterpret_cast<const uint2*>(&s_v[sp][lane * kVec]);
+        const __nv_bfloat162* kh = reinterpret_cast<const __nv_bfloat162*>(&kraw);
+        const __nv_bfloat162* vh = reinterpret_cast<const __nv_bfloat162*>(&vraw);
+        const float kf0 = __bfloat162float(kh[0].x);
+        const float kf1 = __bfloat162float(kh[0].y);
+        const float kf2 = __bfloat162float(kh[1].x);
+        const float kf3 = __bfloat162float(kh[1].y);
+        const float vf0 = __bfloat162float(vh[0].x);
+        const float vf1 = __bfloat162float(vh[0].y);
+        const float vf2 = __bfloat162float(vh[1].x);
+        const float vf3 = __bfloat162float(vh[1].y);
+#pragma unroll
+        for (int i = 0; i < G; ++i) {
+          if (i >= heads_here) break;
+          float s = q[i][0] * kf0 + q[i][1] * kf1 + q[i][2] * kf2 + q[i][3] * kf3;
+#pragma unroll
+          for (int off = 16; off; off >>= 1) {
+            s += __shfl_xor_sync(0xffffffffu, s, off);
+          }
+          const float m_new = fmaxf(m_i[i], s);
+          const float alpha = __expf(m_i[i] - m_new);
+          const float pr = __expf(s - m_new);
+          l_i[i] = l_i[i] * alpha + pr;
+          acc[i][0] = acc[i][0] * alpha + pr * vf0;
+          acc[i][1] = acc[i][1] * alpha + pr * vf1;
+          acc[i][2] = acc[i][2] * alpha + pr * vf2;
+          acc[i][3] = acc[i][3] * alpha + pr * vf3;
+          m_i[i] = m_new;
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  if (!active) return;
+#pragma unroll
+  for (int i = 0; i < G; ++i) {
+    if (i >= heads_here) break;
+    const float inv_l = 1.f / l_i[i];
+    const int64_t out_base =
+        static_cast<int64_t>(my_row) * dim + (head_begin + i) * head_size + lane * kVec;
+    __nv_bfloat162 o[2];
+    o[0] = __floats2bfloat162_rn(acc[i][0] * inv_l, acc[i][1] * inv_l);
+    o[1] = __floats2bfloat162_rn(acc[i][2] * inv_l, acc[i][3] * inv_l);
+    *reinterpret_cast<uint2*>(output + out_base) = *reinterpret_cast<const uint2*>(o);
+  }
+}
+
+// ========== Mixed decode + prefill dispatch (see paged_kernels.cuh) ==========
+namespace {
+// Zero-copy view of rows [row_offset, row_offset + rows) of a [batch, width]
+// tensor (width == 0: a flat [batch] tensor). Rows are contiguous at a fixed
+// stride, so the view needs no data movement.
+tensor::Tensor row_range_view(const tensor::Tensor& src, int32_t row_offset, int32_t rows,
+                              int32_t width) {
+  const size_t elem = base::DataTypeSize(src.data_type());
+  uint8_t* base = const_cast<uint8_t*>(src.ptr<uint8_t>());
+  if (width > 0) {
+    base += static_cast<int64_t>(row_offset) * width * elem;
+    tensor::Tensor view(src.data_type(), std::vector<int32_t>{rows, width}, false, nullptr, base);
+    view.set_device_type(src.device_type());
+    return view;
+  }
+  base += static_cast<int64_t>(row_offset) * elem;
+  tensor::Tensor view(src.data_type(), std::vector<int32_t>{rows}, false, nullptr, base);
+  view.set_device_type(src.device_type());
+  return view;
+}
+
+// Geometry paged_prefill_kernel_bf16 can serve: the kernel reproduces warp2's
+// arithmetic, so it inherits warp2's head_size == 128 (4 head dims per lane),
+// needs a paged block table (table_stride > 0) and at least 4 positions per
+// page (kGroup positions per rescale must not straddle pages). Its CTA maps one
+// q row per warp and one kv head per block, with one kernel instantiation per
+// q-heads-per-kv-head group, so an uneven GQA split is fine as long as the
+// ceil ratio fits in the 1..8 range of instantiations.
+static bool prefill_geometry_ok(int32_t head_num, int32_t kv_head_num, int32_t head_size,
+                                int32_t table_stride, int32_t block_size) {
+  if (head_num <= 0 || kv_head_num <= 0) return false;
+  const int32_t heads_per_kv = (head_num + kv_head_num - 1) / kv_head_num;
+  return head_size == 128 && table_stride > 0 && block_size >= 4 &&
+         (block_size & (block_size - 1)) == 0 && heads_per_kv <= 8;
+}
+}  // namespace
+
+// Prefill-row attention: rows [row_begin, batch) are prefill rows of
+// num_prefill_seqs sequences, seq_row_start[s] .. seq_row_start[s+1) being the
+// rows of sequence s. Each row is one prompt token with its own position, and
+// every row attends to the full causal prefix [0, pos] — the KV of earlier
+// chunks (and of a prefix-cache hit) is already in the cache by the time
+// attention runs, so no chunk bookkeeping is needed here.
+//
+// This wrapper picks the kernel's G = q heads per kv head instantiation and
+// sizes the grid. Callers must have checked prefill_geometry_ok() first:
+// paged_attention_dispatch owns that decision because the only correct thing
+// to do with an unservable geometry is to leave the prefill rows on the decode
+// kernel, which needs the caller's partials buffer.
+void paged_prefill_attention_cu_batch(int32_t row_begin, int32_t head_num, int32_t layer_idx,
+                                      int32_t num_blocks, int32_t block_size, int32_t kv_dim,
+                                      int32_t kv_head_num, int32_t head_size,
+                                      const tensor::Tensor* seq_row_start,
+                                      int32_t num_prefill_seqs, const tensor::Tensor& positions,
+                                      const tensor::Tensor& block_table,
+                                      const tensor::Tensor& query_batch,
+                                      const tensor::Tensor& mha_out,
+                                      const tensor::Tensor& key_cache,
+                                      const tensor::Tensor& value_cache, CudaConfig* config) {
+  const int32_t batch = positions.get_dim(0);
+  const int32_t rows = batch - row_begin;
+  if (rows <= 0 || num_prefill_seqs <= 0 || seq_row_start == nullptr) return;
+  CHECK(config != nullptr);
+  const int32_t dim = query_batch.get_dim(1);
+  const int32_t table_stride = block_table.get_dim(1);
+  // Rounded up: with an uneven GQA split (head_num not a multiple of
+  // kv_head_num) the per-kv-head groups hold ceil or floor of the ratio.
+  const int32_t heads_per_kv = (head_num + kv_head_num - 1) / kv_head_num;
+  CHECK(prefill_geometry_ok(head_num, kv_head_num, head_size, table_stride, block_size))
+      << "paged_prefill_kernel_bf16 cannot serve head_size=" << head_size
+      << " table_stride=" << table_stride << " block_size=" << block_size
+      << " kv_head_num=" << kv_head_num << "; the prefill rows must stay on the decode kernel.";
+
+  const int32_t block_shift = block_shift_for(block_size);
+  constexpr int kWarpsPerBlock = 8;  // one q row per warp, 8 rows per block
+  // grid.x is bounded by the batch's total prefill rows, which is >= the
+  // longest prefill sequence in the batch: blocks past a sequence's end exit
+  // immediately (2 loads) instead of needing a host-side max_q_len.
+  const dim3 grid((rows + kWarpsPerBlock - 1) / kWarpsPerBlock, num_prefill_seqs, kv_head_num);
+  const dim3 block(32 * kWarpsPerBlock);
+  const int32_t* pos = positions.ptr<int32_t>();
+  const int32_t* row_map = seq_row_start->ptr<int32_t>();
+  const int32_t* table = block_table.ptr<int32_t>();
+  const __nv_bfloat16* query = query_batch.ptr<__nv_bfloat16>();
+  __nv_bfloat16* output = const_cast<__nv_bfloat16*>(mha_out.ptr<__nv_bfloat16>());
+  const __nv_bfloat16* kcache = key_cache.ptr<__nv_bfloat16>();
+  const __nv_bfloat16* vcache = value_cache.ptr<__nv_bfloat16>();
+  cudaStream_t stream = config->stream;
+  switch (heads_per_kv) {
+    case 1:
+      paged_prefill_kernel_bf16<1><<<grid, block, 0, stream>>>(
+          pos, row_map, table, table_stride, num_blocks, block_size, block_shift, layer_idx, dim,
+          query, output, kcache, vcache, kv_dim, kv_head_num, head_num, head_size);
+      break;
+    case 2:
+      paged_prefill_kernel_bf16<2><<<grid, block, 0, stream>>>(
+          pos, row_map, table, table_stride, num_blocks, block_size, block_shift, layer_idx, dim,
+          query, output, kcache, vcache, kv_dim, kv_head_num, head_num, head_size);
+      break;
+    case 3:
+      paged_prefill_kernel_bf16<3><<<grid, block, 0, stream>>>(
+          pos, row_map, table, table_stride, num_blocks, block_size, block_shift, layer_idx, dim,
+          query, output, kcache, vcache, kv_dim, kv_head_num, head_num, head_size);
+      break;
+    case 4:
+      paged_prefill_kernel_bf16<4><<<grid, block, 0, stream>>>(
+          pos, row_map, table, table_stride, num_blocks, block_size, block_shift, layer_idx, dim,
+          query, output, kcache, vcache, kv_dim, kv_head_num, head_num, head_size);
+      break;
+    case 5:
+      paged_prefill_kernel_bf16<5><<<grid, block, 0, stream>>>(
+          pos, row_map, table, table_stride, num_blocks, block_size, block_shift, layer_idx, dim,
+          query, output, kcache, vcache, kv_dim, kv_head_num, head_num, head_size);
+      break;
+    case 6:
+      paged_prefill_kernel_bf16<6><<<grid, block, 0, stream>>>(
+          pos, row_map, table, table_stride, num_blocks, block_size, block_shift, layer_idx, dim,
+          query, output, kcache, vcache, kv_dim, kv_head_num, head_num, head_size);
+      break;
+    case 7:
+      paged_prefill_kernel_bf16<7><<<grid, block, 0, stream>>>(
+          pos, row_map, table, table_stride, num_blocks, block_size, block_shift, layer_idx, dim,
+          query, output, kcache, vcache, kv_dim, kv_head_num, head_num, head_size);
+      break;
+    default:
+      paged_prefill_kernel_bf16<8><<<grid, block, 0, stream>>>(
+          pos, row_map, table, table_stride, num_blocks, block_size, block_shift, layer_idx, dim,
+          query, output, kcache, vcache, kv_dim, kv_head_num, head_num, head_size);
+      break;
+  }
+}
+
+void paged_attention_dispatch(int32_t head_num, int32_t layer_idx, int32_t num_blocks,
+                              int32_t block_size, int32_t kv_dim, int32_t kv_head_num,
+                              int32_t head_size, int32_t num_decode_rows,
+                              const tensor::Tensor* seq_row_start, int32_t num_prefill_seqs,
+                              const tensor::Tensor& positions, const tensor::Tensor& block_table,
+                              const tensor::Tensor& query_batch, tensor::Tensor& score_batch,
+                              const tensor::Tensor& mha_out, const tensor::Tensor& key_cache,
+                              const tensor::Tensor& value_cache, CudaConfig* config) {
+  const int32_t batch = query_batch.get_dim(0);
+  CHECK(config != nullptr);
+  const int32_t decode_rows = std::max(0, std::min(num_decode_rows, batch));
+  const bool has_prefill = decode_rows < batch && seq_row_start != nullptr &&
+                           num_prefill_seqs > 0;
+  const int32_t dim = query_batch.get_dim(1);
+  const int32_t table_stride = block_table.get_dim(1);
+  // Only a geometry both kernels serve can be split by row type: the decode
+  // rows go to warp2 and the prefill rows to the prefill kernel, each writing
+  // its own row range of mha_out. Anything else (head_size != 128, an
+  // unsupported page size, no prefill rows at all) keeps the whole batch on
+  // paged_attention_cu_batch, which dispatches per kernel internally.
+  if (!has_prefill ||
+      !prefill_geometry_ok(head_num, kv_head_num, head_size, table_stride, block_size)) {
+    paged_attention_cu_batch(head_num, layer_idx, num_blocks, block_size, kv_dim, kv_head_num,
+                             head_size, positions, block_table, query_batch, score_batch, mha_out,
+                             key_cache, value_cache, config);
+    return;
+  }
+  if (decode_rows > 0) {
+    paged_attention_cu_batch(head_num, layer_idx, num_blocks, block_size, kv_dim, kv_head_num,
+                             head_size, row_range_view(positions, 0, decode_rows, 0),
+                             row_range_view(block_table, 0, decode_rows, table_stride),
+                             row_range_view(query_batch, 0, decode_rows, dim), score_batch,
+                             row_range_view(mha_out, 0, decode_rows, dim), key_cache, value_cache,
+                             config);
+  }
+  paged_prefill_attention_cu_batch(decode_rows, head_num, layer_idx, num_blocks, block_size,
+                                   kv_dim, kv_head_num, head_size, seq_row_start, num_prefill_seqs,
+                                   positions, block_table, query_batch, mha_out, key_cache,
+                                   value_cache, config);
 }
 
 }  // namespace kernel

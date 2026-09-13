@@ -60,6 +60,9 @@ class LLamaModel : public Model {
       tensor::Tensor& value_cache,
       tensor::Tensor& logits,
       bool need_logits = true,
+      int32_t num_decode_rows = 0,
+      const tensor::Tensor* seq_row_start = nullptr,
+      int32_t num_prefill_seqs = 0,
       BatchScratch* scratch = nullptr) const override;
 
   op::EmbeddingOutput embedding(const std::vector<int>& tokens) const override;
