@@ -215,6 +215,9 @@ struct ServingMetrics {
   double kv_cache_util_global = 0;   // 时间加权:已用 token 槽 / 已分配容量
   double kv_cache_frag_global = 0;   // 1 - util_global
   double kv_cache_frag_per_seq = 0;  // 每请求视角(与 offline 口径一致)
+  // Prefix-cache counters: all zero here, the serving benchmark runs with the
+  // cache off (independent prompts share no prefix).
+  scheduler::PrefixCacheStats prefix;
   double avg_busy_kv_slots = 0, peak_busy_kv_slots = 0;
 
   // 系统
@@ -293,7 +296,10 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
       max_batch = requested_batch;
     }
   }
-  Scheduler sched(model, max_batch, max_total_seq_len, args.max_gen, block_size);
+  // Prefix caching off: serving requests are independent, so caching only adds
+  // hashing and pinned KV blocks (see Scheduler's enable_prefix_cache).
+  Scheduler sched(model, max_batch, max_total_seq_len, args.max_gen, block_size,
+                  /*enable_prefix_cache=*/false);
 
   // ---- 预热:与正式压测共用同一 Scheduler(同 offline,统计中跳过) ----
   // 每轮提交 warmup_requests(默认 = max_batch)个相同 prompt,请求同步完成
@@ -514,6 +520,7 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
   m.gpu_sm_util_pct = sampler.sm_util_pct();
   m.gpu_mem_util_pct = sampler.mem_util_pct();
   m.gpu_mem_used_mb = sampler.mem_used_mb();
+  m.prefix = sched.prefix_cache_stats();
 
   return m;
 }
@@ -538,7 +545,9 @@ static void write_csv(const std::string& path,
        "kv_cache_util_global,kv_cache_frag_global,kv_cache_frag_per_seq,"
        "avg_busy_kv_slots,peak_busy_kv_slots,"
        "avg_batch_size,avg_batch_reconstruct_ms,p99_batch_reconstruct_ms,"
-       "mfu,peak_tflops,gpu_sm_util_pct,gpu_mem_util_pct,gpu_mem_used_mb\n";
+       "mfu,peak_tflops,gpu_sm_util_pct,gpu_mem_util_pct,gpu_mem_used_mb,"
+       "prefix_cache_lookups,prefix_cache_hits,prefix_cache_hit_rate,"
+       "prefix_cache_matched_blocks,prefix_cache_inserts,prefix_cache_evictions\n";
   f << std::fixed << std::setprecision(6);
   for (const auto& r : results) {
     f << r.run_id << "," << r.request_rate << "," << r.burstiness << ","
@@ -557,7 +566,10 @@ static void write_csv(const std::string& path,
       << r.peak_busy_kv_slots << "," << r.avg_batch_size << ","
       << r.avg_batch_reconstruct_ms << "," << r.p99_batch_reconstruct_ms << ","
       << r.mfu << "," << r.peak_tflops << "," << r.gpu_sm_util_pct << ","
-      << r.gpu_mem_util_pct << "," << r.gpu_mem_used_mb << "\n";
+      << r.gpu_mem_util_pct << "," << r.gpu_mem_used_mb << ","
+      << r.prefix.lookups << "," << r.prefix.hits << ","
+      << r.prefix.hit_rate() << "," << r.prefix.matched_blocks << ","
+      << r.prefix.inserts << "," << r.prefix.evictions << "\n";
   }
   f.close();
 }
@@ -630,6 +642,11 @@ static void print_report(const ServingMetrics& r, const Args& args) {
   std::cout << "GPU SM util (NVML):                     " << r.gpu_sm_util_pct << "%\n";
   std::cout << "GPU mem util (NVML):                    " << r.gpu_mem_util_pct
             << "%  (used " << r.gpu_mem_used_mb << " MB)\n";
+  std::cout << "Prefix cache:                           lookups=" << r.prefix.lookups
+            << " hits=" << r.prefix.hits << " (" << r.prefix.hit_rate() * 100.0
+            << "%)  matched_blocks=" << r.prefix.matched_blocks
+            << "  inserts=" << r.prefix.inserts << "  evictions=" << r.prefix.evictions
+            << "\n";
   std::cout << "====================================================\n";
 }
 

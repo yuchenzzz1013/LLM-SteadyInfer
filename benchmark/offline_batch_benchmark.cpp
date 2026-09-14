@@ -153,6 +153,8 @@ static void print_usage(const char* prog) {
 struct RunMetrics {
   int run_id = 0;
   int num_requests = 0, completed = 0, rejected = 0;
+  // Prefix-cache counters for this run (all zero when it is disabled).
+  scheduler::PrefixCacheStats prefix;
   long long prompt_tokens = 0, output_tokens = 0, total_tokens = 0;
   double wall_time_s = 0;
 
@@ -214,8 +216,11 @@ static RunMetrics run_once(const std::shared_ptr<model::Model>& model,
   // 分页块大小按工作负载平均 prompt 长度自适应(短文本 8/长文本 32/默认 16)。
   const long long avg_prompt_len =
       prompt_tokens.empty() ? 0 : prompt_len_sum / static_cast<long long>(prompt_tokens.size());
+  // Prefix caching off: offline prompts are independent questions with no
+  // shared prefix, so caching only adds hashing and pinned KV blocks.
   Scheduler sched(model, max_batch, max_total_seq_len, max_gen_len,
-                  Scheduler::resolve_block_size(avg_prompt_len));
+                  Scheduler::resolve_block_size(avg_prompt_len),
+                  /*enable_prefix_cache=*/false);
 
   // ---- 预热:与正式压测共用同一 Scheduler ----
   // decode CUDA graph 在首次 decode 时捕获并烘焙当时 KV/logits 的设备指针;
@@ -388,6 +393,12 @@ static RunMetrics run_once(const std::shared_ptr<model::Model>& model,
   m.gpu_mem_util_pct = sampler.mem_util_pct();
   m.gpu_mem_used_mb = sampler.mem_used_mb();
 
+  // ---- prefix cache ----
+  // Zero whenever the cache is off (Scheduler returns an all-zero stats). A
+  // hit rate near 0 on this workload is the expected result and the reason the
+  // cache is off by default: independent prompts share no prefix.
+  m.prefix = sched.prefix_cache_stats();
+
   return m;
 }
 
@@ -409,7 +420,9 @@ static void write_csv(const std::string& path,
        "avg_busy_kv_slots,peak_busy_kv_slots,"
        "avg_batch_reconstruct_ms,p99_batch_reconstruct_ms,"
        "avg_batch_size,avg_decode_batch,throughput_efficiency,theoretical_peak_tps,"
-       "mfu,peak_tflops,gpu_sm_util_pct,gpu_mem_util_pct,gpu_mem_used_mb\n";
+       "mfu,peak_tflops,gpu_sm_util_pct,gpu_mem_util_pct,gpu_mem_used_mb,"
+       "prefix_cache_lookups,prefix_cache_hits,prefix_cache_hit_rate,"
+       "prefix_cache_matched_blocks,prefix_cache_inserts,prefix_cache_evictions\n";
   f << std::fixed << std::setprecision(6);
   for (const auto& r : results) {
     f << r.run_id << "," << r.num_requests << "," << r.completed << ","
@@ -426,7 +439,10 @@ static void write_csv(const std::string& path,
       << r.avg_decode_batch << "," << r.throughput_efficiency << ","
       << r.theoretical_peak_tps << "," << r.mfu << "," << r.peak_tflops << ","
       << r.gpu_sm_util_pct << "," << r.gpu_mem_util_pct << ","
-      << r.gpu_mem_used_mb << "\n";
+      << r.gpu_mem_used_mb << "," << r.prefix.lookups << ","
+      << r.prefix.hits << "," << r.prefix.hit_rate() << ","
+      << r.prefix.matched_blocks << "," << r.prefix.inserts << ","
+      << r.prefix.evictions << "\n";
   }
   f.close();
 }
@@ -488,7 +504,15 @@ static void print_report(const RunMetrics& r) {
   std::cout << "  ITL : avg=" << r.itl_avg_ms << " ms  p99=" << r.itl_p99_ms
             << " ms\n";
   std::cout << "  E2E : avg=" << r.e2e_avg_ms << " ms  p99=" << r.e2e_p99_ms
-            << " ms\n";
+            << " ms\n\n";
+
+  std::cout << "--- prefix cache ---\n";
+  std::cout << std::setprecision(2);
+  std::cout << "  lookups=" << r.prefix.lookups << "  hits=" << r.prefix.hits
+            << "  hit_rate=" << pct(r.prefix.hit_rate()) << "%"
+            << "  matched_blocks=" << r.prefix.matched_blocks << "\n";
+  std::cout << "  inserts=" << r.prefix.inserts << "  evictions=" << r.prefix.evictions
+            << "  (禁用时全为 0)\n";
   std::cout << "====================================================\n";
 }
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstdint>
 #include <vector>
 
 namespace scheduler {
@@ -30,6 +31,15 @@ struct Sequence {
   bool is_prefill_complete = false;
   int next_prefill_chunk_start = 0;  // chunked prefill progress (tokens prefilled)
   int max_gen_len = 2048;
+
+  // Prefix-cache progress: prefix_hash_chain[b] is the chained hash of prompt
+  // block b, and the chain's length is how many leading prompt blocks have
+  // already been recorded in the cache. The chain is built incrementally as
+  // chunks complete (a block is only hashed/inserted once), and blocks matched
+  // from the cache at admission are skipped by the same cursor — their hashes
+  // are recomputed from the prompt tokens, which is all the chain needs to keep
+  // going (the entries themselves already exist and are deduplicated on insert).
+  std::vector<uint64_t> prefix_hash_chain;
 
   // Per-request latency tracking
   TimePoint arrival_time;            // When the request was submitted (add_request)

@@ -17,11 +17,17 @@ class Scheduler {
   // max_gen_len: per-request generation token limit (clamped to fit in cache).
   // block_size: paged pool block size; 0 = env LLAMA_BLOCK_SIZE, else the
   // workload heuristic (see resolve_block_size).
+  // enable_prefix_cache: content-hash prefix caching (paged mode only). Off by
+  // default — benchmark workloads (offline / online) have no shared prefixes,
+  // so hashing and pinned KV blocks are pure overhead there; multi-turn chat,
+  // where every turn re-sends the whole history, turns it on explicitly.
+  // LLAMA_ENABLE_PREFIX_CACHE=1 forces it on for A/B runs.
   Scheduler(std::shared_ptr<model::Model> model,
             int max_batch_size,
             int max_seq_len,
             int max_gen_len = 0,
-            int block_size = 0);
+            int block_size = 0,
+            bool enable_prefix_cache = false);
 
   // Verifies the block pool invariant (no refcount leak stranded blocks).
   ~Scheduler();
@@ -47,6 +53,11 @@ class Scheduler {
 
   // 等待队列长度(在线压测的排队指标)
   int num_waiting() const { return static_cast<int>(waiting_queue_.size()); }
+
+  // Prefix-cache effectiveness (all zero when the cache is disabled). Lets a
+  // driver decide from measured hit_rate whether a workload is worth it.
+  bool prefix_cache_enabled() const { return prefix_cache_ != nullptr; }
+  const PrefixCacheStats& prefix_cache_stats() const;
 
   // Runtime-selected paged block size from the workload's average prompt
   // length: short prompts waste less capacity with small pages, long prompts
@@ -85,14 +96,20 @@ class Scheduler {
   void truncate_sequence(Sequence& seq, int keep_blocks);
   // Lazy block growth: make sure seq owns blocks up to `position`.
   bool ensure_blocks_for(Sequence* seq, int position);
+  // Record the prompt blocks whose KV this step's forward pass just committed
+  // (chunked prefill makes a prefix shareable as soon as its blocks complete,
+  // not only when the whole prompt is done).
+  void record_committed_prefill();
   // Unrecoverable forward failure: retire every running sequence.
   void force_finish_all(const char* reason);
 
   std::shared_ptr<model::Model> model_;
   std::unique_ptr<KVManager> kv_manager_;
-  // Content-hash prefix cache (paged mode only; nullptr when disabled via
-  // LLAMA_DISABLE_PREFIX_CACHE=1). Shares whole-block prompt prefixes
-  // read-only and skips their prefill.
+  // Content-hash prefix cache (paged mode only; nullptr unless enabled via
+  // the constructor's enable_prefix_cache). Shares whole-block prompt prefixes
+  // read-only and skips their prefill; its entries pin the blocks they point
+  // at (CACHED state), and it is the allocator's reclaim source when the pool
+  // runs dry.
   std::unique_ptr<PrefixCache> prefix_cache_;
   tensor::Tensor logits_;  // preallocated [max_batch_size, vocab_size], model compute dtype
   // Prefill row map for mixed steps: seq_row_start[i] is the first batch row of

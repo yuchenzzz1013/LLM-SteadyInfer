@@ -72,8 +72,12 @@ int main(int argc, char* argv[]) {
   }
 
   // Warmup through the same scheduler path (exercises CUDA-graph capture).
+  // Prefix caching stays off in both schedulers: this driver compares token
+  // ids across builds, so the shared/KV block bookkeeping must not be able to
+  // influence the sampled tokens.
   {
-    scheduler::Scheduler warm_sched(model, 1, 128, 8);
+    scheduler::Scheduler warm_sched(model, 1, 128, 8, /*block_size=*/0,
+                                    /*enable_prefix_cache=*/false);
     auto t = model->encode("warm up");
     if (t.empty()) t = {1};
     warm_sched.add_request(t);
@@ -84,7 +88,8 @@ int main(int argc, char* argv[]) {
   auto tokens = model->encode(prompt);
   if (tokens.empty()) tokens = {1};
   int max_seq_len = static_cast<int>(tokens.size()) + max_gen;
-  scheduler::Scheduler sched(model, 1, max_seq_len, max_gen);
+  scheduler::Scheduler sched(model, 1, max_seq_len, max_gen, /*block_size=*/0,
+                             /*enable_prefix_cache=*/false);
   sched.add_request(tokens);
   while (!sched.all_finished()) sched.step();
   cudaDeviceSynchronize();

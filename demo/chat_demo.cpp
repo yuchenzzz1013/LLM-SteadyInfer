@@ -37,6 +37,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -379,7 +380,12 @@ struct ChatEngine {
     // 调度器:负责 KV cache 分配、prefill / decode 与采样。paged 布局下池子按
     // max_batch x ceil(ctx/block_size) 个块预分配,所以 max_batch 是"占多少显存"
     // 的直接旋钮。
-    sched = std::make_unique<scheduler::Scheduler>(model, max_batch, ctx, args.max_new_tokens);
+    //
+    // 连续对话每轮重发完整历史 → 与前一轮共享长前缀,开启 prefix cache:
+    // 整块复用上一轮已算好的 KV,只 prefill 新增的尾巴,TTFT 与算力都省。
+    sched = std::make_unique<scheduler::Scheduler>(model, max_batch, ctx, args.max_new_tokens,
+                                                   /*block_size=*/0,
+                                                   /*enable_prefix_cache=*/true);
     kv_bytes = static_cast<long long>(max_batch) * ctx * kv_bytes_per_token();
     return true;
   }
@@ -400,6 +406,8 @@ struct Generation {
   int num_tokens = 0;
   double ttft_ms = 0;   // 首 token 延迟(含 prefill)
   double total_ms = 0;  // 端到端
+  // 本轮从 prefix cache 复用的整块数:这些 prompt token 无需重新 prefill。
+  int64_t shared_blocks = 0;
 };
 
 // 跑一次请求:scheduler 一步一个 decode token 地推进,边跑边把新增 token 打出来。
@@ -408,6 +416,7 @@ Generation generate(const ChatEngine& engine, const std::vector<int32_t>& prompt
   Generation gen;
   const auto& model = engine.model;
   scheduler::Scheduler& sched = *engine.sched;
+  const int64_t matched_before = sched.prefix_cache_stats().matched_blocks;
   const int seq_id = sched.add_request(prompt_tokens);
   if (seq_id < 0) {
     std::cerr << "[错误] 请求被调度器拒绝(prompt 放不进 KV cache)\n";
@@ -452,6 +461,8 @@ Generation generate(const ChatEngine& engine, const std::vector<int32_t>& prompt
   }
   gen.text = model->decode(ids);
   gen.num_tokens = static_cast<int>(ids.size());
+  // 本 demo 一次只跑一个请求,所以统计增量就是本轮的命中块数。
+  gen.shared_blocks = sched.prefix_cache_stats().matched_blocks - matched_before;
   // 延迟打点取自序列本身(提交 → 首个 token / 结束)
   if (done->num_generated_tokens > 0 && done->first_token_time > done->arrival_time) {
     gen.ttft_ms = ms_between(done->arrival_time, done->first_token_time);
@@ -462,11 +473,33 @@ Generation generate(const ChatEngine& engine, const std::vector<int32_t>& prompt
   return gen;
 }
 
-void print_stats(const Generation& gen) {
+int sched_block_size(const ChatEngine& engine) {
+  return engine.sched ? engine.sched->get_block_size() : 0;
+}
+
+void print_stats(const Generation& gen, int block_size) {
   const double tps = gen.total_ms > 0 ? gen.num_tokens * 1000.0 / gen.total_ms : 0.0;
   std::cout << "[TTFT " << static_cast<long long>(gen.ttft_ms) << " ms | 生成 "
             << gen.num_tokens << " tokens | " << static_cast<long long>(gen.total_ms)
-            << " ms | " << static_cast<long long>(tps) << " tok/s]\n";
+            << " ms | " << static_cast<long long>(tps) << " tok/s";
+  if (gen.shared_blocks > 0) {
+    std::cout << " | 命中缓存 " << gen.shared_blocks << " 块(跳过 "
+              << gen.shared_blocks * block_size << " tokens prefill)";
+  }
+  std::cout << "]\n";
+}
+
+// 会话结束时的 prefix cache 汇总:多轮对话的命中率即"这一轮有多少 prompt
+// 是上一轮已经算过的"。
+void print_prefix_summary(const scheduler::Scheduler& sched) {
+  if (!sched.prefix_cache_enabled()) return;
+  const scheduler::PrefixCacheStats& st = sched.prefix_cache_stats();
+  std::printf("prefix cache: lookups=%lld hits=%lld hit_rate=%.1f%% matched_blocks=%lld "
+              "inserts=%lld evictions=%lld (block=%d tokens)\n",
+              static_cast<long long>(st.lookups), static_cast<long long>(st.hits),
+              st.hit_rate() * 100.0, static_cast<long long>(st.matched_blocks),
+              static_cast<long long>(st.inserts), static_cast<long long>(st.evictions),
+              sched.get_block_size());
 }
 
 void print_commands() {
@@ -492,7 +525,9 @@ void print_banner(const ChatEngine& engine, const Args& args) {
             << "KV 池: " << engine.max_batch << " 槽 x " << engine.ctx << " tokens x "
             << (engine.kv_bytes_per_token() / 1024) << " KB/token = " << gb(engine.kv_bytes)
             << "(整块预分配)\n"
-            << "记忆: 开启(每轮携带全部历史,超出上下文时丢弃最旧的一轮)\n";
+            << "记忆: 开启(每轮携带全部历史,超出上下文时丢弃最旧的一轮)\n"
+            << "前缀复用(prefix cache): 开启(每轮重发完整历史,"
+               "复用的是上一轮已经算好的整块 KV)\n";
   if (engine.device_type == base::DeviceType::kDeviceCUDA) {
     size_t free_b = 0, total_b = 0;
     if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
@@ -645,7 +680,8 @@ int run(int argc, char** argv) {
     std::cout << "\nAI: " << std::flush;
     const Generation gen = generate(engine, prompt_tokens, args.stream);
     std::cout << "\n";
-    print_stats(gen);
+    std::cout << "[prompt " << prompt_tokens.size() << " tokens] ";
+    print_stats(gen, sched_block_size(engine));
 
     // ---- 回复写回记忆,下一轮就是"连续对话" ----
     const std::string reply = trim(strip_think(gen.text));
@@ -657,7 +693,9 @@ int run(int argc, char** argv) {
     history.push_back({"assistant", reply});
   }
 
-  std::cout << "\n再见。\n";
+  std::cout << "\n";
+  print_prefix_summary(*engine.sched);
+  std::cout << "再见。\n";
   return 0;
 }
 

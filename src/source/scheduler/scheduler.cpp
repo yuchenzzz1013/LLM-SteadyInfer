@@ -30,7 +30,8 @@ Scheduler::Scheduler(std::shared_ptr<model::Model> model,
                      int max_batch_size,
                      int max_seq_len,
                      int max_gen_len,
-                     int block_size)
+                     int block_size,
+                     bool enable_prefix_cache)
     : model_(model),
       max_batch_size_(max_batch_size),
       max_seq_len_(max_seq_len),
@@ -62,13 +63,26 @@ Scheduler::Scheduler(std::shared_ptr<model::Model> model,
                                              model_->device_type(), block_size_);
 
 #ifdef USE_PAGED_ATTENTION
-  // Prefix cache (content-hash block sharing): enabled by default in paged
-  // mode; LLAMA_DISABLE_PREFIX_CACHE=1 disables it.
-  {
-    const char* pc_env = std::getenv("LLAMA_DISABLE_PREFIX_CACHE");
-    if (!(pc_env && std::string(pc_env) == "1")) {
-      prefix_cache_ = std::make_unique<PrefixCache>(block_size_);
+  // Prefix cache (content-hash block sharing). Opt-in: benchmark workloads
+  // never share a prefix, so hashing + pinned blocks would be pure overhead.
+  // LLAMA_ENABLE_PREFIX_CACHE=1 forces it on (debug/A-B compare only).
+  if (!enable_prefix_cache) {
+    const char* force = std::getenv("LLAMA_ENABLE_PREFIX_CACHE");
+    if (force && std::string(force) == "1") {
+      enable_prefix_cache = true;
     }
+  }
+  if (enable_prefix_cache) {
+    prefix_cache_ = std::make_unique<PrefixCache>(block_size_);
+    // The pool lends the cache its overflow: when an allocation runs out of
+    // free blocks, evict LRU cache entries (only ones no sequence references)
+    // instead of failing the allocation. Registered here, after both objects
+    // exist, and cleared in ~Scheduler before either dies.
+    BlockAllocator* allocator = kv_manager_->block_allocator();
+    allocator->set_reclaim_fn([this](int needed) {
+      if (!prefix_cache_) return 0;
+      return prefix_cache_->evict(needed, *kv_manager_->block_allocator());
+    });
   }
 #endif
 
@@ -101,12 +115,20 @@ Scheduler::~Scheduler() {
   // The block pool is pure bookkeeping: refcount leaks (or double frees)
   // silently strand blocks. Verify the invariant before the pool dies.
   if (kv_manager_ && kv_manager_->block_allocator()) {
-    if (!kv_manager_->block_allocator()->invariant_holds()) {
+    BlockAllocator* allocator = kv_manager_->block_allocator();
+    allocator->clear_reclaim_fn();  // the callback captures `this`
+    if (!allocator->invariant_holds()) {
       LOG(FATAL) << "[SCHED] BlockAllocator invariant violated at scheduler "
-                    "destruction: refcount leak or double-free";
+                    "destruction: refcount leak or double-free ("
+                 << allocator->debug_string() << ")";
     }
   }
 #endif
+}
+
+const PrefixCacheStats& Scheduler::prefix_cache_stats() const {
+  static const PrefixCacheStats kNoCache;
+  return prefix_cache_ ? prefix_cache_->stats() : kNoCache;
 }
 
 int Scheduler::add_request(const std::vector<int>& prompt_tokens) {
@@ -188,6 +210,10 @@ void Scheduler::step() {
             << " is_pure_decode=" << (rows[0].is_decode ? 1 : 0);
 #endif
     execute_batch(rows);
+    // Prefix cache: the prefill chunks of this step are now committed KV.
+    // (A failed forward retires every running sequence, so nothing is recorded
+    // for KV that was never written.)
+    record_committed_prefill();
   } else {
 #ifndef NDEBUG
     VLOG(1) << "[SCHED] empty batch this step";
@@ -226,7 +252,7 @@ void Scheduler::try_admit_sequences() {
 
     // WAITING: reserve the prompt's blocks now; generation grows lazily
     // (ensure_blocks_for) so the pool serves more concurrent sequences.
-    int prompt_blocks = (seq.num_prompt_tokens + block_size_ - 1) / block_size_;
+    const int prompt_blocks = (seq.num_prompt_tokens + block_size_ - 1) / block_size_;
 
     // Prefix cache: whole-block prompt prefixes are shared read-only — only
     // the non-shared remainder needs fresh blocks and prefill.
@@ -240,26 +266,45 @@ void Scheduler::try_admit_sequences() {
                                         &shared_blocks);
       }
     };
-    lookup_prefix();
-    int private_blocks = prompt_blocks - matched;
 
-    int row = kv_manager_->block_allocator()->allocate_blocks(private_blocks);
-    if (row < 0) {
-      // Pool exhausted: preempt tail blocks of other RUNNING sequences.
-      // If that does not free enough, the request keeps waiting (FCFS order).
-      if (!try_preempt_for(private_blocks, seq.id)) {
+    // Bounded retry: the pool can move under us between the match and the
+    // mount (allocation may reclaim cache entries, preemption frees other
+    // sequences' blocks), so each attempt re-validates the match. The request
+    // keeps waiting in FCFS order if no attempt lands.
+    int row = -1;
+    bool admitted_ok = false;
+    for (int attempt = 0; attempt < 3 && !admitted_ok; ++attempt) {
+      lookup_prefix();
+      const int private_blocks = prompt_blocks - matched;
+      row = kv_manager_->block_allocator()->allocate_blocks(private_blocks);
+      if (row < 0) {
+        // Pool exhausted even after the allocator reclaimed cached blocks
+        // (only ones no sequence references, so nothing is lost that a
+        // re-prefill cannot rebuild): preempt tail blocks of other RUNNING
+        // sequences. If that does not free enough, the request keeps waiting.
+        if (attempt == 0 && !try_preempt_for(private_blocks, seq.id)) {
+          break;
+        }
+        continue;  // re-validate the match: preemption may have evicted it
+      }
+      if (matched == 0) {
+        admitted_ok = true;
         break;
       }
-      // Preemption may have evicted the very blocks the prefix match shares
-      // (the victim can be the cache's owner): re-validate the match before
-      // allocating, so a recycled block is never mounted twice.
-      lookup_prefix();
-      private_blocks = prompt_blocks - matched;
-      row = kv_manager_->block_allocator()->allocate_blocks(private_blocks);
-      if (row < 0) break;  // defensive; should not happen after a successful preempt
+      // Mounting revives cached blocks (refcount 0 -> 1) and shares live ones;
+      // it only fails if a matched block was released meanwhile, in which case
+      // the row goes back and the match is looked up again.
+      if (kv_manager_->block_allocator()->reserve_shared_prefix(row, shared_blocks)) {
+        admitted_ok = true;
+        break;
+      }
+      LOG(WARNING) << "[SCHED] seq id=" << seq.id
+                   << ": matched prefix blocks changed under us; retrying admission";
+      kv_manager_->block_allocator()->free_all(row);
+      row = -1;
     }
-    if (matched > 0) {
-      CHECK(kv_manager_->block_allocator()->reserve_shared_prefix(row, shared_blocks));
+    if (!admitted_ok) {
+      break;  // keep the request waiting; other sequences still make progress
     }
     Sequence admitted = std::move(seq);
     waiting_queue_.pop_front();
@@ -269,8 +314,10 @@ void Scheduler::try_admit_sequences() {
     admitted.admit_time = now;
     if (matched > 0) {
       // Skip prefilling the shared region (the TTFT win): resume right after
-      // the matched whole-block prefix. A fully matched prompt is
-      // prefill-complete at admission — its first decode step is next.
+      // the matched whole-block prefix. The match always stops short of the
+      // last prompt token's block (PrefixCache::cacheable_blocks), so at least
+      // one token is prefilled here — the first decode step re-runs that token
+      // and must write somewhere private.
       admitted.next_prefill_chunk_start =
           std::min(matched * block_size_, admitted.num_prompt_tokens);
       admitted.is_prefill_complete =
@@ -528,17 +575,31 @@ std::vector<Scheduler::BatchRow> Scheduler::build_batch_rows() {
       seq.next_prefill_chunk_start += take;
       if (seq.next_prefill_chunk_start >= seq.num_prompt_tokens) {
         seq.is_prefill_complete = true;
-        // Prefix cache: only now is the prompt's KV committed — record the
-        // full blocks so later identical-prefix requests can share them.
-        if (prefix_cache_) {
-          prefix_cache_->insert(seq.prompt_tokens, *kv_manager_->block_allocator(),
-                                seq.kv_slot_id);
-        }
       }
     }
   }
 
   return rows;
+}
+
+// Prefix cache: record the prompt blocks this step's forward pass committed.
+// Runs after execute_batch (not while the batch is being built) so an entry is
+// never created for KV a failed forward never wrote; blocks are recorded as
+// soon as their chunk lands, so a long chunked prefill becomes shareable well
+// before the prompt is complete.
+void Scheduler::record_committed_prefill() {
+#ifdef USE_PAGED_ATTENTION
+  if (!prefix_cache_) return;
+  BlockAllocator* allocator = kv_manager_->block_allocator();
+  for (auto& seq : running_sequences_) {
+    if (seq.state != SeqState::RUNNING || seq.is_finished) continue;
+    if (seq.kv_slot_id < 0 || seq.next_prefill_chunk_start <= 0) continue;
+    prefix_cache_->insert_committed(seq.prompt_tokens.data(), seq.num_prompt_tokens,
+                                    seq.next_prefill_chunk_start,
+                                    allocator->block_table_row(seq.kv_slot_id),
+                                    &seq.prefix_hash_chain, *allocator);
+  }
+#endif
 }
 
 // ========== Execution ==========
