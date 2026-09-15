@@ -4,6 +4,7 @@
 # 包含目标:
 #   offline_batch_benchmark                               离线批推理全指标压测
 #   online_serving_benchmark                              在线 Serving 压测(vLLM 风格)
+#   prefix_caching_benchmark                              Prefix caching A/B 收益压测
 #   verify_tokens                                         Token 一致性 A/B 验证驱动
 #
 # 模式 1 — 根项目子目录(推荐):根 CMakeLists.txt 中 add_subdirectory 引入,
@@ -27,6 +28,7 @@ endif()
 # 选项控制(默认开启)
 option(OFFLINE_BATCH_BENCHMARK "Build offline batch benchmark"   ON)
 option(ONLINE_SERVING_BENCHMARK "Build online serving benchmark (vLLM-style)" ON)
+option(PREFIX_CACHING_BENCHMARK "Build prefix caching A/B benchmark" ON)
 
 # ----------------------------------------------
 # 公共依赖:两种模式统一收敛到一个 INTERFACE 目标 bench_deps,
@@ -170,6 +172,14 @@ if (ONLINE_SERVING_BENCHMARK)
     set_target_properties(online_serving_benchmark PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 endif()
 
+# Prefix Caching 基准 (vLLM benchmark_prefix_caching 风格:共享前缀下的 A/B 收益)
+if (PREFIX_CACHING_BENCHMARK)
+    message(STATUS "Building prefix caching benchmark")
+    add_executable(prefix_caching_benchmark prefix_caching_benchmark.cpp)
+    target_link_libraries(prefix_caching_benchmark PRIVATE bench_deps)
+    set_target_properties(prefix_caching_benchmark PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+endif()
+
 # Token 一致性 A/B 验证驱动 (分页布局 vs 连续布局门禁)
 option(VERIFY_TOKENS "Build the token-consistency verify driver" ON)
 if (VERIFY_TOKENS)
@@ -182,7 +192,8 @@ endif()
 # ---------- 独立模式:运行时库搜索路径(作用于全部目标) ----------
 if(BENCH_STANDALONE)
   list(REMOVE_DUPLICATES RPATH_DIRS)
-  foreach(tgt offline_batch_benchmark online_serving_benchmark verify_tokens)
+  foreach(tgt offline_batch_benchmark online_serving_benchmark
+              prefix_caching_benchmark verify_tokens)
     if(TARGET ${tgt})
       set_target_properties(${tgt} PROPERTIES
         BUILD_RPATH "${RPATH_DIRS}"

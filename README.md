@@ -5,7 +5,8 @@
 > **项目状态**：本项目**仍在持续开发中**。
 > 当前已完成核心 Runtime 架构、CPU / CUDA 双后端、BF16 全链路推理（HF safetensors
 > 权重,CUDA 全链路 BF16 存储 / Tensor Core 计算,CPU 设备 FP32 兼容后备）、Paged KV Cache、
-> PagedAttention、Continuous Batching 调度器以及 Offline / Online Benchmark 系统。
+> PagedAttention、Continuous Batching 调度器以及 Offline / Online / Prefix Caching
+> Benchmark 系统。
 > 后续将持续扩展模型支持、优化推理性能并完善 Serving 能力。
 
 ---
@@ -55,6 +56,7 @@ LLM-SteadyInfer 是一个基于 **C++ / CUDA C++** 实现的轻量级大语言�
 - **Prefix Caching**
   - 基于内容 Hash 匹配公共 Prompt 前缀
   - 复用已有 KV Block，减少重复 Prefill 计算
+  - 配套 A/B Benchmark 量化 TTFT 与吞吐收益
 
 - **CUDA Graph Optimization**
   - Decode 路径支持 CUDA Graph Capture / Replay
@@ -113,27 +115,31 @@ make -j$(nproc)
 
 ## Benchmark
 
-提供 Offline Batch 与 Online Serving 两类性能测试：
+提供 Offline Batch、Online Serving 与 Prefix Caching 三类性能测试：
+`benchmark/offline_batch_benchmark.cpp`、`online_serving_benchmark.cpp`、
+`prefix_caching_benchmark.cpp`。
 
 ### Offline Batch
-
-用于测试最大吞吐能力：
-
 * Output Token Throughput
 * Total Token Throughput
 * GPU Utilization
 * MFU
 * KV Cache Fragmentation
+* TTFT / TPOT / ITL / E2E
 
 ### Online Serving
-
-模拟真实请求到达：
-
 * TTFT
 * TPOT
 * E2E Latency
+* Queue Wait / Queue Length
 * Goodput
 * SLA 达标率
+
+### Prefix Caching
+* Prefix Cache 命中率（lookups / hits / matched_blocks / inserts / evictions）
+* TTFT / TPOT / ITL / E2E
+* Output Token Throughput / Total Token Throughput / Completed RPS
+* `skipped_prefill_ratio`
 
 ---
 
@@ -158,9 +164,10 @@ make -j$(nproc)
 ```
 LLM-SteadyInfer/
 ├── benchmark/                       # 性能基准测试与验证
-│   ├── bench_common.h
+│   ├── bench_common.h               # 数据集加载 / 统计工具 / NVML 采样
 │   ├── offline_batch_benchmark.cpp  # 离线吞吐测试
 │   ├── online_serving_benchmark.cpp # 在线 Serving 测试
+│   ├── prefix_caching_benchmark.cpp # Prefix Caching A/B 收益测试
 │   └── verify_tokens.cpp            # Token 一致性验证
 ├── demo/                            # 示例
 │   └── chat_demo.cpp                # 命令行实时连续对话

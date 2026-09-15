@@ -41,7 +41,6 @@
 #include <iostream>
 #include <map>
 #include <numeric>
-#include <random>
 #include <set>
 #include <sstream>
 #include <string>
@@ -64,7 +63,7 @@ struct Args {
   int max_batch = 32;
   int max_gen = 256;
   int iterations = 1;
-  int seed = 42;
+  int seed = 42;  // 已弃用:数据集改为顺序读取,不再抽样;保留仅为兼容命令行
   int warmup_requests = 0;   // 预热请求数,0 = max_batch
   int warmup_iterations = 3; // 预热轮数(每轮完整 prefill + decode)
 };
@@ -135,11 +134,12 @@ static void print_usage(const char* prog) {
       << "                         BF16;默认 Qwen3-4B)\n"
       << "  --tokenizer <path>     tokenizer 路径(qwen2/qwen3 为 tokenizer.json,\n"
       << "                         llama 为 sentencepiece 模型;默认 Qwen3-4B/tokenizer.json)\n"
-      << "  --num-requests <N>     压测请求数,0 表示全部(默认 512)\n"
+      << "  --num-requests <N>     压测请求数,顺序取数据集前 N 条,0 表示全部\n"
+      << "                         (默认 512;不打乱不抽样,保证可复现)\n"
       << "  --max-batch <N>        最大 batch size(默认 32)\n"
       << "  --max-gen <N>          每个请求最大生成 token 数(默认 256)\n"
       << "  --iterations <N>       重复轮数(默认 1)\n"
-      << "  --seed <N>             请求抽样随机种子(默认 42)\n"
+      << "  --seed <N>             保留字段,数据集现在顺序读取,不再使用(默认 42)\n"
       << "  --warmup-requests <N>  预热请求数,0 = max_batch(默认 0)\n"
       << "  --warmup-iterations <N> 预热轮数,每轮跑完整 prefill+decode 以稳定 GPU\n"
       << "                         频率并预构建 CUDA graph(默认 3)\n"
@@ -220,7 +220,7 @@ static RunMetrics run_once(const std::shared_ptr<model::Model>& model,
   // shared prefix, so caching only adds hashing and pinned KV blocks.
   Scheduler sched(model, max_batch, max_total_seq_len, max_gen_len,
                   Scheduler::resolve_block_size(avg_prompt_len),
-                  /*enable_prefix_cache=*/false);
+                  /*enable_prefix_cache=*/true);
 
   // ---- 预热:与正式压测共用同一 Scheduler ----
   // decode CUDA graph 在首次 decode 时捕获并烘焙当时 KV/logits 的设备指针;
@@ -556,10 +556,9 @@ int main(int argc, char* argv[]) {
     return -1;
   }
 
-  // 按种子抽样(仅当请求数小于数据集规模时)
+  // 顺序读取:从头取前 num_requests 条,不打乱、不抽样,保证多次运行完全可复现。
+  // num_requests == 0 或 >= 数据集规模时使用全部样本。
   if (args.num_requests > 0 && args.num_requests < static_cast<int>(dataset.size())) {
-    std::mt19937 rng(args.seed);
-    std::shuffle(dataset.begin(), dataset.end(), rng);
     dataset.resize(args.num_requests);
   }
 
@@ -595,7 +594,7 @@ int main(int argc, char* argv[]) {
   auto model = load_model();
   if (!model) return -1;
 
-  // ---- Tokenize(仅对抽样后的子集) ----
+  // ---- Tokenize(仅对顺序截取后的子集) ----
   std::vector<std::vector<int>> prompt_tokens;
   prompt_tokens.reserve(dataset.size());
   for (const auto& r : dataset) {
