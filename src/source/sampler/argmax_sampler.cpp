@@ -27,6 +27,9 @@ size_t ArgmaxSampler::sample_bf16(const uint16_t* logits, size_t size, void* str
   if (device_type_ == base::DeviceType::kDeviceCPU) {
     // CPU models run FP32 (weights converted at load time), so this is never
     // reached in practice; still handle it by widening each element exactly.
+    if (size == 0) {
+      return 0;
+    }
     size_t max_index = 0;
     float max_value = base::bf16_to_fp32(logits[0]);
     for (size_t i = 1; i < size; ++i) {
@@ -47,6 +50,10 @@ void ArgmaxSampler::sample_batch_bf16(const uint16_t* logits, size_t row_stride,
   if (device_type_ == base::DeviceType::kDeviceCPU) {
     for (int32_t b = 0; b < batch; ++b) {
       const uint16_t* row = logits + static_cast<size_t>(b) * row_stride;
+      if (size == 0) {
+        out_tokens[b] = 0;
+        continue;
+      }
       size_t max_index = 0;
       float max_value = base::bf16_to_fp32(row[0]);
       for (size_t i = 1; i < size; ++i) {

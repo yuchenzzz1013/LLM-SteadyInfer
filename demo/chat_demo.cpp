@@ -103,6 +103,27 @@ void print_usage(const char* prog) {
       << "  exit | quit                    退出\n";
 }
 
+// std::stoi / std::stod throw on bad input — report and exit instead of aborting.
+int parse_int(const std::string& s, const char* name) {
+  try {
+    return std::stoi(s);
+  } catch (const std::exception&) {
+    std::cerr << "参数 " << name << " 需要整数,收到: \"" << s << "\"\n";
+    std::exit(1);
+  }
+  return 0;  // unreachable
+}
+
+double parse_double(const std::string& s, const char* name) {
+  try {
+    return std::stod(s);
+  } catch (const std::exception&) {
+    std::cerr << "参数 " << name << " 需要浮点数,收到: \"" << s << "\"\n";
+    std::exit(1);
+  }
+  return 0.0;  // unreachable
+}
+
 Args parse_args(int argc, char** argv) {
   Args a;
   for (int i = 1; i < argc; ++i) {
@@ -125,13 +146,13 @@ Args parse_args(int argc, char** argv) {
     } else if (k == "--system") {
       a.system_prompt = value("--system");
     } else if (k == "--max-seq-len") {
-      a.max_seq_len = std::stoi(value("--max-seq-len"));
+      a.max_seq_len = parse_int(value("--max-seq-len"), "--max-seq-len");
     } else if (k == "--max-batch") {
-      a.max_batch = std::stoi(value("--max-batch"));
+      a.max_batch = parse_int(value("--max-batch"), "--max-batch");
     } else if (k == "--gpu-mem-fraction") {
-      a.gpu_mem_fraction = std::stod(value("--gpu-mem-fraction"));
+      a.gpu_mem_fraction = parse_double(value("--gpu-mem-fraction"), "--gpu-mem-fraction");
     } else if (k == "--max-new-tokens") {
-      a.max_new_tokens = std::stoi(value("--max-new-tokens"));
+      a.max_new_tokens = parse_int(value("--max-new-tokens"), "--max-new-tokens");
     } else if (k == "--questions") {
       const std::string list = value("--questions");
       size_t pos = 0;
@@ -525,9 +546,15 @@ void print_banner(const ChatEngine& engine, const Args& args) {
             << "KV 池: " << engine.max_batch << " 槽 x " << engine.ctx << " tokens x "
             << (engine.kv_bytes_per_token() / 1024) << " KB/token = " << gb(engine.kv_bytes)
             << "(整块预分配)\n"
-            << "记忆: 开启(每轮携带全部历史,超出上下文时丢弃最旧的一轮)\n"
-            << "前缀复用(prefix cache): 开启(每轮重发完整历史,"
-               "复用的是上一轮已经算好的整块 KV)\n";
+            << "记忆: 开启(每轮携带全部历史,超出上下文时丢弃最旧的一轮)\n";
+  // 前缀复用在连续布局(CPU / 未启用分页)上会被调度器禁用,别把开关说成
+  // 与实际不符。
+  if (engine.sched && engine.sched->prefix_cache_enabled()) {
+    std::cout << "前缀复用(prefix cache): 开启(每轮重发完整历史,"
+                 "复用的是上一轮已经算好的整块 KV)\n";
+  } else {
+    std::cout << "前缀复用(prefix cache): 关闭(当前设备/布局不支持分页共享)\n";
+  }
   if (engine.device_type == base::DeviceType::kDeviceCUDA) {
     size_t free_b = 0, total_b = 0;
     if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
@@ -667,6 +694,9 @@ int run(int argc, char** argv) {
     if (dropped > 0) {
       std::cout << "[记忆已满:丢弃最早的 " << dropped << " 轮对话]\n";
     }
+    // 记忆里只留真正进入本轮 prompt 的轮次(kept 的末位是本轮提问,生成成功后
+    // 再写回):否则 /history 的轮数与实际记忆不符,列表也会一直增长。
+    history.assign(kept.begin(), kept.end() - 1);
 
     // ---- 生成 ----
     const std::vector<int32_t> prompt_tokens =

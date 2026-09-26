@@ -42,6 +42,12 @@ Scheduler::Scheduler(std::shared_ptr<model::Model> model,
     LOG(FATAL) << "Scheduler: model not properly initialized. kv_dim=" << kv_dim
                << " num_layers=" << num_layers;
   }
+  // BatchRow stores Sequence* into running_sequences_, so it must not grow
+  // past admission's cap while a batch is in flight. Reserving once makes that
+  // an invariant of the container instead of a property of the call order.
+  running_sequences_.reserve(max_batch_size > 0 ? max_batch_size : 1);
+  batch_row_seqs_.reserve(running_sequences_.capacity());
+
   std::shared_ptr<base::DeviceAllocator> alloc;
   if (model_->device_type() == base::DeviceType::kDeviceCPU) {
     alloc = base::CPUDeviceAllocatorFactory::get_instance();
@@ -62,6 +68,17 @@ Scheduler::Scheduler(std::shared_ptr<model::Model> model,
                                              max_seq_len, kv_dim, alloc,
                                              model_->device_type(), block_size_);
 
+  // The block arithmetic below assumes one block == block_size_ tokens. On a
+  // non-paged device (CPU) KVManager builds a degenerate pool whose block is a
+  // whole slot (block_size == max_seq_len, table width 1), so adopt that size:
+  // prompt_blocks then stays 1 and matches max_blocks_per_seq(). With the
+  // default 16 a CPU run asks for ceil(prompt/16) > 1 blocks, every
+  // allocate_blocks() is rejected with "exceeds table width 1" and admission
+  // spins forever admitting nothing.
+  if (!kv_manager_->is_paged()) {
+    block_size_ = kv_manager_->block_size();
+  }
+
 #ifdef USE_PAGED_ATTENTION
   // Prefix cache (content-hash block sharing). Opt-in: benchmark workloads
   // never share a prefix, so hashing + pinned blocks would be pure overhead.
@@ -71,6 +88,13 @@ Scheduler::Scheduler(std::shared_ptr<model::Model> model,
     if (force && std::string(force) == "1") {
       enable_prefix_cache = true;
     }
+  }
+  // Sharing needs real pages: the continuous pool holds one block per
+  // sequence, which can never be mounted as a shared prefix page.
+  if (enable_prefix_cache && !kv_manager_->is_paged()) {
+    LOG(WARNING) << "[SCHED] prefix cache needs the paged KV layout (CUDA "
+                    "device + USE_PAGED_ATTENTION); disabled on this device";
+    enable_prefix_cache = false;
   }
   if (enable_prefix_cache) {
     prefix_cache_ = std::make_unique<PrefixCache>(block_size_);
@@ -139,12 +163,18 @@ int Scheduler::add_request(const std::vector<int>& prompt_tokens) {
   seq.num_prompt_tokens = static_cast<int>(prompt_tokens.size());
   seq.state = SeqState::WAITING;
 
+  // An empty prompt has no token to prefill and no last token to decode from
+  // (build_batch_rows reads prompt_tokens.back()); it would also reserve zero
+  // blocks, i.e. a block-table row nobody owns.
+  if (seq.num_prompt_tokens <= 0) {
+    LOG(WARNING) << "[SCHED] Rejecting request id=" << seq.id << ": empty prompt";
+    return -1;
+  }
+
   // Reject prompt if it does not leave room for at least 1 generation token.
   if (seq.num_prompt_tokens >= max_seq_len_) {
-    LOG(ERROR) << "[SCHED] Rejecting request id=" << seq.id
-               << ": prompt length " << seq.num_prompt_tokens
-               << " >= max_seq_len " << max_seq_len_
-               << " — KV cache has no room for generation.";
+    LOG(WARNING) << "[SCHED] Rejecting request id=" << seq.id << ": prompt length "
+                 << seq.num_prompt_tokens << " >= max_seq_len " << max_seq_len_;
     return -1;
   }
 
@@ -152,15 +182,10 @@ int Scheduler::add_request(const std::vector<int>& prompt_tokens) {
   int avail = max_seq_len_ - seq.num_prompt_tokens;
   seq.max_gen_len = std::max(1, std::min(max_gen_len_, avail));
 
-  const int seq_id = seq.id;
-  const int seq_prompt_len = seq.num_prompt_tokens;
-  const int seq_max_gen_len = seq.max_gen_len;
+  VLOG(1) << "[SCHED] add_request id=" << seq.id << " prompt_len=" << seq.num_prompt_tokens
+          << " max_gen_len=" << seq.max_gen_len;
+  const int seq_id = seq.id;  // `seq` is moved from below
   waiting_queue_.push_back(std::move(seq));
-#ifndef NDEBUG
-  VLOG(1) << "[SCHED] add_request id=" << seq_id
-          << " prompt_len=" << seq_prompt_len
-          << " max_gen_len=" << seq_max_gen_len;
-#endif
   return seq_id;
 }
 
@@ -219,7 +244,12 @@ void Scheduler::step() {
     VLOG(1) << "[SCHED] empty batch this step";
 #endif
   }
+  // Safe point: no batch row and no admission loop refers to the running set
+  // any more. Drop the (now dead) row pointers before anything mutates that
+  // set, and retire this step's preemption victims.
+  batch_row_seqs_.clear();
   update_sequences();
+  flush_preempted();
 }
 
 bool Scheduler::all_finished() const {
@@ -350,41 +380,48 @@ void Scheduler::try_admit_sequences() {
 
 bool Scheduler::try_preempt_for(int need_blocks, int skip_seq_id) {
 #ifdef USE_PAGED_ATTENTION
-  int needed = need_blocks - kv_manager_->block_allocator()->free_block_count();
+  BlockAllocator* allocator = kv_manager_->block_allocator();
+  int needed = need_blocks - allocator->free_block_count();
   if (needed <= 0) return true;
 
-  // Collect victims from the most recently admitted RUNNING sequence to the
-  // oldest (FCFS: latecomers yield first), each keeping at least 1 block so
-  // its block-table row stays alive while it waits for re-admission.
-  std::vector<std::pair<Sequence*, int>> victims;  // (seq, blocks to free)
+  // Plan first, mutate last: preempting a sequence costs it a re-prefill, so a
+  // request that still does not fit afterwards must not churn any victim.
+  // Victims are collected from the most recently admitted RUNNING sequence to
+  // the oldest (FCFS: latecomers yield first), each keeping >= 1 block so its
+  // block-table row stays alive while it waits for re-admission. Each cut is
+  // sized by capacity the pool actually gets back, not by table entries
+  // dropped: blocks shared with another row (refcount > 1) or pinned by the
+  // prefix cache stay allocated when this row lets go of them.
+  std::vector<std::pair<Sequence*, int>> victims;  // (seq, blocks to keep)
   for (auto it = running_sequences_.rbegin(); it != running_sequences_.rend(); ++it) {
     if (needed <= 0) break;
     if (it->id == skip_seq_id || it->state != SeqState::RUNNING) continue;
-    int evictable = it->num_blocks_allocated - 1;  // keep >= 1 block
-    if (evictable <= 0) continue;
-    int take = std::min(evictable, needed);
-    needed -= take;
-    victims.emplace_back(&(*it), take);
-  }
-  if (needed > 0) {
-    // Not enough evictable blocks — do not churn any victim for a request
-    // that still cannot fit.
-    return false;
-  }
-
-  for (auto& [victim, take] : victims) {
-    truncate_sequence(*victim, victim->num_blocks_allocated - take);
-  }
-  // Move every PREEMPTED sequence to the head of the waiting queue (they are
-  // in-flight requests — they jump ahead of fresh arrivals on resume).
-  auto it = running_sequences_.begin();
-  while (it != running_sequences_.end()) {
-    if (it->state == SeqState::PREEMPTED) {
-      waiting_queue_.push_front(std::move(*it));
-      it = running_sequences_.erase(it);
-    } else {
-      ++it;
+    // The forward pass is about to read the block table of every sequence that
+    // already has a row in this step's batch — its KV has to stay where it is.
+    if (std::find(batch_row_seqs_.begin(), batch_row_seqs_.end(), &*it) !=
+        batch_row_seqs_.end()) {
+      continue;
     }
+    const int max_take = std::min(it->num_blocks_allocated - 1,
+                                  allocator->reclaimable_blocks_from(it->kv_slot_id, 1));
+    if (max_take <= 0) continue;
+    const int take = std::min(max_take, needed);
+    int keep = it->num_blocks_allocated - take;
+    int gain = allocator->reclaimable_blocks_from(it->kv_slot_id, keep);
+    if (gain <= 0) {
+      // The tail is shared / cache-pinned all the way down to this cut; only a
+      // deeper one reaches the blocks this row owns alone.
+      keep = 1;
+      gain = allocator->reclaimable_blocks_from(it->kv_slot_id, keep);
+    }
+    if (gain <= 0) continue;
+    needed -= gain;
+    victims.emplace_back(&(*it), keep);
+  }
+  if (needed > 0) return false;
+
+  for (auto& [victim, keep] : victims) {
+    truncate_sequence(*victim, keep);
   }
   return true;
 #else
@@ -392,6 +429,28 @@ bool Scheduler::try_preempt_for(int need_blocks, int skip_seq_id) {
   UNUSED(skip_seq_id);
   return false;  // continuous layout: no blocks, no preemption
 #endif
+}
+
+void Scheduler::flush_preempted() {
+  // Retire the sequences try_preempt_for marked PREEMPTED. Doing it here (and
+  // not inside preemption) is what keeps the running set stable while a batch
+  // is being built and executed: BatchRow holds Sequence* into it, and the
+  // admission path holds a reference to the waiting-queue front.
+  std::vector<size_t> preempted;
+  for (size_t i = 0; i < running_sequences_.size(); ++i) {
+    if (running_sequences_[i].state == SeqState::PREEMPTED) preempted.push_back(i);
+  }
+  if (preempted.empty()) return;
+
+  // Oldest first at the head of the waiting queue: these are in-flight
+  // requests, so they jump ahead of fresh arrivals on resume.
+  for (auto i = preempted.rbegin(); i != preempted.rend(); ++i) {
+    waiting_queue_.push_front(std::move(running_sequences_[*i]));
+  }
+  // Indices are ascending; erasing back-to-front keeps the earlier ones valid.
+  for (auto i = preempted.rbegin(); i != preempted.rend(); ++i) {
+    running_sequences_.erase(running_sequences_.begin() + static_cast<long>(*i));
+  }
 }
 
 void Scheduler::truncate_sequence(Sequence& seq, int keep_blocks) {
@@ -462,6 +521,9 @@ bool Scheduler::ensure_blocks_for(Sequence* seq, int position) {
 std::vector<Scheduler::BatchRow> Scheduler::build_batch_rows() {
   std::vector<BatchRow> rows;
   rows.reserve(max_batch_size_);
+  // Sequences that end up with a row here are off-limits to the preemption
+  // that ensure_blocks_for may trigger below (see try_preempt_for).
+  batch_row_seqs_.clear();
 
   // 1. Decode rows first: every RUNNING, prefill-complete sequence. Decode
   // rows sit at rows[0..num_decode_rows) so the sampler output aligns.
@@ -482,6 +544,7 @@ std::vector<Scheduler::BatchRow> Scheduler::build_batch_rows() {
                                                 : seq.generated_tokens.back();
     rows.push_back(BatchRow{&seq, true, static_cast<int32_t>(token_id),
                             static_cast<int32_t>(position)});
+    batch_row_seqs_.push_back(&seq);
   }
 
   // 2. Chunked-prefill rows, mixed into the same step so decode never waits
@@ -566,6 +629,7 @@ std::vector<Scheduler::BatchRow> Scheduler::build_batch_rows() {
         }
       }
 
+      batch_row_seqs_.push_back(&seq);
       for (int i = 0; i < take; ++i) {
         int p = seq.next_prefill_chunk_start + i;
         rows.push_back(BatchRow{&seq, false, static_cast<int32_t>(seq.prompt_tokens[p]),
@@ -913,10 +977,6 @@ void Scheduler::update_sequences() {
 
 int Scheduler::get_busy_kv_slots() const {
   return kv_manager_->busy_slot_count();
-}
-
-int Scheduler::get_max_kv_seq_len() const {
-  return kv_manager_->max_seq_len();
 }
 
 long long Scheduler::get_allocated_kv_tokens() const {

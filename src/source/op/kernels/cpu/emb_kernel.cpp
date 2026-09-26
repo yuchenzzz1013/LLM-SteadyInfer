@@ -13,8 +13,10 @@ void emb_kernel_normal(const tensor::Tensor& input, const tensor::Tensor& weight
   const auto allocator = base::CPUDeviceAllocatorFactory::get_instance();
   for (int32_t i = 0; i < input_num; ++i) {
     int32_t token = *input.ptr<int32_t>(i);
-    if (token > vocab_size) {
-      LOG(FATAL) << "Token index is greater than vocab size.";
+    // >= (not >): token == vocab_size is already one past the last row. Both
+    // bounds are checked — a negative id would read before the weight block.
+    if (token < 0 || token >= vocab_size) {
+      LOG(FATAL) << "Token index " << token << " out of range [0, " << vocab_size << ")";
     } else {
       float* dest_ptr = const_cast<float*>(output.ptr<float>(i * weight_dim));
       float* src_ptr = const_cast<float*>(weight.ptr<float>(token * weight_dim));

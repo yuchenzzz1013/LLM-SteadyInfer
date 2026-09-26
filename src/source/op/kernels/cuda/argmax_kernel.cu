@@ -114,6 +114,7 @@ size_t argmax_kernel_cu(const uint16_t* input_ptr, size_t size, void* stream) {
   std::shared_ptr<base::DeviceAllocator> alloc_cu =
       base::CUDADeviceAllocatorFactory::get_instance();
   size_t* index = static_cast<size_t*>(alloc_cu->allocate(sizeof(size_t)));
+  CHECK(index != nullptr) << "Failed to allocate the argmax index buffer";
   size_t output_index = 0;
   if (!stream) {
     argmax_kernel<<<1, 512>>>(input_ptr, size, index);
@@ -126,6 +127,9 @@ size_t argmax_kernel_cu(const uint16_t* input_ptr, size_t size, void* stream) {
     // value; sync before reading output_index.
     cudaStreamSynchronize(stream_);
   }
+  // Back to the pool — a live allocation per generated token would grow it
+  // without bound (nothing else ever releases these blocks).
+  alloc_cu->release(index);
   return output_index;
 }
 
@@ -148,5 +152,6 @@ void argmax_kernel_cu_batch(const uint16_t* input_ptr, size_t row_stride, size_t
     cudaMemcpy(out_tokens, dev_idx, static_cast<size_t>(batch) * sizeof(int32_t),
                cudaMemcpyDeviceToHost);
   }
+  alloc_cu->release(dev_idx);  // one block per decode step, otherwise pooled forever
 }
 }  // namespace kernel

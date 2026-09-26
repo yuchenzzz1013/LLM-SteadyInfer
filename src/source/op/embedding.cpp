@@ -5,10 +5,10 @@
 namespace op {
 EmbeddingLayer::EmbeddingLayer(base::DeviceType device_type, int32_t dim, int32_t seq_len,
                                int32_t vocab_size)
-    : dim_(dim),
+    : LayerParam(device_type, LayerType::kLayerEmbedding, false, "Embedding"),
+      dim_(dim),
       seq_len_(seq_len),
-      vocab_size_(vocab_size),
-      LayerParam(device_type, LayerType::kLayerEmbedding, false, "Embedding") {
+      vocab_size_(vocab_size) {
   reset_weight_size(1);
   reset_input_size(2);
   reset_output_size(1);

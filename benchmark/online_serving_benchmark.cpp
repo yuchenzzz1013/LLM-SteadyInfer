@@ -11,11 +11,9 @@
 //   - kv_cache_fragmentation / batch reconstruct / MFU / NVML(与 offline 同口径)
 //
 // 用法:
-//   ./build/benchmark/online_serving_benchmark \
-//       --model-type qwen3 --model-dir Qwen3-4B \
-//       --tokenizer Qwen3-4B/tokenizer.json \
-//       --dataset ShareGPT_prompts.jsonl \
-//       --request-rate 8 --num-requests 256 --max-batch 32 --max-gen 256 \
+//   ./build/benchmark/online_serving_benchmark --model-type qwen3 --model-dir Qwen3-4B
+//       --tokenizer Qwen3-4B/tokenizer.json --dataset ShareGPT_prompts.jsonl
+//       --request-rate 8 --num-requests 256 --max-batch 32 --max-gen 256
 //       --duration 60 --ttft-sla-ms 2000 --tpot-sla-ms 100
 // ============================================================================
 
@@ -79,7 +77,7 @@ struct Args {
 // 解析浮点参数,支持 "inf"(无穷大 → -1)
 static double parse_double_arg(const std::string& s) {
   if (s == "inf") return -1;
-  return std::stod(s);
+  return to_double(s);
 }
 
 static Args parse_args(int argc, char** argv) {
@@ -91,14 +89,14 @@ static Args parse_args(int argc, char** argv) {
   if (positional) {
     if (argc > 1) a.model_dir = argv[1];
     if (argc > 2) a.tokenizer = argv[2];
-    if (argc > 3) a.num_requests = std::stoi(argv[3]);
+    if (argc > 3) a.num_requests = to_int(argv[3]);
     if (argc > 4) {
-      a.max_batch = std::stoi(argv[4]);
+      a.max_batch = to_int(argv[4]);
       a.max_batch_explicit = true;
     }
-    if (argc > 5) a.max_gen = std::stoi(argv[5]);
+    if (argc > 5) a.max_gen = to_int(argv[5]);
     if (argc > 6) a.output_csv = argv[6];
-    if (argc > 7) a.iterations = std::stoi(argv[7]);
+    if (argc > 7) a.iterations = to_int(argv[7]);
   }
 
   // --flag 覆盖(两种模式均生效;--flag 优先于位置参数)
@@ -113,31 +111,41 @@ static Args parse_args(int argc, char** argv) {
   if (has_arg(argc, argv, "--output-csv"))
     a.output_csv = get_arg(argc, argv, "--output-csv");
   if (has_arg(argc, argv, "--num-requests"))
-    a.num_requests = std::stoi(get_arg(argc, argv, "--num-requests"));
+    a.num_requests = to_int(get_arg(argc, argv, "--num-requests"));
   if (has_arg(argc, argv, "--max-batch")) {
-    a.max_batch = std::stoi(get_arg(argc, argv, "--max-batch"));
+    a.max_batch = to_int(get_arg(argc, argv, "--max-batch"));
     a.max_batch_explicit = true;
   }
   if (has_arg(argc, argv, "--max-gen"))
-    a.max_gen = std::stoi(get_arg(argc, argv, "--max-gen"));
+    a.max_gen = to_int(get_arg(argc, argv, "--max-gen"));
   if (has_arg(argc, argv, "--iterations"))
-    a.iterations = std::stoi(get_arg(argc, argv, "--iterations"));
+    a.iterations = to_int(get_arg(argc, argv, "--iterations"));
   if (has_arg(argc, argv, "--warmup-requests"))
-    a.warmup_requests = std::stoi(get_arg(argc, argv, "--warmup-requests"));
+    a.warmup_requests = to_int(get_arg(argc, argv, "--warmup-requests"));
   if (has_arg(argc, argv, "--warmup-iterations"))
-    a.warmup_iterations = std::stoi(get_arg(argc, argv, "--warmup-iterations"));
+    a.warmup_iterations = to_int(get_arg(argc, argv, "--warmup-iterations"));
   if (has_arg(argc, argv, "--seed"))
-    a.seed = std::stoi(get_arg(argc, argv, "--seed"));
+    a.seed = to_int(get_arg(argc, argv, "--seed"));
   if (has_arg(argc, argv, "--request-rate"))
     a.request_rate = parse_double_arg(get_arg(argc, argv, "--request-rate"));
   if (has_arg(argc, argv, "--burstiness"))
-    a.burstiness = std::stod(get_arg(argc, argv, "--burstiness"));
+    a.burstiness = to_double(get_arg(argc, argv, "--burstiness"));
   if (has_arg(argc, argv, "--duration"))
-    a.duration = std::stod(get_arg(argc, argv, "--duration"));
+    a.duration = to_double(get_arg(argc, argv, "--duration"));
   if (has_arg(argc, argv, "--ttft-sla-ms"))
-    a.ttft_sla_ms = std::stod(get_arg(argc, argv, "--ttft-sla-ms"));
+    a.ttft_sla_ms = to_double(get_arg(argc, argv, "--ttft-sla-ms"));
   if (has_arg(argc, argv, "--tpot-sla-ms"))
-    a.tpot_sla_ms = std::stod(get_arg(argc, argv, "--tpot-sla-ms"));
+    a.tpot_sla_ms = to_double(get_arg(argc, argv, "--tpot-sla-ms"));
+
+  // 参数兜底:负的 iterations/max_gen 此前会在 vector 分配处抛 length_error 崩溃,
+  // rate==0 会让到达间隔变成 inf(请求永不提交,压测挂死)。
+  if (a.num_requests < 0) a.num_requests = 0;
+  if (a.max_batch < 1) a.max_batch = 1;
+  if (a.max_gen < 1) a.max_gen = 1;
+  if (a.iterations < 1) a.iterations = 1;
+  if (a.warmup_iterations < 0) a.warmup_iterations = 0;
+  if (a.warmup_requests < 0) a.warmup_requests = 0;
+  if (a.request_rate == 0) a.request_rate = -1;  // 0 同样按"不限速"处理
   return a;
 }
 
@@ -173,7 +181,7 @@ static void print_usage(const char* prog) {
       << "  --warmup-requests <N>  预热请求数,0 = max_batch(默认 0)\n"
       << "  --warmup-iterations <N> 预热轮数,每轮跑完整 prefill+decode 以稳定 GPU\n"
       << "                         频率并预构建 CUDA graph(默认 3)\n"
-      << "  --request-rate <R>     请求到达速率 req/s;inf 或 -1 表示全部立即到达\n"
+      << "  --request-rate <R>     请求到达速率 req/s;<=0 或 inf 表示全部立即到达\n"
       << "                         (退化为 offline 模式,默认 inf)\n"
       << "  --burstiness <g>       到达间隔伽马分布 shape 参数(默认 1.0 = 泊松过程;\n"
       << "                         <1 更突发,>1 更平稳,对齐 vLLM --burstiness)\n"
@@ -448,11 +456,14 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
 
     double ttft = first_ms - arrival_ms;
     double e2e = finish_ms - arrival_ms;
-    double tpot =
-        seq.num_generated_tokens > 1 ? (finish_ms - first_ms) / (seq.num_generated_tokens - 1) : 0.0;
+    // TPOT 只在生成 >= 2 个 token 时有定义;单 token 请求(被 max_gen/EOS 截断)
+    // 若按 0 计入会把均值拉低,这里直接不进统计,其 SLA 也按"无 token 间隔可测"通过。
+    const bool has_tpot = seq.num_generated_tokens > 1;
+    const double tpot =
+        has_tpot ? (finish_ms - first_ms) / (seq.num_generated_tokens - 1) : 0.0;
     ttfts.push_back(ttft);
     e2es.push_back(e2e);
-    tpots.push_back(tpot);
+    if (has_tpot) tpots.push_back(tpot);
     qwaits.push_back(admit_ms - arrival_ms);
     for (double itl : seq.token_timestamps_ms) itls.push_back(itl);
 
@@ -461,7 +472,7 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
 
     // Goodput:SLA 未设置时该维度恒通过(与 vLLM 一致)
     bool ttft_ok = args.ttft_sla_ms <= 0 || ttft <= args.ttft_sla_ms;
-    bool tpot_ok = args.tpot_sla_ms <= 0 || tpot <= args.tpot_sla_ms;
+    bool tpot_ok = args.tpot_sla_ms <= 0 || !has_tpot || tpot <= args.tpot_sla_ms;
     if (ttft_ok && tpot_ok) m.goodput_count++;
 
     m.prompt_tokens += seq.num_prompt_tokens;

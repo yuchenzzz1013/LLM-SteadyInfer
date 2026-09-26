@@ -27,7 +27,6 @@ class KVManager {
   bool has_free_slot() const;
   int free_slot_count() const;
   int busy_slot_count() const;
-  int max_batch() const { return max_batch_; }
   int max_seq_len() const { return max_seq_len_; }
 
   // Paged-mode accessors. In continuous mode block_allocator() is the

@@ -3,7 +3,11 @@
 namespace kernel {
 void softmax_inplace_cpu(const tensor::Tensor& input, void* stream) {
   int32_t size = static_cast<int32_t>(input.size());
+  if (size <= 0) {
+    return;
+  }
   const float* input_ptr = input.ptr<float>();
+  CHECK_NE(input_ptr, nullptr);
 
   float max_value = *std::max_element(input_ptr, input_ptr + size);
 
@@ -12,13 +16,5 @@ void softmax_inplace_cpu(const tensor::Tensor& input, void* stream) {
 
   float sum_value = arma::sum(input_mat);
   input_mat = input_mat / sum_value;
-}
-
-void softmax_inplace_cpu(const float* input_ptr, size_t size) {
-  tensor::Tensor input(base::DataType::kDataTypeFp32, size);
-  std::shared_ptr<base::Buffer> buffer = std::make_shared<base::Buffer>(
-      size * sizeof(float), nullptr, (void*)input_ptr, true);
-  input.assign(buffer);
-  return softmax_inplace_cpu(input);
 }
 }  // namespace kernel

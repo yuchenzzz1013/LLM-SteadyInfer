@@ -14,9 +14,8 @@
 //   - TTFT / TPOT / ITL / e2e    延迟分布(avg / p50 / p99)
 //
 // 用法:
-//   ./build/benchmark/offline_batch_benchmark --dataset ShareGPT_prompts.jsonl \
-//       --model-dir Qwen3-4B \
-//       --tokenizer Qwen3-4B/tokenizer.json \
+//   ./build/benchmark/offline_batch_benchmark --dataset ShareGPT_prompts.jsonl
+//       --model-dir Qwen3-4B --tokenizer Qwen3-4B/tokenizer.json
 //       --num-requests 512 --max-batch 32 --max-gen 256
 // ============================================================================
 
@@ -77,11 +76,11 @@ static Args parse_args(int argc, char** argv) {
   if (positional) {
     if (argc > 1) a.model_dir = argv[1];
     if (argc > 2) a.tokenizer = argv[2];
-    if (argc > 3) a.num_requests = std::stoi(argv[3]);
-    if (argc > 4) a.max_batch = std::stoi(argv[4]);
-    if (argc > 5) a.max_gen = std::stoi(argv[5]);
+    if (argc > 3) a.num_requests = to_int(argv[3]);
+    if (argc > 4) a.max_batch = to_int(argv[4]);
+    if (argc > 5) a.max_gen = to_int(argv[5]);
     if (argc > 6) a.output_csv = argv[6];
-    if (argc > 7) a.iterations = std::stoi(argv[7]);
+    if (argc > 7) a.iterations = to_int(argv[7]);
   }
 
   // --flag 覆盖(两种模式均生效;--flag 优先于位置参数)
@@ -96,19 +95,27 @@ static Args parse_args(int argc, char** argv) {
   if (has_arg(argc, argv, "--output-csv"))
     a.output_csv = get_arg(argc, argv, "--output-csv");
   if (has_arg(argc, argv, "--num-requests"))
-    a.num_requests = std::stoi(get_arg(argc, argv, "--num-requests"));
+    a.num_requests = to_int(get_arg(argc, argv, "--num-requests"));
   if (has_arg(argc, argv, "--max-batch"))
-    a.max_batch = std::stoi(get_arg(argc, argv, "--max-batch"));
+    a.max_batch = to_int(get_arg(argc, argv, "--max-batch"));
   if (has_arg(argc, argv, "--max-gen"))
-    a.max_gen = std::stoi(get_arg(argc, argv, "--max-gen"));
+    a.max_gen = to_int(get_arg(argc, argv, "--max-gen"));
   if (has_arg(argc, argv, "--iterations"))
-    a.iterations = std::stoi(get_arg(argc, argv, "--iterations"));
+    a.iterations = to_int(get_arg(argc, argv, "--iterations"));
   if (has_arg(argc, argv, "--seed"))
-    a.seed = std::stoi(get_arg(argc, argv, "--seed"));
+    a.seed = to_int(get_arg(argc, argv, "--seed"));
   if (has_arg(argc, argv, "--warmup-requests"))
-    a.warmup_requests = std::stoi(get_arg(argc, argv, "--warmup-requests"));
+    a.warmup_requests = to_int(get_arg(argc, argv, "--warmup-requests"));
   if (has_arg(argc, argv, "--warmup-iterations"))
-    a.warmup_iterations = std::stoi(get_arg(argc, argv, "--warmup-iterations"));
+    a.warmup_iterations = to_int(get_arg(argc, argv, "--warmup-iterations"));
+
+  // 参数兜底:负值此前会在 vector 分配处抛 length_error 崩溃。
+  if (a.num_requests < 0) a.num_requests = 0;
+  if (a.max_batch < 1) a.max_batch = 1;
+  if (a.max_gen < 1) a.max_gen = 1;
+  if (a.iterations < 1) a.iterations = 1;
+  if (a.warmup_iterations < 0) a.warmup_iterations = 0;
+  if (a.warmup_requests < 0) a.warmup_requests = 0;
   return a;
 }
 

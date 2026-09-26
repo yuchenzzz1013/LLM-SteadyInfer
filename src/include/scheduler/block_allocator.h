@@ -40,9 +40,9 @@ class BlockAllocator {
   BlockAllocator(int num_blocks, int num_rows, int max_blocks_per_seq, int block_size);
 
   // Allocate `n` blocks for a free row (n == 0 returns a row with an empty
-  // table — prefix-cache-only rows). Returns the row index, -1 on failure
-  // (all failure conditions are checked before any state is mutated, so a
-  // failed call leaves the pool untouched).
+  // table — prefix-cache-only rows; the row counts as taken either way).
+  // Returns the row index, -1 on failure. Failure is checked before any block
+  // is taken, so a failed call leaves the pool's blocks untouched.
   int allocate_blocks(int n);
 
   // Mount `blocks` at the front of `row`'s block table (existing entries
@@ -65,6 +65,15 @@ class BlockAllocator {
 
   // Number of allocated (non -1) entries in a row's block table.
   int num_used_blocks(int row) const;
+
+  // How many blocks of [start_block_idx, used) dropping this row's reference
+  // would actually return to the free list (see reclaimable_blocks_from impl).
+  // Preemption uses it to size a truncation by real capacity gained instead of
+  // by table entries dropped.
+  int reclaimable_blocks_from(int row, int start_block_idx) const;
+
+  // Rows currently owned by a sequence (allocate_blocks .. free_all).
+  int num_busy_rows() const;
 
   // Copy a row's block table into dst (max_blocks_per_seq entries).
   void copy_block_table_row(int row, int32_t* dst) const;
@@ -114,7 +123,7 @@ class BlockAllocator {
   // Refcount reached zero: park the block if the cache pins it, else free it.
   void release_block(int block_idx);
   // Top the free list up via the reclaim hook when it is short of `n`.
-  void reclaim_for(size_t n);
+  void reclaim_for(int n);
 
   int num_blocks_ = 0;
   int num_rows_ = 0;
@@ -124,6 +133,7 @@ class BlockAllocator {
   std::vector<int> ref_counts_;                   // per physical block
   std::vector<uint8_t> cached_;                   // per block: cache holds an entry
   std::vector<int32_t> block_tables_;             // flat [num_rows * max_blocks_per_seq]
+  std::vector<uint8_t> row_busy_;                 // per row: owned by a sequence
   ReclaimFn reclaim_fn_;
 };
 

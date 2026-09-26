@@ -31,6 +31,11 @@ struct BatchScratch {
   // Baked into the fast-path re-use check so a stride change re-allocates
   // (and thus forces a graph re-capture in decode_step).
   int32_t block_table_stride = 0;
+  // Split count the flash-decoding partials were sized for (0 on CPU). Part of
+  // the re-use check too: a second Scheduler with a longer max_seq_len on the
+  // same Model would otherwise keep the smaller partials and the decode kernel
+  // would write past them.
+  int32_t num_splits = 0;
 
   // Device buffers (CUDA) or CPU buffers (CPU models), sized [batch, ...].
   tensor::Tensor hidden, rms_out, q_batch, key_batch, val_batch, mha_out_batch, attn_out,
@@ -341,16 +346,6 @@ class Model {
   // caller expects to process, reclaiming hundreds of MB on GPU.
   void resize_internal_kv_cache(int32_t max_seq_len);
 
-  // Point the internal KV buffers at one slot of an external KV cache
-  // (e.g. KVManager) so prefill writes land directly in the external cache
-  // and no internal->external copy is needed.
-  base::Status bind_external_kv_cache(const tensor::Tensor& key_cache,
-                                      const tensor::Tensor& value_cache,
-                                      int32_t slot_id);
-
-  // Restore the model's own internal KV buffers (no-op if not bound).
-  void unbind_external_kv_cache();
-
   // Synchronize the model's CUDA stream (no-op on CPU or when no stream is set).
   virtual void sync_stream() const {}
 
@@ -396,9 +391,6 @@ class Model {
   std::string model_path_;
   std::unique_ptr<op::EncodeLayerBase> encode_layer_;
   std::map<ModelBufferType, tensor::Tensor> buffers_;
-  bool kv_bound_ = false;
-  tensor::Tensor kv_key_backup_;
-  tensor::Tensor kv_value_backup_;
   std::unique_ptr<sampler::Sampler> sampler_;
 
   // ---------- HF safetensors weight storage (host, BF16 raw bits) ----------

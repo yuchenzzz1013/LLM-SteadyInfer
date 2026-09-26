@@ -5,9 +5,9 @@ namespace base {
 Buffer::Buffer(size_t byte_size, std::shared_ptr<DeviceAllocator> allocator, void* ptr,
                bool use_external)
     : byte_size_(byte_size),
-      allocator_(allocator),
       ptr_(ptr),
-      use_external_(use_external) {
+      use_external_(use_external),
+      allocator_(allocator) {
   if (!ptr_ && allocator_) {
     device_type_ = allocator_->device_type();
     use_external_ = false;
@@ -83,7 +83,7 @@ void Buffer::copy_from(const Buffer& buffer) const {
 
 void Buffer::copy_from(const Buffer* buffer) const {
   CHECK(allocator_ != nullptr);
-  CHECK(buffer != nullptr || buffer->ptr_ != nullptr);
+  CHECK(buffer != nullptr && buffer->ptr_ != nullptr);
 
   size_t dest_size = byte_size_;
   size_t src_size = buffer->byte_size_;
@@ -121,10 +121,6 @@ void Buffer::set_device_type(DeviceType device_type) {
 
 std::shared_ptr<Buffer> Buffer::get_shared_from_this() {
   return shared_from_this();
-}
-
-bool Buffer::is_external() const {
-  return this->use_external_;
 }
 
 }  // namespace base

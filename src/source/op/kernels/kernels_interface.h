@@ -38,15 +38,11 @@ typedef void (*RoPEKernel)(int32_t dim, int32_t kv_dim, int32_t head_size,
                            const tensor::Tensor& input_pos, const tensor::Tensor& sin_cache,
                            const tensor::Tensor& cos_cache, void* stream);
 
-typedef void (*ScaleKernel)(float scale, const tensor::Tensor& input, void* stream);
-
 typedef void (*SoftmaxInplaceKernel)(const tensor::Tensor& input, void* stream);
 
 typedef void (*ScaleSumKernel)(const tensor::Tensor& value, const tensor::Tensor& scale,
                                const tensor::Tensor& output, int t, int size, int stride,
                                void* stream);
-
-void softmax_inplace_cpu(const float* input_ptr, size_t size);
 
 AddKernel get_add_kernel(base::DeviceType device_type);
 
@@ -61,8 +57,6 @@ MHAKernel get_mha_kernel(base::DeviceType device_type);
 RMSNormKernel get_rmsnorm_kernel(base::DeviceType device_type);
 
 RoPEKernel get_rope_kernel(base::DeviceType device_type);
-
-ScaleKernel get_scale_kernel(base::DeviceType device_type);
 
 SoftmaxInplaceKernel get_softmax_kernel(base::DeviceType device_type);
 

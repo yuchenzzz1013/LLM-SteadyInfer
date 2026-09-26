@@ -5,7 +5,6 @@
 #include "cpu/mha_kernel.h"
 #include "cpu/rmsnorm_kernel.h"
 #include "cpu/rope_kernel.h"
-#include "cpu/scale_kernel.h"
 #include "cpu/scale_sum_kernel.h"
 #include "cpu/softmax_kernel.h"
 #include "cpu/swiglu_kernel.h"
@@ -75,15 +74,6 @@ RoPEKernel get_rope_kernel(base::DeviceType device_type) {
     return rope_kernel_cpu;
   } else if (device_type == base::DeviceType::kDeviceCUDA) {
     return rope_kernel_cu;
-  } else {
-    LOG(FATAL) << "Unknown device type for get a rope kernel.";
-    return nullptr;
-  }
-}
-
-ScaleKernel get_scale_kernel(base::DeviceType device_type) {
-  if (device_type == base::DeviceType::kDeviceCPU) {
-    return scale_inplace_cpu;
   } else {
     LOG(FATAL) << "Unknown device type for get a rope kernel.";
     return nullptr;

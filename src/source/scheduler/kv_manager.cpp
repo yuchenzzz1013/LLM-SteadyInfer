@@ -97,11 +97,10 @@ bool KVManager::has_free_slot() const {
 
 int KVManager::busy_slot_count() const {
 #ifdef USE_PAGED_ATTENTION
-  int count = 0;
-  for (int r = 0; r < max_batch_; ++r) {
-    if (block_allocator_->num_used_blocks(r) > 0) ++count;
-  }
-  return count;
+  // Rows owned by a sequence — NOT "rows with at least one block": a fully
+  // prefix-shared prompt owns an empty (or shared-only) table but is still in
+  // flight, and counting it would understate the KV cache in use.
+  return block_allocator_->num_busy_rows();
 #else
   int count = 0;
   for (bool busy : slot_busy_) {

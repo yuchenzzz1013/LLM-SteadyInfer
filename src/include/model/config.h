@@ -15,18 +15,6 @@ struct HfConfig {
   bool tie_word_embeddings = false;
 };
 
-struct ModelConfig {
-  int32_t dim = 0;
-  int32_t hidden_dim = 0;
-  int32_t layer_num = 0;
-  int32_t head_num = 0;
-  int32_t kv_head_num = 0;
-  int32_t vocab_size = 0;
-  int32_t seq_len = 0;
-  int32_t immediate_dim_ = 0;  // Qwen3 intermediate FFN dimension (always present for ABI stability)
-  float rope_theta_ = 1000000.0f;  // RoPE base frequency (1e6 for Qwen, 5e5 for Llama)
-};
-
 struct TransformerConfig {
   int32_t kv_dim_ = 0;
   int32_t kv_mul_ = 0;

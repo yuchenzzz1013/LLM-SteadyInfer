@@ -105,9 +105,16 @@ void rmsnorm_kernel_cu_dim(const tensor::Tensor& input, const tensor::Tensor& we
         output.device_type() == base::DeviceType::kDeviceCUDA);
 
   const float eps = 1e-6f;
+  // Row length is the layer dim (as in the CPU kernel), not the tensor's last
+  // dim: the two agree for the [rows, dim] shapes the layer checks for, but
+  // only the former stays correct for any rank.
+  CHECK_GT(dim, 0);
   const int32_t total_size = static_cast<int32_t>(input.size());
-  const int32_t size = input.get_dim(input.dims_size() - 1);
-  const int32_t dim_size = total_size / size;
+  CHECK_EQ(total_size % dim, 0);
+  CHECK_EQ(weight.size(), static_cast<int64_t>(dim))
+      << "RMSNorm weight must cover exactly one row of `dim` elements.";
+  const int32_t size = dim;
+  const int32_t dim_size = total_size / dim;
 
   const __nv_bfloat16* in_ptr = input.ptr<__nv_bfloat16>();
   const __nv_bfloat16* wei_ptr = weight.ptr<__nv_bfloat16>();

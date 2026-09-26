@@ -47,11 +47,7 @@ struct Sequence {
   TimePoint first_token_time;        // When first token was generated
   TimePoint last_token_time;         // When last token was generated (for ITL)
   TimePoint finish_time;             // When the request finished
-  bool first_token_recorded = false;
   std::vector<double> token_timestamps_ms;  // ITL between consecutive generated tokens
-
-  bool is_active() const { return !is_finished; }
-  int total_tokens() const { return num_prompt_tokens + num_generated_tokens; }
 };
 
 }  // namespace scheduler

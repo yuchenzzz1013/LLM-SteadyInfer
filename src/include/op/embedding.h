@@ -7,11 +7,11 @@ struct EmbeddingOutput {
   tensor::Tensor input_tokens;
   tensor::Tensor input_embeddings;
   tensor::Tensor input_token_num;
-  explicit EmbeddingOutput(tensor::Tensor input_tokens, tensor::Tensor input_embeddings,
-                           tensor::Tensor input_token_num)
-      : input_tokens(std::move(input_tokens)),
-        input_embeddings(std::move(input_embeddings)),
-        input_token_num(std::move(input_token_num)) {}
+  explicit EmbeddingOutput(tensor::Tensor tokens, tensor::Tensor embeddings,
+                           tensor::Tensor token_num)
+      : input_tokens(std::move(tokens)),
+        input_embeddings(std::move(embeddings)),
+        input_token_num(std::move(token_num)) {}
 };
 
 class EmbeddingLayer : public LayerParam {

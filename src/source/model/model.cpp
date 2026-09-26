@@ -13,11 +13,11 @@
 namespace model {
 Model::Model(base::TokenizerType tokenizer_type, base::ModelType model_type, std::string token_path,
              std::string model_path, bool is_quant_model)
-    : tokenizer_type_(tokenizer_type),
-      model_type_(model_type),
+    : is_quant_model_(is_quant_model),
       token_path_(std::move(token_path)),
       model_path_(std::move(model_path)),
-      is_quant_model_(is_quant_model) {
+      model_type_(model_type),
+      tokenizer_type_(tokenizer_type) {
   // Escape hatch for A/B testing graph capture without rebuilding.
   const char* disable = std::getenv("LLAMA_DISABLE_CUDA_GRAPH");
   if (disable && std::string(disable) == "1") {
@@ -30,14 +30,18 @@ void BatchScratch::ensure(int32_t batch, int32_t hidden_dim, int32_t dim, int32_
                           int32_t max_seq_len, int32_t block_table_stride,
                           base::DeviceType device, base::DataType dtype,
                           const std::shared_ptr<base::DeviceAllocator>& alloc) {
+  const int32_t num_splits =
+      device == base::DeviceType::kDeviceCUDA ? kernel::flash_decoding_num_splits(max_seq_len) : 0;
   // dtype can differ between runs (BF16 CUDA model vs. FP32 CPU model);
   // re-allocate when the element type of the cached buffers changed.
   if (this->batch == batch && !hidden.is_empty() && hidden.get_dim(0) == batch &&
-      hidden.data_type() == dtype && this->block_table_stride == block_table_stride) {
+      hidden.data_type() == dtype && this->block_table_stride == block_table_stride &&
+      this->num_splits == num_splits) {
     return;
   }
   this->batch = batch;
   this->block_table_stride = block_table_stride;
+  this->num_splits = num_splits;
 
   hidden = tensor::Tensor(dtype, batch, hidden_dim, true, alloc);
   rms_out = tensor::Tensor(dtype, batch, hidden_dim, true, alloc);
@@ -62,7 +66,6 @@ void BatchScratch::ensure(int32_t batch, int32_t hidden_dim, int32_t dim, int32_
   input_token_num = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc_cpu);
 
   if (device == base::DeviceType::kDeviceCUDA) {
-    int32_t num_splits = kernel::flash_decoding_num_splits(max_seq_len);
     partial_batch = tensor::Tensor(dtype, static_cast<int64_t>(batch) * head_num * num_splits *
                                            (head_size + 2),
                                    true, alloc);
@@ -580,44 +583,6 @@ std::pair<tensor::Tensor, tensor::Tensor> Model::slice_kv_cache(int32_t layer_id
   return {key, val};
 }
 
-base::Status Model::bind_external_kv_cache(const tensor::Tensor& key_cache,
-                                           const tensor::Tensor& value_cache,
-                                           int32_t slot_id) {
-  using namespace base;
-  if (kv_bound_) {
-    unbind_external_kv_cache();
-  }
-  // The external cache now uses the head-dim-contiguous layout
-  // [num_layers, num_slots, kv_dim, max_seq_len]; the legacy single-sequence
-  // kernels index an internal [num_layers, seq, kv_dim] cache, which cannot
-  // be expressed as a flat view of the transposed external layout. Serving
-  // goes through forward_batch/decode_step (continuous batching), so this
-  // legacy bridge is no longer supported — fail loudly instead of silently
-  // mis-indexing the cache.
-  const int32_t num_slots = key_cache.get_dim(1);
-  const int32_t kv_dim = key_cache.get_dim(2);
-  const int32_t max_seq_len = key_cache.get_dim(3);
-  if (key_cache.get_dim(0) != config_->layer_num_ || kv_dim != config_->kv_dim_ ||
-      value_cache.get_dim(0) != config_->layer_num_ || value_cache.get_dim(1) != num_slots ||
-      value_cache.get_dim(2) != kv_dim || value_cache.get_dim(3) != max_seq_len) {
-    return error::InvalidArgument("External KV cache shape out of range");
-  }
-  LOG(WARNING) << "bind_external_kv_cache is not supported with the head-dim-contiguous "
-                  "external KV layout; use the continuous-batching path (forward_batch / "
-                  "decode_step) instead.";
-  return error::InvalidArgument(
-      "Legacy external-KV binding is unsupported with the head-dim-contiguous cache layout.");
-}
-
-void Model::unbind_external_kv_cache() {
-  if (!kv_bound_) {
-    return;
-  }
-  buffers_.at(ModelBufferType::kKeyCache) = std::move(kv_key_backup_);
-  buffers_.at(ModelBufferType::kValueCache) = std::move(kv_value_backup_);
-  kv_bound_ = false;
-}
-
 tensor::Tensor Model::fill_input(const tensor::Tensor& pos_tensor,
                                  const op::EmbeddingOutput& embedding_output,
                                  bool is_prompt) const {
@@ -646,7 +611,7 @@ tensor::Tensor Model::fill_input(const tensor::Tensor& pos_tensor,
                          static_cast<size_t>(index) * model_dim * elem_size),
       true);
   tensor::Tensor input(dtype, model_dim);
-  input.assign(input_emb_buffer);
+  CHECK(input.assign(input_emb_buffer));
   input.set_device_type(device_type_);
   return input;
 }
@@ -676,8 +641,6 @@ std::vector<int32_t> Model::post_processing_batch(const tensor::Tensor& logits) 
 
 void Model::resize_internal_kv_cache(int32_t max_seq_len) {
   if (max_seq_len <= 0) return;
-  // Drop any stale external-slot views before touching the real internal cache.
-  unbind_external_kv_cache();
 
   // Any captured decode graph may reference the old internal buffers
   // (single-sequence prefill path); invalidate the pool so the next decode

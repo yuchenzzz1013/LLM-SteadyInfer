@@ -6,6 +6,16 @@
 
 namespace kernel {
 
+// Geometry the paged warp-per-head decode kernel can serve: it owns exactly 4
+// head dims per lane (head_size == 128) and its 4-position arithmetic group
+// must stay inside one page (block_size >= 4). Every other geometry (including
+// the continuous layout, which reports block_size == 0) stays on the
+// split-partials fallback inside paged_attention_cu_batch, so callers must size
+// score_batch for it whenever this returns false.
+inline bool paged_decode_geometry_ok(int32_t head_size, int32_t table_stride, int32_t block_size) {
+  return head_size == 128 && table_stride > 0 && block_size >= 4;
+}
+
 // Paged KV cache layout (vLLM-style):
 //   [num_layers, num_blocks, block_size, kv_dim]
 // element (layer, block, pos_in_block, d) at

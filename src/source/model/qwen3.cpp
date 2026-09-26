@@ -30,7 +30,13 @@ SectTimer& sect_timer() {
   return t;
 }
 }  // namespace
-#define SECT_REC(idx) sect_timer().record((idx), cuda_config_->stream)
+// The timer is CUDA-event based, so it stays dark on the CPU path — where
+// cuda_config_ is null and even evaluating the stream would fault.
+#define SECT_REC(idx)                                    \
+  do {                                                   \
+    SectTimer& st = sect_timer();                        \
+    if (st.on && cuda_config_) st.record((idx), cuda_config_->stream); \
+  } while (0)
 #include <string>
 #include <utility>
 #include "../op/kernels/cpu/mha_kernel.h"
@@ -144,12 +150,14 @@ base::Status Qwen3Model::init(base::DeviceType device_type) {
 
   device_type_ = device_type;
   if (device_type == DeviceType::kDeviceCUDA) {
-    cudaSetDevice(0);
+    if (cudaSetDevice(0) != cudaSuccess) {
+      return error::InternalError("cudaSetDevice(0) failed.");
+    }
     cuda_config_ = std::make_shared<kernel::CudaConfig>();
-    cudaStreamCreate(&cuda_config_->stream);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-      return error::InternalError("The cuda hanle create failed.");
+    // Check the call's own status: cudaGetLastError() here could report a stale
+    // error left over by an earlier call instead of this one.
+    if (cudaStreamCreate(&cuda_config_->stream) != cudaSuccess) {
+      return error::InternalError("The cuda handle create failed.");
     }
   }
 
@@ -689,8 +697,6 @@ void Qwen3Model::attention_mha(int32_t layer_idx, const tensor::Tensor& pos_tens
   CHECK(qwen_layers_ != nullptr);
   // mha
   tensor::Tensor key_cache = get_buffer(ModelBufferType::kKeyCache);
-  // VAL = [val1,val2,...val t]
-  // output @ VAL = 最终的结果
   tensor::Tensor val_cache = get_buffer(ModelBufferType::kValueCache);
 
   tensor::Tensor mha_output = get_buffer(ModelBufferType::kOutputMHA);
@@ -902,14 +908,16 @@ base::Status Qwen3Model::forward_batch(
     key_batch = tensor::Tensor(dtype, batch, kv_dim, true, alloc);
     val_batch = tensor::Tensor(dtype, batch, kv_dim, true, alloc);
     qkv_out = tensor::Tensor(dtype, batch, config_->dim_ + 2 * kv_dim, true, alloc);
-    // Split-KV partials are only produced by the fallback attention path
-    // (continuous CUDA layout, or a head_size the warp/prefill kernels do not
-    // cover). The paged warp2 decode kernel and the prefill kernel accumulate
+    // Split-KV partials are only produced by the fallback attention path — the
+    // geometry warp2 does not serve (see paged_decode_geometry_ok: anything
+    // else writes its partials through a null score_batch) and the continuous
+    // layout. The warp2 decode kernel and the prefill kernel accumulate
     // online-softmax state in registers and never touch score_batch, so a
-    // prefill chunk / mixed step skips the allocation entirely — for a
-    // 512-row chunk that is ~35 MB of scratch per layer per step.
-    if (device_type_ == base::DeviceType::kDeviceCUDA &&
-        (!cache_dims.paged || config_->head_size_ != 128)) {
+    // prefill chunk / mixed step skips the allocation entirely — for a 512-row
+    // chunk that is ~35 MB of scratch per layer per step.
+    const bool warp2_covers = cache_dims.paged && kernel::paged_decode_geometry_ok(
+                                                    config_->head_size_, table_stride, block_size);
+    if (device_type_ == base::DeviceType::kDeviceCUDA && !warp2_covers) {
       int32_t num_splits = kernel::flash_decoding_num_splits(max_seq_len);
       // Score rows of head_size floats; BF16 splits keep the same row count.
       partial_batch = tensor::Tensor(

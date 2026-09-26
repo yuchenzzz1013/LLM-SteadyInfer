@@ -13,10 +13,9 @@
 //      跳过的 prefill 比例 skipped_prefill_ratio(prefix cache 的直接收益来源)。
 //
 // 用法:
-//   ./build/benchmark/prefix_caching_benchmark \
-//       --dataset ShareGPT_prompts.jsonl --model-dir Qwen3-4B \
-//       --tokenizer Qwen3-4B/tokenizer.json \
-//       --num-requests 128 --max-batch 32 --max-gen 128 \
+//   ./build/benchmark/prefix_caching_benchmark --dataset ShareGPT_prompts.jsonl
+//       --model-dir Qwen3-4B --tokenizer Qwen3-4B/tokenizer.json
+//       --num-requests 128 --max-batch 32 --max-gen 128
 //       --prefix-len 256 --prefix-mode shared --block-size 16
 //
 // 两个容易踩的口径问题(实现里都有对应处理,细节见 run_round):
@@ -104,25 +103,34 @@ static Args parse_args(int argc, char** argv) {
   if (has_arg(argc, argv, "--output-csv"))
     a.output_csv = get_arg(argc, argv, "--output-csv");
   if (has_arg(argc, argv, "--num-requests"))
-    a.num_requests = std::stoi(get_arg(argc, argv, "--num-requests"));
+    a.num_requests = to_int(get_arg(argc, argv, "--num-requests"));
   if (has_arg(argc, argv, "--max-batch"))
-    a.max_batch = std::stoi(get_arg(argc, argv, "--max-batch"));
+    a.max_batch = to_int(get_arg(argc, argv, "--max-batch"));
   if (has_arg(argc, argv, "--max-gen"))
-    a.max_gen = std::stoi(get_arg(argc, argv, "--max-gen"));
+    a.max_gen = to_int(get_arg(argc, argv, "--max-gen"));
   if (has_arg(argc, argv, "--prefix-len"))
-    a.prefix_len = std::stoi(get_arg(argc, argv, "--prefix-len"));
+    a.prefix_len = to_int(get_arg(argc, argv, "--prefix-len"));
   if (has_arg(argc, argv, "--prefix-mode"))
     a.prefix_mode = get_arg(argc, argv, "--prefix-mode");
   if (has_arg(argc, argv, "--seed"))
-    a.seed = std::stoi(get_arg(argc, argv, "--seed"));
+    a.seed = to_int(get_arg(argc, argv, "--seed"));
   if (has_arg(argc, argv, "--warmup-requests"))
-    a.warmup_requests = std::stoi(get_arg(argc, argv, "--warmup-requests"));
+    a.warmup_requests = to_int(get_arg(argc, argv, "--warmup-requests"));
   if (has_arg(argc, argv, "--warmup-iterations"))
-    a.warmup_iterations = std::stoi(get_arg(argc, argv, "--warmup-iterations"));
+    a.warmup_iterations = to_int(get_arg(argc, argv, "--warmup-iterations"));
   if (has_arg(argc, argv, "--block-size"))
-    a.block_size = std::stoi(get_arg(argc, argv, "--block-size"));
+    a.block_size = to_int(get_arg(argc, argv, "--block-size"));
   if (has_arg(argc, argv, "--prime-prefix-cache"))
-    a.prime_prefix_cache = std::stoi(get_arg(argc, argv, "--prime-prefix-cache"));
+    a.prime_prefix_cache = to_int(get_arg(argc, argv, "--prime-prefix-cache"));
+
+  // 参数兜底:负值此前会在 vector 分配处抛 length_error 崩溃
+  // (prefix_mode / prefix_len 的校验在 main 里已有,这里不重复)。
+  if (a.num_requests < 0) a.num_requests = 0;
+  if (a.max_batch < 1) a.max_batch = 1;
+  if (a.max_gen < 1) a.max_gen = 1;
+  if (a.block_size < 1) a.block_size = 1;
+  if (a.warmup_iterations < 0) a.warmup_iterations = 0;
+  if (a.warmup_requests < 0) a.warmup_requests = 0;
   return a;
 }
 

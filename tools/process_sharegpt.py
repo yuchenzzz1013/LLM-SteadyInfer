@@ -40,6 +40,8 @@ def parse_args():
 
 def clean_conversations(sample):
     """只保留 human 的 value,返回 [value, ...];无有效 human 则返回空列表。"""
+    if not isinstance(sample, dict):
+        return []
     convs = sample.get("conversations")
     if not isinstance(convs, list):
         return []

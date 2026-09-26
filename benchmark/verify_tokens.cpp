@@ -41,7 +41,17 @@ int main(int argc, char* argv[]) {
   }
   const std::string model_dir = argv[1];
   const std::string tokenizer = argv[2];
-  int max_gen = std::stoi(argv[3]);
+  int max_gen = 0;
+  try {
+    max_gen = std::stoi(argv[3]);
+  } catch (const std::exception&) {
+    std::cerr << "max_gen 需要整数,收到: \"" << argv[3] << "\"\n";
+    return -1;
+  }
+  if (max_gen <= 0) {
+    std::cerr << "max_gen 必须为正数,收到: " << max_gen << "\n";
+    return -1;
+  }
   std::string prompt = (argc > 4 && std::string(argv[4]).rfind("--", 0) != 0)
                            ? argv[4] : "What is AI?";
 
@@ -90,9 +100,21 @@ int main(int argc, char* argv[]) {
   int max_seq_len = static_cast<int>(tokens.size()) + max_gen;
   scheduler::Scheduler sched(model, 1, max_seq_len, max_gen, /*block_size=*/0,
                              /*enable_prefix_cache=*/false);
-  sched.add_request(tokens);
+  const int seq_id = sched.add_request(tokens);
+  if (seq_id < 0) {
+    std::cerr << "The scheduler rejected the prompt (" << tokens.size()
+              << " tokens, max_seq_len " << max_seq_len << ").\n";
+    return 1;
+  }
   while (!sched.all_finished()) sched.step();
   cudaDeviceSynchronize();
+
+  // Empty output must not look like a successful (and therefore "matching")
+  // A/B run: an A/B diff of two builds that both print nothing would pass.
+  if (sched.get_finished().empty()) {
+    std::cerr << "No sequence finished — generation failed.\n";
+    return 1;
+  }
 
   std::cout << "MODEL: " << model_dir << " (" << model_type << ")\n";
   std::cout << "PROMPT: " << prompt << "\n";

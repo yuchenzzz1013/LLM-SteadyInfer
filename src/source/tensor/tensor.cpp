@@ -227,7 +227,7 @@ int32_t Tensor::dims_size() const { return static_cast<int32_t>(dims_.size()); }
 base::DataType Tensor::data_type() const { return data_type_; }
 
 void Tensor::reshape(const std::vector<int32_t>& dims) {
-  size_t size = reduce_dimension(dims.begin(), dims.end(), 1);
+  size_t size = reduce_dimension(dims.begin(), dims.end(), 1LL);
   if (!buffer_) {
     this->dims_ = dims;
     this->size_ = size;
@@ -235,9 +235,13 @@ void Tensor::reshape(const std::vector<int32_t>& dims) {
   }
 
   if (size > size_) {
+    // Buffer's constructor already allocates through the same allocator;
+    // calling allocate() on top of it would allocate a second block and leak
+    // the first one.
     auto new_buffer = std::make_shared<base::Buffer>(size * base::DataTypeSize(this->data_type_),
                                                      buffer_->allocator());
-    CHECK(new_buffer->allocate());
+    CHECK(new_buffer->ptr() != nullptr)
+        << "reshape: failed to grow the buffer to " << size << " elements";
     new_buffer->copy_from(buffer_.get());
     this->buffer_ = new_buffer;
   }
@@ -263,7 +267,7 @@ std::vector<size_t> Tensor::strides() const {
   std::vector<size_t> strides;
   if (!dims_.empty()) {
     for (int32_t i = 0; i < dims_.size() - 1; ++i) {
-      size_t stride = reduce_dimension(dims_.begin() + i + 1, dims_.end(), 1);
+      size_t stride = reduce_dimension(dims_.begin() + i + 1, dims_.end(), 1LL);
       strides.push_back(stride);
     }
     strides.push_back(1);

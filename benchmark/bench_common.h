@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -42,6 +43,28 @@ inline bool has_arg(int argc, char** argv, const std::string& name) {
     if (std::string(argv[i]) == name) return true;
   }
   return false;
+}
+
+// std::stoi / std::stod throw on bad input and nothing above catches them (the
+// process just aborts): report the offending value and exit instead.
+inline int to_int(const std::string& s) {
+  try {
+    return std::stoi(s);
+  } catch (const std::exception&) {
+    std::cerr << "[bench] 非法整数参数: \"" << s << "\"\n";
+    std::exit(2);
+  }
+  return 0;  // unreachable
+}
+
+inline double to_double(const std::string& s) {
+  try {
+    return std::stod(s);
+  } catch (const std::exception&) {
+    std::cerr << "[bench] 非法浮点参数: \"" << s << "\"\n";
+    std::exit(2);
+  }
+  return 0.0;  // unreachable
 }
 
 // 默认路径解析:优先按 CWD 解释,失败则相对可执行文件推断出的项目根目录
@@ -92,12 +115,18 @@ inline std::vector<Request> load_dataset(const std::string& path) {
 
 // ============================== 统计工具 ==============================
 
-inline double percentile(std::vector<double> data, double p) {
+// Nearest-rank percentile. Takes the samples by value: they must be sorted,
+// and callers reuse their vectors (latency lists) after the call.
+inline double percentile(const std::vector<double>& data, double p) {
   if (data.empty()) return 0.0;
-  std::sort(data.begin(), data.end());
-  size_t idx = static_cast<size_t>(std::ceil(p / 100.0 * data.size()) - 1);
-  if (idx >= data.size()) idx = data.size() - 1;
-  return data[idx];
+  std::vector<double> sorted = data;
+  std::sort(sorted.begin(), sorted.end());
+  // ceil(p/100 * n) - 1 clamped to [0, n-1]: p == 0 (and any p below the first
+  // rank) must return the minimum, not the maximum.
+  const double rank = std::ceil(p / 100.0 * static_cast<double>(sorted.size())) - 1.0;
+  size_t idx = rank < 0.0 ? 0 : static_cast<size_t>(rank);
+  if (idx >= sorted.size()) idx = sorted.size() - 1;
+  return sorted[idx];
 }
 
 inline double mean(const std::vector<double>& v) {
@@ -141,14 +170,21 @@ class GpuUtilSampler {
     while (!stop_.load()) {
       nvmlUtilization_t u{};
       nvmlMemory_t m{};
+      bool got = false;
       if (nvmlDeviceGetUtilizationRates(dev_, &u) == NVML_SUCCESS) {
         sm_sum_ += u.gpu;
         mem_sum_ += u.memory;
+        got = true;
       }
       if (nvmlDeviceGetMemoryInfo(dev_, &m) == NVML_SUCCESS) {
         mem_used_mb_sum_ += static_cast<double>(m.used) / (1024.0 * 1024.0);
+        got = true;
       }
-      samples_++;
+      // Only count ticks that actually produced a sample — a failed query must
+      // not dilute the averages.
+      if (got) {
+        samples_++;
+      }
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
   }
@@ -157,7 +193,7 @@ class GpuUtilSampler {
   std::atomic<bool> stop_{true};
   std::thread th_;
   double sm_sum_ = 0.0, mem_sum_ = 0.0, mem_used_mb_sum_ = 0.0;
-  int samples_ = 0;
+  std::atomic<int> samples_{0};
 };
 
 // ============================== 硬件峰值算力 / MFU ==============================

@@ -59,9 +59,9 @@ void matmul_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight,
   const int32_t K = weight.get_dim(0);  // row (output dim per sample)
   const int32_t M = weight.get_dim(1);  // col (input dim per sample)
 
-  int32_t input_size = input.size();
-  int32_t output_size = output.size();
-  int32_t batch = input_size / M;
+  const int32_t input_size = static_cast<int32_t>(input.size());
+  const int32_t output_size = static_cast<int32_t>(output.size());
+  const int32_t batch = input_size / M;
 
   CHECK_EQ(input_size % M, 0);
   CHECK_EQ(output_size % K, 0);
@@ -90,8 +90,14 @@ void matmul_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight,
       if (st == CUBLAS_STATUS_SUCCESS) {
         return;
       }
-      LOG(WARNING) << "[MATMUL-BF16] cublasGemmEx BF16 failed (" << int(st)
-                   << "); falling back to the custom kernel.";
+      // Log once: a persistent cuBLAS failure would otherwise print this on
+      // every GEMM of every token.
+      static bool cublas_warned = false;
+      if (!cublas_warned) {
+        cublas_warned = true;
+        LOG(WARNING) << "[MATMUL-BF16] cublasGemmEx BF16 failed (" << int(st)
+                     << "); falling back to the custom kernel (warning printed once).";
+      }
     }
   }
 

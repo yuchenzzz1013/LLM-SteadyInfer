@@ -7,22 +7,6 @@
 #include "op/rope.h"
 #include "op/swiglu.h"
 namespace model {
-struct QWen3TransformerConfig {
-  int32_t kv_dim_ = 0;
-  int32_t kv_mul_ = 0;
-  int32_t head_size_ = 0;
-  int32_t immediate_size_ = 0;
-  int32_t vocab_size_ = 0;
-
-  int32_t dim_ = 0;
-  int32_t hidden_dim_ = 0;
-  int32_t layer_num_ = 0;
-  int32_t head_num_ = 0;
-  int32_t kv_head_num_ = 0;
-  int32_t seq_len_ = 0;
-  bool is_shared_weight_ = false;
-};
-
 struct Qwen3Layers {
   std::shared_ptr<op::Layer> add_layer_;
   std::shared_ptr<op::Layer> rope_layer_;

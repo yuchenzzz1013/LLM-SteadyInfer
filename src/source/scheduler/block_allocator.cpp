@@ -12,7 +12,8 @@ BlockAllocator::BlockAllocator(int num_blocks, int num_rows, int max_blocks_per_
       free_blocks_(num_blocks),
       ref_counts_(num_blocks, 0),
       cached_(num_blocks, 0),
-      block_tables_(static_cast<size_t>(num_rows) * max_blocks_per_seq, -1) {
+      block_tables_(static_cast<size_t>(num_rows) * max_blocks_per_seq, -1),
+      row_busy_(num_rows, 0) {
   // Start with the whole pool free. Fill back-to-front so the first
   // allocation pops block 0 and allocation locality stays ascending.
   for (int i = 0; i < num_blocks_; ++i) {
@@ -22,9 +23,11 @@ BlockAllocator::BlockAllocator(int num_blocks, int num_rows, int max_blocks_per_
   CHECK_GT(num_blocks_, 0) << "num_blocks must be positive";
 }
 
-void BlockAllocator::reclaim_for(size_t n) {
-  if (free_blocks_.size() >= n || !reclaim_fn_) return;
-  reclaim_fn_(static_cast<int>(n - free_blocks_.size()));
+void BlockAllocator::reclaim_for(int n) {
+  if (n <= 0 || !reclaim_fn_) return;
+  const int short_by = n - static_cast<int>(free_blocks_.size());
+  if (short_by <= 0) return;
+  reclaim_fn_(short_by);
 }
 
 int BlockAllocator::append_blocks(int row, int n) {
@@ -36,7 +39,7 @@ int BlockAllocator::append_blocks(int row, int n) {
     return -1;
   }
   // Free list first, cached blocks second (prefix-cache LRU eviction).
-  reclaim_for(static_cast<size_t>(n));
+  reclaim_for(n);
   if (static_cast<int>(free_blocks_.size()) < n) {
     return -1;
   }
@@ -54,23 +57,29 @@ int BlockAllocator::append_blocks(int row, int n) {
 }
 
 int BlockAllocator::allocate_blocks(int n) {
-  if (n > max_blocks_per_seq_) {
-    LOG(ERROR) << "[BLOCK] allocate_blocks: " << n << " exceeds table width "
-               << max_blocks_per_seq_;
-    return -1;
-  }
   if (n < 0) {
     return -1;
   }
-  reclaim_for(static_cast<size_t>(n));
-  if (static_cast<int>(free_blocks_.size()) < n) {
+  if (n > max_blocks_per_seq_) {
+    // Log once: this fires from the admission loop, so a persistent mismatch
+    // (e.g. a block size that disagrees with the pool's) would otherwise flood
+    // the log at scheduler-step rate — it once produced tens of GB of /tmp.
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      LOG(ERROR) << "[BLOCK] allocate_blocks: " << n << " exceeds table width "
+                 << max_blocks_per_seq_ << " (further occurrences not logged)";
+    }
     return -1;
   }
 
-  // Find a free row (first-fit, same policy as the old slot allocator).
+  // Find a free row first (first-fit, same policy as the old slot allocator):
+  // reclaiming cached blocks is pointless when the limit is rows, not blocks.
+  // row_busy_ (not "table[0] == -1") is what marks a row as taken, so an n == 0
+  // row — prefix-cache-only, empty table — cannot be handed out twice.
   int row = -1;
   for (int r = 0; r < num_rows_; ++r) {
-    if (block_tables_[static_cast<size_t>(r) * max_blocks_per_seq_] == -1) {
+    if (!row_busy_[r]) {
       row = r;
       break;
     }
@@ -79,6 +88,12 @@ int BlockAllocator::allocate_blocks(int n) {
     return -1;
   }
 
+  reclaim_for(n);
+  if (static_cast<int>(free_blocks_.size()) < n) {
+    return -1;
+  }
+
+  row_busy_[row] = 1;
   for (int i = 0; i < n; ++i) {
     int block_idx = free_blocks_.back();
     free_blocks_.pop_back();
@@ -128,17 +143,46 @@ bool BlockAllocator::reserve_shared_prefix(int row, const std::vector<int32_t>& 
 
 void BlockAllocator::free_blocks_from(int row, int start_block_idx) {
   if (row < 0 || row >= num_rows_) return;
-  for (int i = start_block_idx; i < max_blocks_per_seq_; ++i) {
+  bool any_left = false;
+  for (int i = 0; i < max_blocks_per_seq_; ++i) {
     int32_t& slot = block_tables_[static_cast<size_t>(row) * max_blocks_per_seq_ + i];
     if (slot < 0) continue;
-    const int block_idx = slot;
-    slot = -1;
-    CHECK_GT(ref_counts_[block_idx], 0) << "freeing block " << block_idx
-                                        << " with zero refcount (row=" << row << ")";
-    if (--ref_counts_[block_idx] == 0) {
-      release_block(block_idx);
+    if (i >= start_block_idx) {
+      const int block_idx = slot;
+      slot = -1;
+      CHECK_GT(ref_counts_[block_idx], 0) << "freeing block " << block_idx
+                                          << " with zero refcount (row=" << row << ")";
+      if (--ref_counts_[block_idx] == 0) {
+        release_block(block_idx);
+      }
+    } else {
+      any_left = true;
     }
   }
+  // An empty row is free again; a row keeping its prefix (truncation) is not.
+  if (!any_left) row_busy_[row] = 0;
+}
+
+int BlockAllocator::reclaimable_blocks_from(int row, int start_block_idx) const {
+  if (row < 0 || row >= num_rows_) return 0;
+  const int32_t* table = block_table_row(row);
+  int n = 0;
+  for (int i = std::max(0, start_block_idx); i < max_blocks_per_seq_; ++i) {
+    const int b = table[i];
+    // Only blocks this row alone owns come back to the free list: a shared
+    // block (refcount > 1) stays mounted in the other rows, and a cached block
+    // is parked for the prefix cache instead of being handed out again.
+    if (b >= 0 && ref_counts_[b] == 1 && !cached_[b]) ++n;
+  }
+  return n;
+}
+
+int BlockAllocator::num_busy_rows() const {
+  int n = 0;
+  for (uint8_t busy : row_busy_) {
+    if (busy) ++n;
+  }
+  return n;
 }
 
 void BlockAllocator::free_all(int row) { free_blocks_from(row, 0); }

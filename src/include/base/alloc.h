@@ -47,8 +47,8 @@ struct CudaMemoryBuffer {
 
   CudaMemoryBuffer() = default;
 
-  CudaMemoryBuffer(void* data, size_t byte_size, bool busy)
-      : data(data), byte_size(byte_size), busy(busy) {}
+  CudaMemoryBuffer(void* data, size_t byte_size, bool is_busy)
+      : data(data), byte_size(byte_size), busy(is_busy) {}
 };
 
 class CUDADeviceAllocator : public DeviceAllocator {

@@ -45,7 +45,6 @@ class Scheduler {
 
   // KV cache stats
   int get_busy_kv_slots() const;
-  int get_max_kv_seq_len() const;
   // Reserved KV capacity in tokens (paged: allocated blocks x block_size;
   // continuous: busy slots x max_seq_len). 0 when unavailable.
   long long get_allocated_kv_tokens() const;
@@ -89,11 +88,18 @@ class Scheduler {
 
   // Preemption (recompute-style, no CPU swap): evict tail blocks from the
   // most recently admitted RUNNING sequence until `need_blocks` are free.
-  // Victims keep >= 1 block, get truncated to the block boundary, and are
-  // moved to the front of the waiting queue. skip_seq_id avoids victimizing
-  // the sequence the blocks are being freed FOR.
+  // Returns true only once the free list really holds `need_blocks` blocks —
+  // a victim's tail can be all shared / cache-pinned blocks, which free
+  // nothing when the row drops them. Victims keep >= 1 block and are marked
+  // PREEMPTED; flush_preempted() retires them after the step's forward pass.
+  // skip_seq_id avoids victimizing the sequence the blocks are freed FOR.
   bool try_preempt_for(int need_blocks, int skip_seq_id);
   void truncate_sequence(Sequence& seq, int keep_blocks);
+  // Retire the PREEMPTED sequences of this step: move them to the head of the
+  // waiting queue (oldest first — they are in-flight requests and jump ahead
+  // of fresh arrivals on resume) and drop them from the running set. Called
+  // only once no batch row points into running_sequences_ any more.
+  void flush_preempted();
   // Lazy block growth: make sure seq owns blocks up to `position`.
   bool ensure_blocks_for(Sequence* seq, int position);
   // Record the prompt blocks whose KV this step's forward pass just committed
@@ -121,7 +127,12 @@ class Scheduler {
   // reused every step (one small H2D per mixed step).
   tensor::Tensor seq_row_start_host_;
   tensor::Tensor seq_row_start_cu_;
+  // Sequences holding a row in the batch currently being built: preempting one
+  // of these would truncate a block table the forward pass is about to read.
+  std::vector<const Sequence*> batch_row_seqs_;
   std::deque<Sequence> waiting_queue_;  // deque: preempted seqs jump the head
+  // BatchRow holds Sequence*, so this vector must never reallocate while a
+  // batch is in flight: reserved to the admission cap (see the constructor).
   std::vector<Sequence> running_sequences_;
   std::vector<Sequence> finished_sequences_;
   std::vector<double> batch_reconstruct_times_ms_;  // per decode-step overhead

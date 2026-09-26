@@ -7,8 +7,8 @@ class MultiHeadAttention : public op::Layer {
  public:
   // kv_head_num is the number of GQA KV heads. The KV head for attention head
   // h is h * kv_head_num / head_num, which handles uneven GQA splits (e.g.
-  // Qwen3-4B: 36 heads / 8 KV heads) correctly — unlike head / (head_num /
-  // kv_head_num), which mis-maps heads and reads out of bounds.
+  // Qwen3-4B: 32 query heads / 8 KV heads) correctly — unlike head / (head_num
+  // / kv_head_num), which mis-maps heads and reads out of bounds.
   explicit MultiHeadAttention(base::DeviceType device_type, int32_t layer_index,
                               int32_t kv_head_num, int32_t kv_dim, int32_t seq_len,
                               int32_t head_num, int32_t head_size);
