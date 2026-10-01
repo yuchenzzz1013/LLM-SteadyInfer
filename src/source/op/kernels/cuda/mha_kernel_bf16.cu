@@ -21,17 +21,23 @@
 // (bf16 operands, fp32 accumulation) rather than FP32 kernels — activation and
 // cache data never round-trips through FP32 storage.
 //
-// Partials buffers (o | m | l) are stored as bf16 elements per split slot;
-// the slot stride (head_size + 2 elements) matches the fp32 layout, so the
-// scratch tensors only need the same element counts in the model dtype.
+// Partials buffers hold one slot per (row, head, split). Two layouts share
+// them: bf16 (o | m | l) rows of head_size + 2 elements (continuous layout,
+// and the paged fallback for geometries paged_decode_geometry_ok rejects), and
+// fp32 (acc | m | l) rows of head_size + 4 floats written by the paged
+// split-KV decode kernel — 2x the bf16 element count, since a bf16 partial
+// would round the split's running accumulator before the combine. Callers size
+// with flash_decoding_partials_elements (mha_kernel.cuh).
 #include <base/cuda_config.h>
 #include <tensor/tensor.h>
 #include <cfloat>
+#include <cstdlib>
 #include <vector>
 #include <cuda_bf16.h>
 #include <cub/cub.cuh>
 #include "mha_kernel.cuh"
 #include "paged_kernels.cuh"
+#include "model/qkv_split.h"
 namespace kernel {
 
 // Flash-softmax helper: scores live in fp32 smem (computed from bf16 inputs);
@@ -702,6 +708,245 @@ __global__ void paged_attn_warp2_kernel_bf16(
   *reinterpret_cast<uint2*>(output + out_base + d0) = *reinterpret_cast<const uint2*>(o);
 }
 
+// ========== Paged decode attention, split-KV (flash decoding) ==============
+// Same per-(row, head, position) arithmetic as paged_attn_warp2_kernel_bf16 —
+// 4 contiguous head dims per lane, groups of 4 positions sharing one rescale,
+// the same 5-shuffle score reduction and the same < 4-position tail — but the
+// causal prefix [0, seq) of a row is cut into num_splits ranges and every
+// (row, head, split) triple gets its own warp.
+//
+// Why: warp2 launches exactly batch * head_num warps, so with batch 1 (32
+// warps over 108 SMs) it idles the GPU, and in a mixed batch every row waits
+// on the longest row's prefix — the step costs max(seq), not mean(seq).
+// Splitting multiplies the warp count by num_splits and cuts that tail.
+// Measured A100-PCIE, head_size 128, H = 32, block_size 16, seq per row:
+//   batch 1  : 2.5x (seq 64) .. 7.4x (seq 1024)
+//   batch 32 : 1.69x (all 512) 1.84x (all 1024) 2.39x (ramp 64..1024)
+//              4.81x (one row 1024, the other 31 at 64)
+// The short-row cases are where the fixed cost shows: all rows 64 measured
+// 0.99x with S = 2 and the split ranges are computed per warp at run time, so
+// those warps exit early and cost a gather + a store.
+//
+// Graph safety: num_splits is derived from the KV *capacity* (see
+// flash_decoding_num_splits), never from the step's positions, so the launch
+// configuration frozen into a captured decode graph stays correct as the
+// batch's sequences grow. Empty ranges fall out of the arithmetic: a warp
+// whose lo >= seq writes m = -FLT_MAX, l = 0, acc = 0, and the combine gives
+// that slot weight exp(-inf) = 0.
+//
+// Partials are FP32 (acc[head_size] | m | l) at a stride of head_size + 4
+// floats — the acc vector is written as one float4 per lane, so the row start
+// must stay 16B aligned; the trailing 2-element pad keeps the stride a
+// multiple of 4 floats. bf16 partials would round the running acc to 8 bits of
+// mantissa on every split before the combine, which is exactly the precision
+// the online softmax is meant to preserve. The fp32 rows are 2x the bf16
+// element count, which is what BatchScratch sizes partial_batch for.
+__global__ void paged_attn_warp2_split_kernel_bf16(
+    const int32_t* __restrict__ positions, int32_t batch, const int32_t* __restrict__ block_table,
+    int32_t table_stride, int32_t num_blocks, int32_t block_size, int32_t block_shift,
+    int32_t layer_idx, int32_t dim, const __nv_bfloat16* __restrict__ query,
+    float* __restrict__ partials, const __nv_bfloat16* __restrict__ key_cache,
+    const __nv_bfloat16* __restrict__ value_cache, int32_t kv_dim, int32_t kv_head_num,
+    int32_t head_num, int32_t head_size, int32_t num_splits) {
+  constexpr int kVec = 4;  // head dims per lane; head_size == 128
+  constexpr int kGroup = 4;
+  const int warp_id = (blockIdx.x * (blockDim.x >> 5)) + (threadIdx.x >> 5);
+  const int lane = threadIdx.x & 31;
+  const int pair = warp_id / num_splits;  // b * head_num + head
+  const int split = warp_id - pair * num_splits;
+  const int b = pair / head_num;
+  // The grid is a whole number of 8-warp blocks, so it can carry up to 7 warps
+  // more than batch * head_num * num_splits: they own no row and must not
+  // index positions / query / partials with b >= batch.
+  if (b >= batch) return;
+  const int head = pair - b * head_num;
+  const int pos = positions[b];
+  const float scale = 1.f / sqrtf(static_cast<float>(head_size));
+  const int head_offset = (head * kv_head_num / head_num) * head_size;
+  const int32_t* table_row = block_table + static_cast<int64_t>(b) * table_stride;
+  const int64_t layer_base =
+      static_cast<int64_t>(layer_idx) * num_blocks * block_size * kv_dim;
+  const __nv_bfloat16* q_head = query + static_cast<int64_t>(b) * dim + head * head_size;
+  const int d0 = lane * kVec;
+
+  // Split ranges are [split * per, min(seq, (split + 1) * per)) with `per`
+  // rounded up to kGroup, so every range starts on a group boundary and the
+  // group loop's "one page lookup per group" invariant still holds.
+  const int seq = pos + 1;
+  int per = (seq + num_splits - 1) / num_splits;
+  per = (per + kGroup - 1) & ~(kGroup - 1);
+  const int begin = min(split * per, seq);
+  const int end = min(begin + per, seq);
+  if (end <= begin) {
+    // No work for this split: publish an empty partial. m is -FLT_MAX so the
+    // combine's global max ignores it; l = 0 zeroes its weight exactly.
+    float* empty =
+        partials + (static_cast<int64_t>(pair) * num_splits + split) * (head_size + 4);
+    if (lane == 0) {
+      empty[head_size] = -FLT_MAX;
+      empty[head_size + 1] = 0.f;
+    }
+    *reinterpret_cast<float4*>(empty + d0) = make_float4(0.f, 0.f, 0.f, 0.f);
+    return;
+  }
+
+  // Fold the softmax scale into q once; the dot then needs no extra multiply.
+  float q[kVec];
+  {
+    const uint2 raw = *reinterpret_cast<const uint2*>(q_head + d0);
+    const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&raw);
+    q[0] = __bfloat162float(h[0].x) * scale;
+    q[1] = __bfloat162float(h[0].y) * scale;
+    q[2] = __bfloat162float(h[1].x) * scale;
+    q[3] = __bfloat162float(h[1].y) * scale;
+  }
+
+  float m_i = -FLT_MAX;  // online flash stats (warp-uniform)
+  float l_i = 0.f;
+  float acc[kVec] = {0.f, 0.f, 0.f, 0.f};
+
+  int64_t row[kGroup];
+  int gpos = begin;
+  for (; gpos + kGroup <= end; gpos += kGroup) {
+    const int32_t pg = __ldg(table_row + (gpos >> block_shift));
+    const int32_t off = gpos & (block_size - 1);
+    const int64_t row0 = layer_base + static_cast<int64_t>(pg) * (block_size * kv_dim) +
+                         head_offset + static_cast<int64_t>(off) * kv_dim + d0;
+#pragma unroll
+    for (int j = 0; j < kGroup; ++j) {
+      row[j] = row0 + static_cast<int64_t>(j) * kv_dim;
+    }
+    float s[kGroup];
+    float v_reg[kGroup][kVec];
+#pragma unroll
+    for (int j = 0; j < kGroup; ++j) {
+      const uint2 kraw = *reinterpret_cast<const uint2*>(key_cache + row[j]);
+      const __nv_bfloat162* kh = reinterpret_cast<const __nv_bfloat162*>(&kraw);
+      s[j] = q[0] * __bfloat162float(kh[0].x) + q[1] * __bfloat162float(kh[0].y) +
+             q[2] * __bfloat162float(kh[1].x) + q[3] * __bfloat162float(kh[1].y);
+      const uint2 vraw = *reinterpret_cast<const uint2*>(value_cache + row[j]);
+      const __nv_bfloat162* vh = reinterpret_cast<const __nv_bfloat162*>(&vraw);
+      v_reg[j][0] = __bfloat162float(vh[0].x);
+      v_reg[j][1] = __bfloat162float(vh[0].y);
+      v_reg[j][2] = __bfloat162float(vh[1].x);
+      v_reg[j][3] = __bfloat162float(vh[1].y);
+    }
+#pragma unroll
+    for (int j = 0; j < kGroup; ++j) {
+#pragma unroll
+      for (int off = 16; off; off >>= 1) {
+        s[j] += __shfl_xor_sync(0xffffffffu, s[j], off);
+      }
+    }
+    float m_new = m_i;
+#pragma unroll
+    for (int j = 0; j < kGroup; ++j) {
+      m_new = fmaxf(m_new, s[j]);
+    }
+    const float alpha = __expf(m_i - m_new);
+    float l_new = l_i * alpha;
+    float p[kGroup];
+#pragma unroll
+    for (int j = 0; j < kGroup; ++j) {
+      p[j] = __expf(s[j] - m_new);
+      l_new += p[j];
+    }
+#pragma unroll
+    for (int c = 0; c < kVec; ++c) {
+      float a = acc[c] * alpha;
+#pragma unroll
+      for (int j = 0; j < kGroup; ++j) {
+        a += p[j] * v_reg[j][c];
+      }
+      acc[c] = a;
+    }
+    m_i = m_new;
+    l_i = l_new;
+  }
+  for (; gpos < end; ++gpos) {
+    const int32_t pg = __ldg(table_row + (gpos >> block_shift));
+    const int64_t row =
+        layer_base + static_cast<int64_t>(pg) * (block_size * kv_dim) + head_offset +
+        static_cast<int64_t>(gpos & (block_size - 1)) * kv_dim + d0;
+    const uint2 kraw = *reinterpret_cast<const uint2*>(key_cache + row);
+    const __nv_bfloat162* kh = reinterpret_cast<const __nv_bfloat162*>(&kraw);
+    float s = q[0] * __bfloat162float(kh[0].x) + q[1] * __bfloat162float(kh[0].y) +
+              q[2] * __bfloat162float(kh[1].x) + q[3] * __bfloat162float(kh[1].y);
+#pragma unroll
+    for (int off = 16; off; off >>= 1) {
+      s += __shfl_xor_sync(0xffffffffu, s, off);
+    }
+    const float m_new = fmaxf(m_i, s);
+    const float alpha = __expf(m_i - m_new);
+    const float p = __expf(s - m_new);
+    l_i = l_i * alpha + p;
+    const uint2 vraw = *reinterpret_cast<const uint2*>(value_cache + row);
+    const __nv_bfloat162* vh = reinterpret_cast<const __nv_bfloat162*>(&vraw);
+    acc[0] = acc[0] * alpha + p * __bfloat162float(vh[0].x);
+    acc[1] = acc[1] * alpha + p * __bfloat162float(vh[0].y);
+    acc[2] = acc[2] * alpha + p * __bfloat162float(vh[1].x);
+    acc[3] = acc[3] * alpha + p * __bfloat162float(vh[1].y);
+    m_i = m_new;
+  }
+
+  // Unnormalized acc: l is published alongside it so the combine can do one
+  // global rescale over all splits (the warp2 kernel divides by l here
+  // because it owns the whole prefix).
+  float* out_partial =
+      partials + (static_cast<int64_t>(pair) * num_splits + split) * (head_size + 4);
+  *reinterpret_cast<float4*>(out_partial + d0) = make_float4(acc[0], acc[1], acc[2], acc[3]);
+  if (lane == 0) {
+    out_partial[head_size] = m_i;
+    out_partial[head_size + 1] = l_i;
+  }
+}
+
+// Log-sum-exp combine over the num_splits partials of one (row, head) pair:
+// o = sum_s exp(m_s - m) * acc_s / sum_s exp(m_s - m) * l_s. One 128-thread
+// block per pair (head_size == 128 in every geometry that reaches it).
+__global__ void paged_attn_warp2_split_combine_kernel_bf16(const float* __restrict__ partials,
+                                                           __nv_bfloat16* __restrict__ output,
+                                                           int32_t head_num, int32_t head_size,
+                                                           int32_t num_splits, int32_t batch) {
+  using BlockReduce = cub::BlockReduce<float, 128>;
+  __shared__ typename BlockReduce::TempStorage temp;
+  __shared__ float s_global_m;
+  const int pair = blockIdx.x;
+  if (pair >= batch * head_num) return;
+  const int d = threadIdx.x;
+  const float* base = partials + static_cast<int64_t>(pair) * num_splits * (head_size + 4);
+
+  // Global max over splits (every thread reads the same values; the reduction
+  // is over the num_splits leading threads, the rest feed -FLT_MAX).
+  float local_m = -FLT_MAX;
+  if (d < num_splits) {
+    local_m = __ldg(base + static_cast<int64_t>(d) * (head_size + 4) + head_size);
+  }
+  const float global_m = BlockReduce(temp).Reduce(local_m, cub::Max());
+  if (threadIdx.x == 0) {
+    s_global_m = global_m;
+  }
+  __syncthreads();
+  const float m = s_global_m;
+
+  float o = 0.f;
+  float l = 0.f;
+  for (int s = 0; s < num_splits; ++s) {
+    const float* ps = base + static_cast<int64_t>(s) * (head_size + 4);
+    // Empty splits carry m = -FLT_MAX, so w underflows to exactly 0 and the
+    // slot drops out of both sums.
+    const float w = __expf(ps[head_size] - m);
+    l += w * ps[head_size + 1];
+    if (d < head_size) {
+      o += w * __ldg(ps + d);
+    }
+  }
+  if (d < head_size) {
+    output[static_cast<int64_t>(pair) * head_size + d] =
+        __float2bfloat16(l > 0.f ? o / l : 0.f);
+  }
+}
+
 // Paged kernels map a token position to its page with `pos >> block_shift`;
 // the block_size CHECK in paged_attention_cu_batch already guarantees a power
 // of two, so a shift is exact (and cheaper than the divide).
@@ -747,9 +992,33 @@ void paged_attention_cu_batch(int32_t head_num, int32_t layer_idx, int32_t num_b
   // That leaves the split-partials path as the fallback for geometries warp2
   // does not serve (see paged_decode_geometry_ok).
   if (paged_decode_geometry_ok(head_size, table_stride, block_size)) {
+    const int block_shift = block_shift_for(block_size);
+    // Split-KV flash decoding over the same geometry: batch * head_num warps
+    // is not enough to fill the device at small batch, and in a mixed batch
+    // the step is bounded by the longest row, so cut each row's prefix into
+    // num_splits pieces and combine. The partials are fp32 rows of
+    // (head_size + 4) floats, i.e. 2x the bf16 element count that
+    // BatchScratch::ensure and the models' pooled path size partial_batch
+    // for; when the caller handed us a buffer that is not that large (a
+    // partial_batch sized only for the bf16 fallback) stay on warp2.
+    const int64_t partial_floats =
+        static_cast<int64_t>(batch) * head_num * num_splits * (head_size + 4);
+    if (num_splits > 1 && static_cast<int64_t>(score_batch.size()) * 2 >= partial_floats * 4) {
+      float* partials_f = reinterpret_cast<float*>(partials);
+      const int warps_per_block = 256 / 32;
+      const int total_warps = batch * head_num * num_splits;
+      const unsigned grid = (total_warps + warps_per_block - 1) / warps_per_block;
+      paged_attn_warp2_split_kernel_bf16<<<grid, 256, 0, stream>>>(
+          positions.ptr<int32_t>(), batch, block_table.ptr<int32_t>(), table_stride, num_blocks,
+          block_size, block_shift, layer_idx, dim, query, partials_f, kcache, vcache, kv_dim,
+          kv_head_num, head_num, head_size, num_splits);
+      const int combine_threads = head_size <= 64 ? 64 : 128;
+      paged_attn_warp2_split_combine_kernel_bf16<<<batch * head_num, combine_threads, 0, stream>>>(
+          partials_f, output, head_num, head_size, num_splits, batch);
+      return;
+    }
     const int warps_per_block = 256 / 32;
     const int total_warps = batch * head_num;
-    const int block_shift = block_shift_for(block_size);
     const unsigned grid = (total_warps + warps_per_block - 1) / warps_per_block;
     paged_attn_warp2_kernel_bf16<<<grid, 256, 0, stream>>>(
         positions.ptr<int32_t>(), batch, block_table.ptr<int32_t>(), table_stride, num_blocks,
@@ -1192,6 +1461,51 @@ void paged_attention_dispatch(int32_t head_num, int32_t layer_idx, int32_t num_b
                                    kv_dim, kv_head_num, head_size, seq_row_start, num_prefill_seqs,
                                    positions, block_table, query_batch, mha_out, key_cache,
                                    value_cache, config);
+}
+
+// ========== Fused-QKV de-interleave ========================================
+// Split the [batch, dim + 2 * kv_dim] fused QKV projection output into its
+// contiguous q / k / v buffers (see model::split_fused_qkv_output, which keeps
+// the batch == 1 zero-copy view and calls this for every multi-token batch).
+// Replaces three cudaMemcpy2DAsync calls: a 2D copy is one strided walk per
+// request, so a 512-row chunk pays three of them (plus their setup) for a
+// layout that is a single flat pass per row here. One block per row, 16 bytes
+// per thread step.
+__global__ void split_fused_qkv_kernel_bf16(const uint4* __restrict__ src,
+                                            uint4* __restrict__ dst_q, uint4* __restrict__ dst_k,
+                                            uint4* __restrict__ dst_v, int32_t q_vec,
+                                            int32_t kv_vec, int32_t row_vec) {
+  const uint4* srow = src + static_cast<int64_t>(blockIdx.x) * row_vec;
+  uint4* dq = dst_q + static_cast<int64_t>(blockIdx.x) * q_vec;
+  uint4* dk = dst_k + static_cast<int64_t>(blockIdx.x) * kv_vec;
+  uint4* dv = dst_v + static_cast<int64_t>(blockIdx.x) * kv_vec;
+  // The three segments share one walk: every thread reads consecutive source
+  // words (fully coalesced on the load side) and writes them to whichever
+  // output buffer owns them. dim and kv_dim are multiples of 8 bf16 values
+  // (one uint4) in every geometry this path is used for.
+  for (int32_t i = threadIdx.x; i < row_vec; i += blockDim.x) {
+    const uint4 v = srow[i];
+    if (i < q_vec) {
+      dq[i] = v;
+    } else if (i < q_vec + kv_vec) {
+      dk[i - q_vec] = v;
+    } else {
+      dv[i - q_vec - kv_vec] = v;
+    }
+  }
+}
+
+void split_fused_qkv_bf16_cu(const void* fused_src, void* dst_q, void* dst_k, void* dst_v,
+                             int32_t batch, int32_t dim, int32_t kv_dim, cudaStream_t stream) {
+  CHECK(batch > 0 && dim > 0 && kv_dim > 0);
+  CHECK_EQ(dim % 8, 0);
+  CHECK_EQ(kv_dim % 8, 0);
+  const int32_t q_vec = dim / 8;
+  const int32_t kv_vec = kv_dim / 8;
+  const int32_t row_vec = q_vec + 2 * kv_vec;
+  split_fused_qkv_kernel_bf16<<<batch, 256, 0, stream>>>(
+      reinterpret_cast<const uint4*>(fused_src), reinterpret_cast<uint4*>(dst_q),
+      reinterpret_cast<uint4*>(dst_k), reinterpret_cast<uint4*>(dst_v), q_vec, kv_vec, row_vec);
 }
 
 }  // namespace kernel

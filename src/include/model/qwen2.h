@@ -33,6 +33,15 @@ struct Qwen2Layers {
   std::vector<std::shared_ptr<op::Layer>> w2_layers_;
   std::vector<std::shared_ptr<op::Layer>> rmsnorm_layers_;
   std::vector<std::shared_ptr<op::Layer>> w3_layers_;
+
+  // Fused gate/up projection: one GEMM with the stacked weight
+  // [2 * immediate_dim, hidden_dim] instead of w1 and w3 separately, paired
+  // with kernel::swiglu_kernel_cu_fused (which reads gate and up from the two
+  // halves of each output row). The _src_ tensors keep the stacked buffers
+  // alive (set_weight stores a non-owning view).
+  bool fused_w13_enabled_ = false;
+  std::vector<std::shared_ptr<op::Layer>> fused_w13_layers_;
+  std::vector<tensor::Tensor> fused_w13_weight_src_;
   std::shared_ptr<op::Layer> cls_layer_;
 
   std::shared_ptr<op::Layer> embedding_layer_;
@@ -84,6 +93,10 @@ class Qwen2Model : public Model {
   // Build the fused QKV MatmulLayers from the (already device-resident)
   // wq/wk/wv weights. Must run after Qwen2Layers::to_cuda in init_mem.
   void build_fused_qkv_layers();
+
+  // Stack w1/w3 into one [2 * immediate_dim, hidden_dim] MatmulLayer (gate
+  // rows first, then up). Must run after Qwen2Layers::to_cuda in init_mem.
+  void build_fused_w13_layers();
 
   void attention_mha(int32_t layer_idx, const tensor::Tensor& pos_tensor) const;
 

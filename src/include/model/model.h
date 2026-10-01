@@ -14,6 +14,7 @@
 #include "config.h"
 #include "op/encode.h"
 #include "op/layer.h"
+#include "qkv_split.h"
 #include "sampler/argmax_sampler.h"
 #include "sentencepiece_processor.h"
 #include "tensor/tensor.h"
@@ -43,6 +44,11 @@ struct BatchScratch {
   // Fused QKV output (M3): [batch, dim + 2*kv_dim]; the q/k/v views used by
   // the fused path point into this buffer (zero-copy row split).
   tensor::Tensor qkv_out;
+  // Fused gate/up FFN projection output: [batch, 2*ffn_dim] (gate columns
+  // first, then up), consumed by kernel::swiglu_kernel_cu_fused. Only the
+  // fused-w13 path writes it, but it is allocated with the rest so the decode
+  // graph never has to re-capture on a buffer change.
+  tensor::Tensor w13_out;
   // Flash-Decoding partials (CUDA only):
   //   [batch * head_num * num_splits * (head_size + 2)]
   tensor::Tensor partial_batch;
@@ -188,6 +194,10 @@ inline void split_fused_qkv_output(tensor::Tensor& qkv_out, int32_t batch, int32
   uint8_t* dst_k = key_batch.ptr<uint8_t>();
   uint8_t* dst_v = val_batch.ptr<uint8_t>();
   if (device_type == base::DeviceType::kDeviceCUDA) {
+    if (dtype == base::DataType::kDataTypeBF16 && dim % 8 == 0 && kv_dim % 8 == 0) {
+      kernel::split_fused_qkv_bf16_cu(src, dst_q, dst_k, dst_v, batch, dim, kv_dim, stream);
+      return;
+    }
     cudaMemcpy2DAsync(dst_q, static_cast<size_t>(dim) * elem, src, row_bytes,
                       static_cast<size_t>(dim) * elem, batch, cudaMemcpyDeviceToDevice, stream);
     cudaMemcpy2DAsync(dst_k, static_cast<size_t>(kv_dim) * elem,

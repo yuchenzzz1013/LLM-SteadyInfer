@@ -57,6 +57,8 @@ void BatchScratch::ensure(int32_t batch, int32_t hidden_dim, int32_t dim, int32_
   // Fused QKV output [batch, dim + 2*kv_dim] — allocated unconditionally so
   // the fused path never re-allocates (and CUDA graphs stay capture-safe).
   qkv_out = tensor::Tensor(dtype, batch, dim + 2 * kv_dim, true, alloc);
+  // Fused gate/up FFN output [batch, 2*ffn_dim], same reasoning.
+  w13_out = tensor::Tensor(dtype, batch, 2 * ffn_dim, true, alloc);
 
   auto alloc_cpu = base::CPUDeviceAllocatorFactory::get_instance();
   input_ids = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc_cpu);
@@ -66,9 +68,16 @@ void BatchScratch::ensure(int32_t batch, int32_t hidden_dim, int32_t dim, int32_
   input_token_num = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc_cpu);
 
   if (device == base::DeviceType::kDeviceCUDA) {
-    partial_batch = tensor::Tensor(dtype, static_cast<int64_t>(batch) * head_num * num_splits *
-                                           (head_size + 2),
-                                   true, alloc);
+    // Sized for the fp32 split-KV partials (2x the bf16 (o | m | l) footprint)
+    // whenever a split path can reach this buffer — the paged decode kernel
+    // reinterprets it as (acc | m | l) fp32 rows. Sizing for the larger layout
+    // also covers the plain bf16 split-partials fallback and the continuous
+    // layout; the decode batches here are small, so the surplus is KBs.
+    const bool fp32_split = num_splits > 1 && head_size == 128 && block_table_stride > 0;
+    partial_batch = tensor::Tensor(
+        dtype, kernel::flash_decoding_partials_elements(batch, head_num, num_splits, head_size,
+                                                        fp32_split),
+        true, alloc);
     tokens_cu = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc);
     positions_cu = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc);
     block_table_cu = tensor::Tensor(base::DataType::kDataTypeInt32, batch, block_table_stride,

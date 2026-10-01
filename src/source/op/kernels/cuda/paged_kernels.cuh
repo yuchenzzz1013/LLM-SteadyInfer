@@ -44,8 +44,13 @@ void paged_kv_scatter_cu(const tensor::Tensor& src, tensor::Tensor& dst_cache,
 //   block_table  [batch, table_stride] CUDA int32 (-1 = unused entry)
 //   query_batch  [batch, dim] (dim = head_num * head_size)
 //   score_batch  scratch: batch * head_num * flash_decoding_num_splits(
-//                table_stride * block_size) * (head_size + 2) elements of the
-//                model dtype (raw bf16)
+//                table_stride * block_size) split slots, each (head_size + 2)
+//                bf16 elements for the (o | m | l) fallback layout or
+//                (head_size + 4) fp32 floats for the split-KV decode layout
+//                (2x the bf16 element count) — see
+//                flash_decoding_partials_elements, which sizes both. A buffer
+//                too small for the fp32 layout silently keeps the step on the
+//                warp2 decode kernel.
 //   mha_out      [batch, dim]
 //   key/value_cache [num_layers, num_blocks, block_size, kv_dim]
 void paged_attention_cu_batch(int32_t head_num, int32_t layer_idx, int32_t num_blocks,

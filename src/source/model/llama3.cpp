@@ -15,6 +15,7 @@
 #include "../op/kernels/cuda/mha_kernel.cuh"
 #include "../op/kernels/cuda/paged_kernels.cuh"
 #include "../op/kernels/cuda/rope_kernel.cuh"
+#include "../op/kernels/cuda/swiglu_kernel.cuh"
 namespace model {
 
 void LLamaLayers::to_cuda(std::shared_ptr<kernel::CudaConfig> config) {
@@ -370,6 +371,58 @@ void LLamaModel::build_fused_qkv_layers() {
   llama_layers_->fused_qkv_enabled_ = true;
 }
 
+void LLamaModel::build_fused_w13_layers() {
+  if (is_quant_model_) {
+    return;
+  }
+  // CUDA only: the stacked weight is filled with device-to-device copies and
+  // the paired SwiGLU kernel is a CUDA kernel. The CPU fallback keeps its two
+  // GEMMs + get_swiglu_kernel path.
+  if (device_type_ != base::DeviceType::kDeviceCUDA) {
+    return;
+  }
+
+  const int32_t ffn_dim = config_->immediate_dim_;
+  const int32_t hidden_dim = config_->hidden_dim_;
+  const int32_t num_layers = config_->layer_num_;
+  const base::DataType dtype = compute_dtype();
+  const size_t elem = base::DataTypeSize(dtype);
+  const size_t w_block = static_cast<size_t>(ffn_dim) * hidden_dim * elem;
+
+  auto alloc = base::CUDADeviceAllocatorFactory::get_instance();
+  cudaStream_t stream = cuda_config_->stream;
+
+  llama_layers_->fused_w13_layers_.clear();
+  llama_layers_->fused_w13_weight_src_.clear();
+  for (int32_t i = 0; i < num_layers; ++i) {
+    const tensor::Tensor& w1_w =
+        std::dynamic_pointer_cast<op::MatmulLayer>(llama_layers_->w1_layers_.at(i))->get_weight(0);
+    const tensor::Tensor& w3_w =
+        std::dynamic_pointer_cast<op::MatmulLayer>(llama_layers_->w3_layers_.at(i))->get_weight(0);
+
+    // Both operands are K-major ([K, M] row-major), so the stacked weight is
+    // two contiguous block copies — no repacking kernel needed.
+    tensor::Tensor fused_w(dtype, 2 * ffn_dim, hidden_dim, true, alloc);
+    cudaMemcpyAsync(fused_w.ptr<uint8_t>(), w1_w.ptr<uint8_t>(), w_block,
+                    cudaMemcpyDeviceToDevice, stream);
+    cudaMemcpyAsync(fused_w.ptr<uint8_t>(w_block), w3_w.ptr<uint8_t>(), w_block,
+                    cudaMemcpyDeviceToDevice, stream);
+    cudaStreamSynchronize(stream);  // init-time only: weights must be ready pre-forward
+
+    auto fused =
+        std::make_shared<op::MatmulLayer>(device_type_, 2 * ffn_dim, hidden_dim, false, false);
+    CHECK(fused->set_weight(0, fused_w));
+    fused->set_cuda_config(cuda_config_);
+    llama_layers_->fused_w13_layers_.push_back(fused);
+    // Keep-alive holder: set_weight stores a non-owning view into this buffer.
+    llama_layers_->fused_w13_weight_src_.push_back(fused_w);
+  }
+  llama_layers_->fused_w13_enabled_ = true;
+  LOG(INFO) << "[LLAMA3] fused gate/up projection: " << num_layers << " layers, "
+            << (2.0 * w_block * num_layers) / (1024.0 * 1024.0) << " MB stacked weights (+"
+            << (w_block * num_layers) / (1024.0 * 1024.0) << " MB over w1 || w3)";
+}
+
 void LLamaModel::init_mem() {
   std::shared_ptr<base::DeviceAllocator> alloc;
   if (device_type_ == base::DeviceType::kDeviceCPU) {
@@ -388,6 +441,7 @@ void LLamaModel::init_mem() {
   // reproduces the original three-GEMM path exactly.
 #ifdef USE_PAGED_ATTENTION
   build_fused_qkv_layers();
+  build_fused_w13_layers();
 #endif
 
   std::shared_ptr<base::DeviceAllocator> alloc_cpu =
@@ -763,7 +817,7 @@ base::Status LLamaModel::forward_batch(
   // path). The scratch keeps stable addresses across steps so a captured
   // graph always replays against the same memory.
   tensor::Tensor hidden, rms_out, q_batch, key_batch, val_batch, mha_out_batch, attn_out,
-      ffn_norm_out, w1_out, w3_out, w2_out, partial_batch, qkv_out;
+      ffn_norm_out, w1_out, w3_out, w2_out, partial_batch, qkv_out, w13_out;
   if (scratch) {
     scratch->ensure(batch, hidden_dim, config_->dim_, kv_dim, config_->hidden_dim_,
                     config_->head_num_, config_->head_size_, max_seq_len, table_stride,
@@ -781,6 +835,7 @@ base::Status LLamaModel::forward_batch(
     w2_out = scratch->w2_out;
     partial_batch = scratch->partial_batch;
     qkv_out = scratch->qkv_out;
+    w13_out = scratch->w13_out;
   } else {
     // Pooled allocations (prefill path): same element counts as the scratch
     // buffers but at the model compute dtype (BF16 on CUDA).
@@ -797,20 +852,26 @@ base::Status LLamaModel::forward_batch(
     key_batch = tensor::Tensor(dtype, batch, kv_dim, true, alloc);
     val_batch = tensor::Tensor(dtype, batch, kv_dim, true, alloc);
     qkv_out = tensor::Tensor(dtype, batch, config_->dim_ + 2 * kv_dim, true, alloc);
-    // Split-KV partials are only produced by the fallback attention path — the
-    // geometry warp2 does not serve (see paged_decode_geometry_ok: anything
-    // else writes its partials through a null score_batch) and the continuous
-    // layout. The warp2 decode kernel and the prefill kernel accumulate
-    // online-softmax state in registers and never touch score_batch, so a
-    // prefill chunk / mixed step skips the allocation entirely.
-    const bool warp2_covers = cache_dims.paged && kernel::paged_decode_geometry_ok(
-                                                    config_->head_size_, table_stride, block_size);
-    if (device_type_ == base::DeviceType::kDeviceCUDA && !warp2_covers) {
-      int32_t num_splits = kernel::flash_decoding_num_splits(max_seq_len);
-      // Score rows of head_size floats; BF16 splits keep the same row count.
+    if (llama_layers_->fused_w13_enabled_) {
+      // Only the fused-w13 path reads this; the unfused pair writes w1_out /
+      // w3_out instead and skips the allocation.
+      w13_out = tensor::Tensor(dtype, batch, 2 * config_->immediate_dim_, true, alloc);
+    }
+    // Attention partials (score_batch). Two producers write here: the paged
+    // split-KV decode path, which serves exactly the warp2 geometry
+    // (paged_decode_geometry_ok) and writes fp32 (acc | m | l) rows — 2x the
+    // bf16 element count per split slot — and the bf16 (o | m | l) fallback
+    // that covers the continuous layout and every other geometry. The row mix
+    // of a step is not known when this buffer is allocated, so a paged step
+    // sizes for whichever of the two its geometry can reach (the buffers are
+    // reused from the pool on every later layer/step).
+    const bool split_kv = cache_dims.paged && kernel::paged_decode_geometry_ok(
+                                                  config_->head_size_, table_stride, block_size);
+    if (device_type_ == base::DeviceType::kDeviceCUDA) {
+      const int32_t num_splits = kernel::flash_decoding_num_splits(max_seq_len);
       partial_batch = tensor::Tensor(
-          dtype, static_cast<int64_t>(batch) * config_->head_num_ * num_splits *
-                     (config_->head_size_ + 2),
+          dtype, kernel::flash_decoding_partials_elements(batch, config_->head_num_, num_splits,
+                                                          config_->head_size_, split_kv),
           true, alloc);
     }
   }
@@ -891,6 +952,9 @@ base::Status LLamaModel::forward_batch(
     // b. QKV projection: one fused GEMM (M3) with zero-copy q/k/v views, or
     // the classic three GEMMs (escape hatch LLAMA_DISABLE_FUSED_QKV / quant).
     const bool fused_qkv = llama_layers_->fused_qkv_enabled_;
+    // i. FFN gate/up: one stacked GEMM + paired SwiGLU, or the two-GEMM pair
+    // (off on CPU and in the non-paged attention build).
+    const bool fused_w13 = llama_layers_->fused_w13_enabled_;
     if (fused_qkv) {
       auto& fused = llama_layers_->fused_qkv_layers_.at(layer_idx);
       std::dynamic_pointer_cast<op::MatmulLayer>(fused)->set_batch_size(batch);
@@ -1035,22 +1099,34 @@ base::Status LLamaModel::forward_batch(
       auto& ffn_rmsnorm = llama_layers_->rmsnorm_layers_.at(layer_idx + config_->layer_num_);
       STATUS_CHECK(ffn_rmsnorm->forward(hidden, ffn_norm_out));
 
-      // W1: [batch, hidden_dim] -> [batch, hidden_dim_ffn]
-      {
-        auto& w1 = llama_layers_->w1_layers_.at(layer_idx);
-        std::dynamic_pointer_cast<op::MatmulLayer>(w1)->set_batch_size(batch);
-        STATUS_CHECK(w1->forward(ffn_norm_out, w1_out));
-      }
+      if (fused_w13) {
+        // One GEMM over the stacked [2 * ffn, hidden] weight, then the paired
+        // SwiGLU reads gate and up from the two halves of each output row.
+        // Measured 7-11% on the w1||w3 GEMM pair (fewer weight-stream
+        // restarts); the activation's per-element arithmetic is unchanged.
+        auto& w13 = llama_layers_->fused_w13_layers_.at(layer_idx);
+        std::dynamic_pointer_cast<op::MatmulLayer>(w13)->set_batch_size(batch);
+        STATUS_CHECK(w13->forward(ffn_norm_out, w13_out));
+        kernel::swiglu_kernel_cu_fused(w13_out, w1_out, batch, config_->immediate_dim_,
+                                       cuda_config_->stream);
+      } else {
+        // W1: [batch, hidden_dim] -> [batch, hidden_dim_ffn]
+        {
+          auto& w1 = llama_layers_->w1_layers_.at(layer_idx);
+          std::dynamic_pointer_cast<op::MatmulLayer>(w1)->set_batch_size(batch);
+          STATUS_CHECK(w1->forward(ffn_norm_out, w1_out));
+        }
 
-      // W3: [batch, hidden_dim] -> [batch, hidden_dim_ffn]
-      {
-        auto& w3 = llama_layers_->w3_layers_.at(layer_idx);
-        std::dynamic_pointer_cast<op::MatmulLayer>(w3)->set_batch_size(batch);
-        STATUS_CHECK(w3->forward(ffn_norm_out, w3_out));
-      }
+        // W3: [batch, hidden_dim] -> [batch, hidden_dim_ffn]
+        {
+          auto& w3 = llama_layers_->w3_layers_.at(layer_idx);
+          std::dynamic_pointer_cast<op::MatmulLayer>(w3)->set_batch_size(batch);
+          STATUS_CHECK(w3->forward(ffn_norm_out, w3_out));
+        }
 
-      // SwiGLU: w1_out = w1_out * sigmoid(w1_out) * w3_out (element-wise via kernel)
-      STATUS_CHECK(llama_layers_->swiglu_layer_->forward(w1_out, w3_out, w1_out));
+        // SwiGLU: w1_out = w1_out * sigmoid(w1_out) * w3_out (element-wise via kernel)
+        STATUS_CHECK(llama_layers_->swiglu_layer_->forward(w1_out, w3_out, w1_out));
+      }
 
       // W2: [batch, hidden_dim_ffn] -> [batch, hidden_dim]
       {

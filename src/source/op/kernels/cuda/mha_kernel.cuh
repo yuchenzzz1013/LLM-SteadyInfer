@@ -20,6 +20,24 @@ inline int flash_decoding_num_splits(int32_t max_seq_len) {
   return std::max(1, std::min(MAX_SPLITS, splits));
 }
 
+// Element count of the partials buffer (score_batch) one attention call needs,
+// in the model dtype. Two layouts share that buffer:
+//   * bf16 rows of (head_size + 2) elements, (o | m | l) — the continuous
+//     layout and the paged fallback for geometries paged_decode_geometry_ok
+//     rejects;
+//   * fp32 rows of (head_size + 4) floats, (acc | m | l), written by the
+//     split-KV paged decode kernel (paged_attn_warp2_split_kernel_bf16). One
+//     fp32 row is 2 * (head_size + 4) bf16 elements.
+// `fp32_split` picks the fp32 split-KV sizing; a caller that does not know
+// which path a step will take may size for it, since the larger footprint
+// still satisfies the bf16 one.
+inline int64_t flash_decoding_partials_elements(int32_t batch, int32_t head_num,
+                                                int32_t num_splits, int32_t head_size,
+                                                bool fp32_split) {
+  const int64_t rows = static_cast<int64_t>(batch) * head_num * num_splits;
+  return fp32_split ? 2 * rows * (head_size + 4) : rows * (head_size + 2);
+}
+
 // Batched decode / chunked-prefill MHA (Flash Decoding): one launch per layer
 // for the whole batch. The KV range of each (batch, head) is split across
 // num_splits blocks; partial (o, m, l) results are reduced by a second kernel.
