@@ -32,6 +32,9 @@ struct BatchScratch {
   // Baked into the fast-path re-use check so a stride change re-allocates
   // (and thus forces a graph re-capture in decode_step).
   int32_t block_table_stride = 0;
+  // Paged page size this scratch was sized for (0 in continuous mode). Part of
+  // the re-use check: it selects the partials layout (see fp32_split below).
+  int32_t block_size = 0;
   // Split count the flash-decoding partials were sized for (0 on CPU). Part of
   // the re-use check too: a second Scheduler with a longer max_seq_len on the
   // same Model would otherwise keep the smaller partials and the decode kernel
@@ -66,7 +69,7 @@ struct BatchScratch {
   // (compute_dtype()), kDataTypeFp32 on CPU models.
   void ensure(int32_t batch, int32_t hidden_dim, int32_t dim, int32_t kv_dim, int32_t ffn_dim,
               int32_t head_num, int32_t head_size, int32_t max_seq_len, int32_t block_table_stride,
-              base::DeviceType device, base::DataType dtype,
+              int32_t block_size, base::DeviceType device, base::DataType dtype,
               const std::shared_ptr<base::DeviceAllocator>& alloc);
 };
 
@@ -131,6 +134,14 @@ inline KVCacheDims resolve_kv_cache_dims(const tensor::Tensor& key_cache,
     d.table_stride = block_table.get_dim(1);
     d.max_seq_len = d.table_stride * d.block_size;
   } else {
+    // Continuous layout: the kernels read one slot id per row
+    // (block_table[b]); a paged-shaped table (width > 1) would be misread as
+    // slot ids with no error anywhere. The continuous pool always builds a
+    // width-1 table ([batch], or the slot-mode pool's [batch, 1]), so any
+    // other width is a caller bug worth failing on.
+    CHECK(block_table.dims_size() == 1 || block_table.get_dim(1) == 1)
+        << "continuous KV layout needs a [batch] slot-id block table, got width "
+        << (block_table.dims_size() > 1 ? block_table.get_dim(1) : 1);
     d.num_blocks = key_cache.get_dim(1);  // == num_slots
     d.max_seq_len = key_cache.get_dim(3);
     d.table_stride = 1;
@@ -241,6 +252,12 @@ class Model {
 
   virtual base::Status init(base::DeviceType device_type) = 0;
 
+  // ---- Legacy single-sequence path (no callers left in this repo) ----
+  // predict/forward drive forward_batch's predecessor: one token per call over
+  // the model's internal KV cache (see ensure_internal_kv_cache). The runtime
+  // (Scheduler::execute_batch) uses forward_batch exclusively, so these are
+  // kept only for API compatibility; the internal cache they need is allocated
+  // lazily on first use, not at init.
   virtual base::Status predict(const tensor::Tensor& input, const tensor::Tensor& pos_tensor,
                                bool is_prompt, int& next) const = 0;
 
@@ -350,11 +367,21 @@ class Model {
   // Batch post-processing: argmax sample next token per sequence
   virtual std::vector<int32_t> post_processing_batch(const tensor::Tensor& logits) const;
 
-  // Free large internal KV cache and re-allocate at a smaller size.
-  // The internal cache is only used during single-sequence prefill; its
-  // sequence-length dimension can be reduced to the longest prompt the
-  // caller expects to process, reclaiming hundreds of MB on GPU.
+  // Cap the internal single-sequence KV cache at `max_seq_len` tokens.
+  //
+  // The cache is legacy-path state (predict/forward/attention_*): the Scheduler
+  // uses its own paged pool and never touches it, so it is allocated lazily —
+  // see ensure_internal_kv_cache — and this call only records the cap unless
+  // the cache already exists (then it reallocates and shrinks). A value above
+  // the model window is clamped: the RoPE sin/cos tables are window-sized, so
+  // a longer cache could never be used safely.
   void resize_internal_kv_cache(int32_t max_seq_len);
+
+  // Allocate the internal single-sequence KV cache if it does not exist yet,
+  // at the recorded cap (resize_internal_kv_cache) or the full model window.
+  // Called from the legacy const accessors (slice_kv_cache); the buffers_ map
+  // is mutable for exactly this reason.
+  void ensure_internal_kv_cache() const;
 
   // Synchronize the model's CUDA stream (no-op on CPU or when no stream is set).
   virtual void sync_stream() const {}
@@ -400,7 +427,14 @@ class Model {
   std::string token_path_;
   std::string model_path_;
   std::unique_ptr<op::EncodeLayerBase> encode_layer_;
-  std::map<ModelBufferType, tensor::Tensor> buffers_;
+  // Mutable: ensure_internal_kv_cache() lazily inserts the legacy internal KV
+  // cache (kKeyCache/kValueCache) from const accessors, so a driver that never
+  // runs the legacy single-sequence path never pays for the ~6 GB pool.
+  mutable std::map<ModelBufferType, tensor::Tensor> buffers_;
+  // Token length of the internal KV cache: the cap recorded by
+  // resize_internal_kv_cache (before first use) then the allocated length.
+  // 0 = "not sized yet" -> the model window.
+  mutable int32_t internal_kv_len_ = 0;
   std::unique_ptr<sampler::Sampler> sampler_;
 
   // ---------- HF safetensors weight storage (host, BF16 raw bits) ----------

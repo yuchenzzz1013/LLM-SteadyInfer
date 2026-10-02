@@ -14,7 +14,11 @@ class KVManager {
   // device: decides the layout — CUDA (+USE_PAGED_ATTENTION) gets the paged
   //   layout [num_layers, num_blocks, block_size, kv_dim], everything else
   //   keeps the continuous layout [num_layers, max_batch, kv_dim, max_seq_len].
-  // block_size: physical block size of the paged pool (default 16).
+  // block_size: physical block size of the paged pool (default 16). Only used
+  //   in paged mode, where the constructor CHECKs it is a power of two >= 4
+  //   dividing 256 (kernel geometry).
+  // The constructor LOG(FATAL)s if the pool tensors fail to allocate, so a
+  // successful construction guarantees a usable KV pool.
   KVManager(int num_layers, int max_batch, int max_seq_len, int kv_dim,
             std::shared_ptr<base::DeviceAllocator> alloc,
             base::DeviceType device, int block_size = 16);
@@ -36,7 +40,13 @@ class KVManager {
   const BlockAllocator* block_allocator() const { return block_allocator_.get(); }
   int max_blocks_per_seq() const { return max_blocks_per_seq_; }
   int block_size() const { return block_size_; }
+  int num_blocks() const { return num_blocks_; }
   bool is_paged() const { return paged_; }
+
+  // Bytes of the preallocated K + V pool (both modes). This is the memory the
+  // cache really occupies from construction on — a driver that prints a
+  // token-count estimate should print this instead of recomputing it.
+  long long pool_bytes() const;
 
   tensor::Tensor& key_cache() { return key_cache_; }
   tensor::Tensor& value_cache() { return value_cache_; }

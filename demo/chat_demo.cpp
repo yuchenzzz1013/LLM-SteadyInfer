@@ -36,6 +36,7 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -175,6 +176,18 @@ Args parse_args(int argc, char** argv) {
       print_usage(argv[0]);
       std::exit(1);
     }
+  }
+  // 取值校验:这些值会直接进入 KV 容量与显存预算的计算,非法值此前要么被
+  // 静默吞掉(负 max-new-tokens 反而放大 prompt_budget 并被调度器解释为
+  // "生成到窗口上限"),要么把池子撑到 OOM(gpu-mem-fraction > 1)。
+  if (a.max_new_tokens <= 0) {
+    std::cerr << "--max-new-tokens 必须为正数,收到: " << a.max_new_tokens << "\n";
+    std::exit(1);
+  }
+  if (!(a.gpu_mem_fraction > 0.0 && a.gpu_mem_fraction <= 1.0)) {
+    std::cerr << "--gpu-mem-fraction 必须在 (0, 1] 区间内,收到: " << a.gpu_mem_fraction
+              << "\n";
+    std::exit(1);
   }
   return a;
 }
@@ -358,10 +371,9 @@ struct ChatEngine {
     }
 
     // 模型自带的内部 KV cache([layers, seq_len, kv_dim])只服务于旧的单序列
-    // prefill 路径(predict/forward);本示例走 Scheduler + forward_batch,用的
-    // 是 KVManager 的池子,这份内部缓存是死重。窗口调到 40960 时它要占约 6GB,
-    // 这里缩到最小把它还给显存池。
-    model->resize_internal_kv_cache(1024);
+    // prefill 路径(predict/forward),本示例走 Scheduler + forward_batch、用的
+    // 是 KVManager 的池子。该缓存现已改为惰性分配(首次进入老路径时才建),
+    // 这里什么都不用做:窗口 40960 时它要占的约 6GB 根本不会被分配。
 
     max_batch = args.max_batch > 0 ? args.max_batch : 1;
     ctx = args.max_seq_len > 0 ? args.max_seq_len : model->seq_len();
@@ -371,23 +383,36 @@ struct ChatEngine {
       ctx = model->seq_len();
     }
 
-    // 显存预算:KV 池 = max_batch x max_seq_len 个位置整块预分配,不能超过
-    // 空闲显存的 --gpu-mem-fraction,否则直接 OOM。
+    // 显存预算:KV 池按整块预分配 —— 每个序列占 ceil(ctx/block_size) 个块,
+    // 所以按块对齐后的容量计费,而不是 token 精确:ctx 越小低估越明显
+    // (bs=16、ctx=100 时约 12%),旧公式的 fit / kv_bytes 都偏乐观。
     if (device_type == base::DeviceType::kDeviceCUDA) {
       size_t free_b = 0, total_b = 0;
       if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
         vram_free = static_cast<long long>(free_b);
         vram_total = static_cast<long long>(total_b);
         const double budget = static_cast<double>(free_b) * args.gpu_mem_fraction;
+        // 与 Scheduler(block_size=0)实际会用的默认块大小一致。
+        const int block_size = scheduler::Scheduler::default_block_size();
         const long long per_token = kv_bytes_per_token() * max_batch;
-        const int fit = static_cast<int>(budget / static_cast<double>(per_token));
+        const long long bytes_per_block = per_token * block_size;
+        const long long fit_blocks =
+            static_cast<long long>(budget / static_cast<double>(bytes_per_block));
+        const long long fit = fit_blocks * block_size;
         if (fit < ctx) {
           std::cout << "[提示] 显存只放得下 " << fit << " tokens 的 KV(空闲 "
                     << (vram_free >> 20) << " MB x " << args.gpu_mem_fraction
-                    << "),上下文从 " << ctx << " 缩到 " << fit << "\n";
-          ctx = fit;
+                    << ",按块对齐 " << block_size << "),上下文从 " << ctx << " 缩到 " << fit
+                    << "\n";
+          ctx = static_cast<int>(std::min<long long>(fit, model->seq_len()));
         }
       }
+    }
+    if (ctx <= 0) {
+      std::cerr << "可用显存放不下一个 KV 块(--gpu-mem-fraction "
+                << args.gpu_mem_fraction << ");请调大该比例或减小 --max-batch\n";
+      model.reset();
+      return false;
     }
 
     prompt_budget = ctx - args.max_new_tokens - 16;  // 16 = 模板与裁剪误差余量
@@ -407,7 +432,8 @@ struct ChatEngine {
     sched = std::make_unique<scheduler::Scheduler>(model, max_batch, ctx, args.max_new_tokens,
                                                    /*block_size=*/0,
                                                    /*enable_prefix_cache=*/true);
-    kv_bytes = static_cast<long long>(max_batch) * ctx * kv_bytes_per_token();
+    // KV 池的字节数直接问调度器要(含块对齐的真实分配),而不是按 token 估算。
+    kv_bytes = sched->kv_pool_bytes();
     return true;
   }
 
@@ -483,6 +509,8 @@ Generation generate(const ChatEngine& engine, const std::vector<int32_t>& prompt
   gen.text = model->decode(ids);
   gen.num_tokens = static_cast<int>(ids.size());
   // 本 demo 一次只跑一个请求,所以统计增量就是本轮的命中块数。
+  // matched_blocks 以"准入成功"为口径(准入重试/等待重查不重复计数),
+  // 因此这里的"跳过 prefill"是真实挂载复用的块数,不再偏大。
   gen.shared_blocks = sched.prefix_cache_stats().matched_blocks - matched_before;
   // 延迟打点取自序列本身(提交 → 首个 token / 结束)
   if (done->num_generated_tokens > 0 && done->first_token_time > done->arrival_time) {
@@ -515,8 +543,11 @@ void print_stats(const Generation& gen, int block_size) {
 void print_prefix_summary(const scheduler::Scheduler& sched) {
   if (!sched.prefix_cache_enabled()) return;
   const scheduler::PrefixCacheStats& st = sched.prefix_cache_stats();
-  std::printf("prefix cache: lookups=%lld hits=%lld hit_rate=%.1f%% matched_blocks=%lld "
-              "inserts=%lld evictions=%lld (block=%d tokens)\n",
+  // 口径:lookups = 准入成功的请求数(不是 lookups() 调用次数——准入重试与
+  // 等待重查不重复计数),hits = 其中挂载了 ≥1 个缓存块的请求数,
+  // matched_blocks = 实际复用(跳过 prefill)的块数。
+  std::printf("prefix cache: lookups(获批请求)=%lld hits(命中请求)=%lld hit_rate=%.1f%% "
+              "matched_blocks(复用块)=%lld inserts=%lld evictions=%lld (block=%d tokens)\n",
               static_cast<long long>(st.lookups), static_cast<long long>(st.hits),
               st.hit_rate() * 100.0, static_cast<long long>(st.matched_blocks),
               static_cast<long long>(st.inserts), static_cast<long long>(st.evictions),

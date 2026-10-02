@@ -16,6 +16,22 @@ int Scheduler::resolve_block_size(long long avg_prompt_len) {
   return 16;
 }
 
+int Scheduler::default_block_size() {
+  const char* bs_env = std::getenv("LLAMA_BLOCK_SIZE");
+  if (bs_env != nullptr) {
+    char* end = nullptr;
+    const long value = std::strtol(bs_env, &end, 10);
+    if (end != bs_env && *end == '\0' && value >= 1 && value <= (1L << 20)) {
+      return static_cast<int>(value);
+    }
+    // An unparsable value used to fall through to the default silently; say so
+    // — the user set the variable expecting it to take effect.
+    LOG(WARNING) << "Ignoring LLAMA_BLOCK_SIZE=\"" << bs_env << "\" (want a positive integer); "
+                 << "using default " << kDefaultBlockSize;
+  }
+  return kDefaultBlockSize;
+}
+
 // Max token-rows a single forward_batch step may carry (decode rows +
 // prefill chunk rows, each row = one token). max_batch_size_ only bounds the
 // decode side; prefill rows are decoupled from it (see build_batch_rows).
@@ -42,6 +58,23 @@ Scheduler::Scheduler(std::shared_ptr<model::Model> model,
     LOG(FATAL) << "Scheduler: model not properly initialized. kv_dim=" << kv_dim
                << " num_layers=" << num_layers;
   }
+  // Sizing checks. Each of these used to fail much later with a much worse
+  // message (a zero-sized pool, or a silent out-of-bounds RoPE/score read on
+  // CUDA once a sequence grew past the tables): fail at construction, where
+  // the offending argument is still in the caller's hands.
+  if (max_batch_size <= 0) {
+    LOG(FATAL) << "Scheduler: max_batch_size must be positive, got " << max_batch_size;
+  }
+  if (max_seq_len <= 0) {
+    LOG(FATAL) << "Scheduler: max_seq_len must be positive, got " << max_seq_len;
+  }
+  const int model_window = model_->seq_len();
+  if (max_seq_len > model_window) {
+    LOG(FATAL) << "Scheduler: max_seq_len=" << max_seq_len
+               << " exceeds the model window " << model_window
+               << " (the RoPE sin/cos tables and CPU score scratch are window-sized; a longer "
+                  "sequence would read past them). Clamp with min(max_seq_len, model->seq_len()).";
+  }
   // BatchRow stores Sequence* into running_sequences_, so it must not grow
   // past admission's cap while a batch is in flight. Reserving once makes that
   // an invariant of the container instead of a property of the call order.
@@ -54,16 +87,11 @@ Scheduler::Scheduler(std::shared_ptr<model::Model> model,
   } else {
     alloc = base::CUDADeviceAllocatorFactory::get_instance();
   }
-  // Paged KV pool block size: explicit arg > env LLAMA_BLOCK_SIZE > default
-  // 16. Drivers pick the workload-adaptive value via resolve_block_size.
-  if (block_size > 0) {
-    block_size_ = block_size;
-  } else {
-    const char* bs_env = std::getenv("LLAMA_BLOCK_SIZE");
-    if (bs_env && std::atoi(bs_env) >= 1) {
-      block_size_ = std::atoi(bs_env);
-    }
-  }
+  // Paged KV pool block size: explicit arg > env LLAMA_BLOCK_SIZE > default.
+  // Drivers pick the workload-adaptive value via resolve_block_size; a value
+  // that reaches the kernels broken (not a power of two >= 4 dividing 256) is
+  // rejected inside KVManager, where it is applied.
+  block_size_ = block_size > 0 ? block_size : default_block_size();
   kv_manager_ = std::make_unique<KVManager>(num_layers, max_batch_size,
                                              max_seq_len, kv_dim, alloc,
                                              model_->device_type(), block_size_);
@@ -353,6 +381,12 @@ void Scheduler::try_admit_sequences() {
       admitted.is_prefill_complete =
           (admitted.next_prefill_chunk_start >= admitted.num_prompt_tokens);
     }
+    if (prefix_cache_) {
+      // Count the outcome, not the queries: this request may have run lookup()
+      // on every attempt above (and re-ran it across the waiting steps), but
+      // only the blocks mounted here actually saved prefill work.
+      prefix_cache_->record_admission(matched);
+    }
 #ifndef NDEBUG
     VLOG(1) << "[SCHED] admitted seq id=" << admitted.id
             << " prompt_blocks=" << prompt_blocks
@@ -458,6 +492,17 @@ void Scheduler::truncate_sequence(Sequence& seq, int keep_blocks) {
   const int trunc_pos = keep_blocks * block_size_;
   kv_manager_->block_allocator()->free_blocks_from(seq.kv_slot_id, keep_blocks);
   seq.num_blocks_allocated = keep_blocks;
+  // Roll the prefix-cache cursor back with the blocks. The chain length means
+  // "prompt blocks whose KV this sequence has committed and recorded", and the
+  // dropped blocks [keep_blocks, ...) lose their KV here — after the recompute
+  // repopulates them, record_committed_prefill() must hash and insert them
+  // again. Left ahead, the cursor would skip them forever: the resumed
+  // sequence's KV would never become shareable, and worse, the chain would
+  // keep hashes for blocks the row no longer owns. Shrink-only: growing the
+  // chain would fabricate hashes for blocks that were never committed.
+  if (static_cast<int>(seq.prefix_hash_chain.size()) > keep_blocks) {
+    seq.prefix_hash_chain.resize(static_cast<size_t>(keep_blocks));
+  }
   if (trunc_pos < seq.num_prompt_tokens) {
     // Evicted into the prompt region: re-prefill from the truncation point.
     // Every generated token (position >= num_prompt_tokens > trunc_pos) loses
@@ -981,16 +1026,21 @@ int Scheduler::get_busy_kv_slots() const {
 
 long long Scheduler::get_allocated_kv_tokens() const {
 #ifdef USE_PAGED_ATTENTION
-  // Reserved KV capacity = actually allocated blocks x block_size (lazy
-  // growth makes this the truthful reservation, unlike busy x max_seq_len).
-  long long blocks = 0;
-  for (const auto& s : running_sequences_) {
-    blocks += s.num_blocks_allocated;
-  }
+  // Pool occupancy = blocks off the free list x block_size. Summing
+  // num_blocks_allocated over running sequences (the old formula) got the
+  // footprint wrong in both directions: a block shared by N rows was counted
+  // N times, and blocks the prefix cache pins (CACHED, no owning row) were
+  // missed entirely — so utilisation could exceed 100% or shrink when a
+  // finished sequence's KV stayed cached. The allocator's own count is exact.
+  const long long blocks = kv_manager_->block_allocator()->used_block_count();
   return blocks * block_size_;
 #else
   return static_cast<long long>(get_busy_kv_slots()) * max_seq_len_;
 #endif
+}
+
+long long Scheduler::kv_pool_bytes() const {
+  return kv_manager_ ? kv_manager_->pool_bytes() : 0;
 }
 
 }  // namespace scheduler

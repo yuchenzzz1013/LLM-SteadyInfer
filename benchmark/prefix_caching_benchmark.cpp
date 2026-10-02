@@ -222,6 +222,7 @@ struct RoundMetrics {
 
 // PrefixCacheStats 只增不减(Scheduler 不提供 reset),压测窗口内的读数只能
 // 取两次采样之差 —— 预热与填热请求的计数因此不会混进本轮的命中率。
+// 注意所有计数都以"准入成功"为口径(lookups 是获批请求数而非查询次数)。
 static scheduler::PrefixCacheStats stats_delta(const scheduler::PrefixCacheStats& after,
                                                const scheduler::PrefixCacheStats& before) {
   scheduler::PrefixCacheStats d;
@@ -230,6 +231,7 @@ static scheduler::PrefixCacheStats stats_delta(const scheduler::PrefixCacheStats
   d.matched_blocks = after.matched_blocks - before.matched_blocks;
   d.inserts = after.inserts - before.inserts;
   d.evictions = after.evictions - before.evictions;
+  d.evict_shortfalls = after.evict_shortfalls - before.evict_shortfalls;
   return d;
 }
 
@@ -332,6 +334,14 @@ static RoundMetrics run_round(const std::shared_ptr<model::Model>& model,
         while (!sched.all_finished()) {
           sched.step();
         }
+      } else {
+        // 填热请求被调度器拒绝(prompt + 后缀放不进 KV cache):缓存没有被
+        // 填热,本轮命中率将按"冷启动"口径报告。必须显式告警,否则读数的
+        // 前提(steady-state)悄无声息地不成立。
+        LOG(WARNING) << "[PRIME] 填热请求被拒绝(prompt 放不进 KV cache, "
+                        "max_seq_len="
+                     << max_total_seq_len
+                     << ");本轮 prefix cache 未被填热,命中率按冷启动口径统计";
       }
     }
     cudaDeviceSynchronize();
@@ -406,10 +416,16 @@ static RoundMetrics run_round(const std::shared_ptr<model::Model>& model,
   m.e2e_p99_ms = percentile(e2es, 99);
 
   // ---- prefix cache ----
-  // 只取测量窗口内的增量:预热/填热请求的 lookup 不计入本轮的命中率。
+  // 只取测量窗口内的增量:预热/填热请求的计数不计入本轮。
+  // 计数口径已锚定"准入成功":lookups = 本轮获批的请求数,hits = 其中挂载了
+  // ≥1 个缓存块的请求数,matched_blocks = 真实挂载复用(被跳过 prefill)的块数。
+  // 准入重试/等待重查不再重复计数;唯一仍会重复的情形是请求被抢占后重新准入
+  // (同一请求计两次),此时比例可能略微超过"独占命中"的实际上限。
   m.prefix = stats_delta(sched.prefix_cache_stats(), stats_before);
   // 跳过的 prefill 比例:命中的整块 = matched_blocks * block_size 个 token,
   // 占全部 prompt token 的比例。禁用时 matched_blocks 为 0,比例为 0。
+  // 注意:匹配的块只覆盖每个 prompt 的前 (n-1)/block_size 块(最后一块
+  // 从不共享,见 PrefixCache::cacheable_blocks),所以即使全部命中该比例也 <1。
   m.skipped_prefill_ratio =
       m.prompt_tokens > 0
           ? static_cast<double>(m.prefix.matched_blocks * block_size) /
@@ -434,7 +450,8 @@ static void write_csv(const std::string& path, int prefix_len, const std::string
        "tpot_avg_ms,tpot_p50_ms,tpot_p99_ms,"
        "itl_avg_ms,itl_p99_ms,e2e_avg_ms,e2e_p99_ms,"
        "prefix_lookups,prefix_hits,prefix_hit_rate,prefix_matched_blocks,"
-       "prefix_inserts,prefix_evictions,skipped_prefill_ratio\n";
+       "prefix_inserts,prefix_evictions,prefix_evict_shortfalls,"
+       "skipped_prefill_ratio\n";
   f << std::fixed << std::setprecision(6);
   for (const auto& r : results) {
     f << r.run_id << "," << (r.enable_prefix_cache ? 1 : 0) << "," << r.num_requests
@@ -447,7 +464,7 @@ static void write_csv(const std::string& path, int prefix_len, const std::string
       << r.e2e_avg_ms << "," << r.e2e_p99_ms << "," << r.prefix.lookups << ","
       << r.prefix.hits << "," << r.prefix.hit_rate() << "," << r.prefix.matched_blocks
       << "," << r.prefix.inserts << "," << r.prefix.evictions << ","
-      << r.skipped_prefill_ratio << "\n";
+      << r.prefix.evict_shortfalls << "," << r.skipped_prefill_ratio << "\n";
   }
   f.close();
 }
@@ -472,12 +489,15 @@ static void print_round(const RoundMetrics& r) {
   std::cout << "E2E : avg=" << r.e2e_avg_ms << " ms  p99=" << r.e2e_p99_ms << " ms\n";
   std::cout << "output_tps=" << r.output_tps << "  total_tps=" << r.total_tps
             << "  completed_rps=" << r.completed_rps << "\n";
-  std::cout << "prefix_cache: lookups=" << r.prefix.lookups
-            << "  hits=" << r.prefix.hits
+  // lookups/hits 以准入成功为口径:lookups = 本轮获批请求数,hits = 其中复用
+  // 了 ≥1 个缓存块的请求数(准入重试/等待重查不重复计数)。
+  std::cout << "prefix_cache: lookups=" << r.prefix.lookups << " (admitted)"
+            << "  hits=" << r.prefix.hits << " (admitted with reuse)"
             << "  hit_rate=" << pct(r.prefix.hit_rate()) << "%\n";
   std::cout << "              matched_blocks=" << r.prefix.matched_blocks
             << "  inserts=" << r.prefix.inserts
-            << "  evictions=" << r.prefix.evictions << "\n";
+            << "  evictions=" << r.prefix.evictions
+            << "  evict_shortfalls=" << r.prefix.evict_shortfalls << "\n";
   std::cout << "skipped_prefill_ratio = matched_blocks * block_size / "
                "total_prompt_tokens = "
             << pct(r.skipped_prefill_ratio) << "%\n";
@@ -668,9 +688,9 @@ int main(int argc, char* argv[]) {
     max_gen = fitted;
   }
 
-  // 收缩模型内部 KV cache —— 必须在任何 decode CUDA graph 捕获之前调用(同
-  // offline),且两轮共用同一 Model,所以只调用一次。
-  model->resize_internal_kv_cache(max_prompt_len);
+  // 不再需要 resize_internal_kv_cache:模型内部那条单序列 KV cache 已改为首次
+  // 使用老 predict/forward 路径时才分配,而本基准(以及全部调度器路径)从不
+  // 触碰它——它不再占显存,也就没有"建 Scheduler 前先腾出 6 GB"的次序要求。
 
   // ---- 表头 ----
   std::cout << "\n============ Prefix Caching Benchmark ============\n";

@@ -260,8 +260,9 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
   int max_total_seq_len =
       std::min(max_prompt_len + args.max_gen, static_cast<int>(model->seq_len()));
 
-  // 收缩模型内部 KV cache(必须在任何 decode CUDA graph 捕获之前,同 offline)
-  model->resize_internal_kv_cache(max_prompt_len);
+  // 不再需要 resize_internal_kv_cache:模型内部那条单序列 KV cache 已改为
+  // 首次使用(老 predict/forward 路径)时才分配,调度器路径(本基准)永不触碰,
+  // 因此没有"建 Scheduler 前先腾出 6 GB"的次序要求。
 
   // 分页块大小按工作负载平均 prompt 长度自适应(短文本 8/长文本 32/默认 16)。
   const long long avg_prompt_len =
@@ -269,11 +270,14 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
   const int block_size = Scheduler::resolve_block_size(avg_prompt_len);
 
   // ---- 自适应 max_batch ----
-  // KV 池按 max_batch * ceil(max_seq_len/block_size) 个块整块预分配(每个
-  // sequence 在接纳时就占满整行),所以并发度直接受空闲显存约束。默认的 32
-  // 远低于本机可容纳量:批量变大时每步耗时几乎不变(decode 主要是把权重从
-  // HBM 流一遍,与 batch 基本无关),所以吞吐近似线性增长,而 TTFT 的绝大部分
-  // 是排队等待——32 的默认值在突发负载下会把 TTFT 推到几十秒。
+  // 显存按上限整池预留:max_batch * ceil(max_seq_len/block_size) 个物理块在
+  // Scheduler 构造时一次分配完(不能扩也不能缩);"惰性增长"只作用于块索引——
+  // 一个 sequence 接纳时只占 prompt 长度所需的块,decode 边生成边增块,未用容量
+  // 仍归池子、可被其它 sequence 使用。所以并发度直接受空闲显存约束,而单请求
+  // 的块占用低于 max_seq_len 上限。默认的 32 远低于本机可容纳量:批量变大时每步
+  // 耗时几乎不变(decode 主要是把权重从 HBM 流一遍,与 batch 基本无关),所以
+  // 吞吐近似线性增长,而 TTFT 的绝大部分是排队等待——32 的默认值在突发负载下
+  // 会把 TTFT 推到几十秒。
   const int requested_batch = args.max_batch;
   int max_batch = requested_batch;
   {
@@ -306,10 +310,12 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
       max_batch = requested_batch;
     }
   }
-  // Prefix caching off: serving requests are independent, so caching only adds
-  // hashing and pinned KV blocks (see Scheduler's enable_prefix_cache).
+  // Prefix caching off (explicit, matching the comment): serving requests are
+  // independent, so caching would only add hashing work and pin KV blocks,
+  // changing the pool capacity / OOM boundary / utilisation this benchmark
+  // reports. See prefix_caching_benchmark for the cache A/B.
   Scheduler sched(model, max_batch, max_total_seq_len, args.max_gen, block_size,
-                  /*enable_prefix_cache=*/true);
+                  /*enable_prefix_cache=*/false);
 
   // ---- 预热:与正式压测共用同一 Scheduler(同 offline,统计中跳过) ----
   // 每轮提交 warmup_requests(默认 = max_batch)个相同 prompt,请求同步完成
@@ -408,14 +414,15 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
     const auto& running = sched.get_running();
     int busy = sched.get_busy_kv_slots();
     if (busy > 0) {
+      // used = tokens actually stored; denominator = KV pool physical
+      // occupancy in tokens (shared blocks once, cache-pinned blocks
+      // included) — "how full is the pool", not per-row reservations.
       long long used = 0;
       for (const auto& s : running) {
         used += static_cast<long long>(s.num_prompt_tokens) + s.num_generated_tokens;
       }
       used_cap_sum += used;
       {
-        // Paged: truthful reservation = allocated blocks x block_size (lazy
-        // growth); continuous layout falls back to busy slots x capacity.
         long long alloc_tokens = sched.get_allocated_kv_tokens();
         alloc_cap_sum += alloc_tokens > 0
                              ? alloc_tokens
@@ -467,6 +474,8 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
     qwaits.push_back(admit_ms - arrival_ms);
     for (double itl : seq.token_timestamps_ms) itls.push_back(itl);
 
+    // See offline_batch_benchmark: per-request unused capacity — an upper
+    // bound on waste under paged allocation (unused blocks stay in the pool).
     int used = seq.num_prompt_tokens + seq.num_generated_tokens;
     per_seq_frag.push_back(1.0 - static_cast<double>(used) / max_total_seq_len);
 

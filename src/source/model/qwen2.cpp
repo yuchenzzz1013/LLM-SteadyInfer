@@ -184,8 +184,8 @@ void Qwen2Model::create_nonparam_layers() {
       device_type_, config_->dim_, config_->kv_dim_, config_->head_size_);
 
   qwen_layers_->mha_layer_ = std::make_shared<op::MultiHeadAttention>(
-      device_type_, 0, config_->kv_head_num_, config_->kv_dim_, config_->seq_len_,
-      config_->head_num_, config_->head_size_);
+      device_type_, 0, config_->kv_head_num_, config_->kv_dim_, config_->head_num_,
+      config_->head_size_);
 
   qwen_layers_->add_layer_ = std::make_shared<op::VecAddLayer>(device_type_);
 
@@ -547,14 +547,12 @@ void Qwen2Model::init_mem() {
   CHECK(insert_buffer(ModelBufferType::kW1Output, w1_output));
   CHECK(insert_buffer(ModelBufferType::kW3Output, w3_output));
 
-  // kv cache
-  tensor::Tensor key_cache(dtype, config_->layer_num_, config_->seq_len_, config_->kv_dim_, true,
-                           alloc);
-  tensor::Tensor value_cache(dtype, config_->layer_num_, config_->seq_len_, config_->kv_dim_, true,
-                             alloc);
-
-  CHECK(insert_buffer(ModelBufferType::kKeyCache, key_cache));
-  CHECK(insert_buffer(ModelBufferType::kValueCache, value_cache));
+  // NOTE: no internal KV cache here. It belongs to the legacy single-sequence
+  // path (slice_kv_cache / attention_mha) and is allocated lazily on first use
+  // by Model::ensure_internal_kv_cache — see the comment on buffers_ in
+  // model.h. Allocating it eagerly cost the full window (layers x seq_len x
+  // kv_dim x 2 tensors) even for every driver that only runs the batched
+  // scheduler path, which uses KVManager's own pool.
 
   // Wq query output
   tensor::Tensor query(dtype, config_->dim_, true, alloc);
@@ -892,7 +890,7 @@ base::Status Qwen2Model::forward_batch(
   if (scratch) {
     scratch->ensure(batch, hidden_dim, config_->dim_, kv_dim, config_->hidden_dim_,
                     config_->head_num_, config_->head_size_, max_seq_len, table_stride,
-                    device_type_, compute_dtype(), alloc);
+                    cache_dims.block_size, device_type_, compute_dtype(), alloc);
     hidden = scratch->hidden;
     rms_out = scratch->rms_out;
     q_batch = scratch->q_batch;

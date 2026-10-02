@@ -81,6 +81,16 @@ class BlockAllocator {
 
   int free_block_count() const;
   bool has_free_blocks(int n) const { return free_block_count() >= n; }
+
+  // Physical pool occupancy: every block NOT on the free list — blocks
+  // referenced by at least one row (each shared block counted once) plus
+  // cache-pinned (CACHED) blocks. This is the true KV footprint; summing
+  // num_used_blocks(row) per row double-counts shared blocks and misses
+  // cache-pinned ones.
+  int used_block_count() const {
+    return num_blocks_ - static_cast<int>(free_blocks_.size());
+  }
+
   int num_blocks() const { return num_blocks_; }
   int block_size() const { return block_size_; }
   int max_blocks_per_seq() const { return max_blocks_per_seq_; }

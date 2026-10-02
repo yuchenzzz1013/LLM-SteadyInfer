@@ -14,9 +14,16 @@ namespace scheduler {
 class Scheduler {
  public:
   // max_seq_len: per-sequence KV capacity (prompt + generation, in tokens).
+  //   Must not exceed the model window (model->seq_len()): the RoPE tables and
+  //   the CPU score scratch are sized to the window, so a larger capacity would
+  //   index past them. CHECKed in the constructor; drivers clamp with
+  //   min(..., model->seq_len()).
   // max_gen_len: per-request generation token limit (clamped to fit in cache).
-  // block_size: paged pool block size; 0 = env LLAMA_BLOCK_SIZE, else the
-  // workload heuristic (see resolve_block_size).
+  // block_size: paged pool block size. 0 = LLAMA_BLOCK_SIZE when it parses to
+  //   a positive integer, else kDefaultBlockSize (16). The constructor does
+  //   NOT run the workload heuristic (resolve_block_size) — that needs prompt
+  //   statistics the constructor does not have; drivers that measured a
+  //   workload pass the resolved value explicitly.
   // enable_prefix_cache: content-hash prefix caching (paged mode only). Off by
   // default — benchmark workloads (offline / online) have no shared prefixes,
   // so hashing and pinned KV blocks are pure overhead there; multi-turn chat,
@@ -45,10 +52,23 @@ class Scheduler {
 
   // KV cache stats
   int get_busy_kv_slots() const;
-  // Reserved KV capacity in tokens (paged: allocated blocks x block_size;
-  // continuous: busy slots x max_seq_len). 0 when unavailable.
+  // KV pool occupancy in tokens (paged: physical blocks off the free list —
+  // those referenced by running sequences, each shared block once, plus
+  // blocks pinned by the prefix cache — times block_size; continuous: busy
+  // slots times max_seq_len). 0 when unavailable.
   long long get_allocated_kv_tokens() const;
+  // Bytes of the preallocated K + V pool (both modes, device or host). The
+  // cache occupies this from construction, regardless of tokens in use;
+  // drivers should report this instead of re-deriving a size from tokens.
+  long long kv_pool_bytes() const;
   int get_block_size() const { return block_size_; }
+
+  // Block size a constructor call with block_size == 0 would pick: the
+  // LLAMA_BLOCK_SIZE environment variable when it parses to a positive
+  // integer, else kDefaultBlockSize. Exposed so drivers can size their own
+  // KV estimates around the block rounding the pool actually applies.
+  static constexpr int kDefaultBlockSize = 16;
+  static int default_block_size();
 
   // 等待队列长度(在线压测的排队指标)
   int num_waiting() const { return static_cast<int>(waiting_queue_.size()); }
@@ -140,7 +160,7 @@ class Scheduler {
   int max_seq_len_;
   int max_gen_len_;
   int next_seq_id_ = 0;
-  int block_size_ = 16;  // paged KV pool block size
+  int block_size_ = kDefaultBlockSize;  // paged KV pool block size
 
   // Adaptive chunked-prefill token budget (see build_batch_rows). Dampened
   // one level per step to avoid oscillation when decode pressure hovers

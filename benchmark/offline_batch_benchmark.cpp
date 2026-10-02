@@ -215,19 +215,22 @@ static RunMetrics run_once(const std::shared_ptr<model::Model>& model,
   }
   int max_total_seq_len =
       std::min(max_prompt_len + max_gen_len, static_cast<int>(model->seq_len()));
-  // 收缩模型内部 KV cache —— 必须在任何 decode CUDA graph 捕获之前调用:
-  // 捕获会把当时的 buffer 指针烘焙进图,捕获后再重分配会导致 replay 时
-  // 访问已释放内存(illegal memory access)。
-  model->resize_internal_kv_cache(max_prompt_len);
+  // 不再需要 resize_internal_kv_cache:模型内部那条单序列 KV cache 已改为
+  // 首次使用(老 predict/forward 路径)时才分配,调度器路径(本基准)永不触碰,
+  // 因此它不再占用显存,也就不存在"建 Scheduler 前先腾出 6 GB"的次序要求。
 
   // 分页块大小按工作负载平均 prompt 长度自适应(短文本 8/长文本 32/默认 16)。
   const long long avg_prompt_len =
       prompt_tokens.empty() ? 0 : prompt_len_sum / static_cast<long long>(prompt_tokens.size());
-  // Prefix caching off: offline prompts are independent questions with no
-  // shared prefix, so caching only adds hashing and pinned KV blocks.
+  // Prefix caching off (explicit, matching the comment): offline prompts are
+  // independent questions with no shared prefix, so caching would only add
+  // hashing work and pin KV blocks in the pool — changing the very pool
+  // utilisation / OOM boundary this benchmark measures. The KV metrics below
+  // are therefore the no-cache baseline. See prefix_caching_benchmark for the
+  // A/B of the cache itself.
   Scheduler sched(model, max_batch, max_total_seq_len, max_gen_len,
                   Scheduler::resolve_block_size(avg_prompt_len),
-                  /*enable_prefix_cache=*/true);
+                  /*enable_prefix_cache=*/false);
 
   // ---- 预热:与正式压测共用同一 Scheduler ----
   // decode CUDA graph 在首次 decode 时捕获并烘焙当时 KV/logits 的设备指针;
@@ -283,14 +286,18 @@ static RunMetrics run_once(const std::shared_ptr<model::Model>& model,
     const auto& running = sched.get_running();
     int busy = sched.get_busy_kv_slots();
     if (busy > 0) {
+      // used = tokens actually stored; denominator = KV pool occupancy in
+      // tokens (paged: every physical block off the free list, shared blocks
+      // once and cache-pinned blocks included; continuous: busy slots x
+      // capacity). Physical occupancy, not per-row reservations — so the
+      // ratio answers "how full is the pool", not "how much did each row
+      // reserve".
       long long used = 0;
       for (const auto& s : running) {
         used += static_cast<long long>(s.num_prompt_tokens) + s.num_generated_tokens;
       }
       used_cap_sum += used;
       {
-        // Paged: truthful reservation = allocated blocks x block_size (lazy
-        // growth); continuous layout falls back to busy slots x capacity.
         long long alloc_tokens = sched.get_allocated_kv_tokens();
         alloc_cap_sum += alloc_tokens > 0
                              ? alloc_tokens
@@ -333,6 +340,11 @@ static RunMetrics run_once(const std::shared_ptr<model::Model>& model,
     }
     for (double itl : seq.token_timestamps_ms) itls.push_back(itl);
 
+    // Per-request view: the fraction of its full per-sequence capacity the
+    // request did NOT use. In the paged pool that capacity is not reserved to
+    // the row (blocks are allocated on demand and an unused tail block is
+    // still free), so this is an upper bound on waste — pool-level reuse is
+    // captured by kv_cache_util_global above, not here.
     int used = seq.num_prompt_tokens + seq.num_generated_tokens;
     per_seq_frag.push_back(1.0 - static_cast<double>(used) / max_total_seq_len);
 
@@ -360,11 +372,15 @@ static RunMetrics run_once(const std::shared_ptr<model::Model>& model,
   m.e2e_p99_ms = percentile(e2es, 99);
 
   // ---- KV cache 碎片率 ----
-  // 全局(时间加权):已分配容量中真正存有 token 的比例
+  // 全局(时间加权):池子物理占用中真正存有 token 的比例。分母取
+  // Scheduler::get_allocated_kv_tokens()(分页下 = 池中非空闲块 x block_size,
+  // 共享块只计一次、被前缀缓存 pin 住的块也计入),所以这是"池有多满",
+  // 而不是"每行各预留了多少"。
   m.kv_cache_util_global =
       alloc_cap_sum > 0 ? static_cast<double>(used_cap_sum) / alloc_cap_sum : 0;
   m.kv_cache_frag_global = 1.0 - m.kv_cache_util_global;
-  // 每请求视角:单个请求对其 KV slot 序列维度的浪费
+  // 每请求视角:该请求对自身最大序列容量未使用的比例(分页下为浪费上界,
+  // 未用容量并不被该行独占;见 per_seq_frag 赋值处注释)。
   m.kv_cache_frag_per_seq = mean(per_seq_frag);
   m.avg_busy_kv_slots =
       kv_samples > 0 ? static_cast<double>(busy_slots_sum) / kv_samples : 0;

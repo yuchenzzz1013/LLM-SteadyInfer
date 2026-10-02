@@ -5,10 +5,12 @@
 namespace scheduler {
 
 namespace {
-// Per-call cap on the LRU walk in evict_lru: a pool under pressure may have
-// most entries still referenced, and walking a huge cache on every failed
-// allocation would cost more than the eviction is worth. Anything left is
-// retried on the next allocation attempt.
+// Per-call cap on the LRU walk in evict_lru, applied only while the walk is
+// actually freeing blocks: a pool under pressure may have most entries still
+// referenced, and walking a huge cache on every failed allocation would cost
+// more than the eviction is worth. Anything left is retried on the next
+// allocation attempt. A walk that has freed nothing ignores the cap and runs
+// to the list head — see evict_lru for why stopping there would livelock.
 constexpr int kEvictScanCap = 1024;
 }  // namespace
 
@@ -83,8 +85,10 @@ void PrefixCache::touch(Entry* e) {
 
 int PrefixCache::lookup(const std::vector<int>& prompt_tokens, BlockAllocator& allocator,
                         std::vector<int32_t>* shared_blocks) {
+  // Pure query: no stats. The scheduler may run this more than once for one
+  // request (admission retries, later re-queries) while only one outcome
+  // matters; record_admission() counts the outcome that was mounted.
   shared_blocks->clear();
-  ++stats_.lookups;
   const int max_blocks = cacheable_blocks(static_cast<int>(prompt_tokens.size()));
 
   uint64_t prev_hash = 0;
@@ -114,12 +118,15 @@ int PrefixCache::lookup(const std::vector<int>& prompt_tokens, BlockAllocator& a
     prev_hash = h;  // only a matched block lets the chain advance
   }
 
-  const int matched = static_cast<int>(shared_blocks->size());
-  if (matched > 0) {
+  return static_cast<int>(shared_blocks->size());
+}
+
+void PrefixCache::record_admission(int matched_blocks) {
+  ++stats_.lookups;
+  if (matched_blocks > 0) {
     ++stats_.hits;
-    stats_.matched_blocks += matched;
+    stats_.matched_blocks += matched_blocks;
   }
-  return matched;
 }
 
 int PrefixCache::insert_committed(const int* prompt_tokens, int num_prompt_tokens,
@@ -184,14 +191,26 @@ int PrefixCache::insert_committed(const int* prompt_tokens, int num_prompt_token
 
 int PrefixCache::evict(int n, BlockAllocator& allocator) {
   if (n <= 0) return 0;
-  return evict_lru(n, allocator);
+  const int evicted = evict_lru(n, allocator);
+  if (evicted < n) {
+    ++stats_.evict_shortfalls;
+    // Once per process: a shortfall means reclaim could not free all the
+    // requested blocks because the rest of the cache is referenced by running
+    // sequences — the pool is over-subscribed and requests will increasingly
+    // wait or preempt. Silence after the first report keeps a busy server log
+    // readable; the counter above stays exact.
+    LOG_FIRST_N(WARNING, 1)
+        << "[PREFIX] reclaim short: asked for " << n << " blocks, freed " << evicted
+        << " (cached KV still referenced by running sequences); pool over-subscribed";
+  }
+  return evicted;
 }
 
 int PrefixCache::evict_lru(int n, BlockAllocator& allocator) {
   int evicted = 0;
   int scan_budget = kEvictScanCap;
   Entry* e = lru_tail_;
-  while (e != nullptr && evicted < n && scan_budget-- > 0) {
+  while (e != nullptr && evicted < n) {
     Entry* prev = e->prev;  // unlink() rewrites the list around e
     // Only blocks no sequence references may be released: dropping the pin on
     // a block a row still reads would let the pool hand its KV to a writer.
@@ -205,6 +224,15 @@ int PrefixCache::evict_lru(int n, BlockAllocator& allocator) {
       ++stats_.evictions;
     }
     e = prev;
+    // The budget throttles only productive walks (every iteration near the
+    // tail of a big cache costs a ref_count probe). A walk that has freed
+    // NOTHING yet runs to the list head, bounded by the entry count alone:
+    // stopping it at the cap would make the next call start from the same
+    // live tail and re-skip the same entries, so a cache whose oldest entries
+    // are all pinned could never reach the free blocks behind them. Reclaim
+    // runs only after an allocation already failed, and the returned count is
+    // still capped by the caller's need (n).
+    if (evicted > 0 && --scan_budget <= 0) break;
   }
   return evicted;
 }

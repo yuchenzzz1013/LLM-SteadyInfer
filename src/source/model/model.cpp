@@ -10,6 +10,7 @@
 #include "base/bf16_utils.h"
 #include "model/safetensors_reader.h"
 #include "../op/kernels/cuda/mha_kernel.cuh"
+#include "../op/kernels/cuda/paged_kernels.cuh"  // paged_decode_geometry_ok (partials sizing)
 namespace model {
 Model::Model(base::TokenizerType tokenizer_type, base::ModelType model_type, std::string token_path,
              std::string model_path, bool is_quant_model)
@@ -27,7 +28,7 @@ Model::Model(base::TokenizerType tokenizer_type, base::ModelType model_type, std
 
 void BatchScratch::ensure(int32_t batch, int32_t hidden_dim, int32_t dim, int32_t kv_dim,
                           int32_t ffn_dim, int32_t head_num, int32_t head_size,
-                          int32_t max_seq_len, int32_t block_table_stride,
+                          int32_t max_seq_len, int32_t block_table_stride, int32_t block_size,
                           base::DeviceType device, base::DataType dtype,
                           const std::shared_ptr<base::DeviceAllocator>& alloc) {
   const int32_t num_splits =
@@ -36,11 +37,12 @@ void BatchScratch::ensure(int32_t batch, int32_t hidden_dim, int32_t dim, int32_
   // re-allocate when the element type of the cached buffers changed.
   if (this->batch == batch && !hidden.is_empty() && hidden.get_dim(0) == batch &&
       hidden.data_type() == dtype && this->block_table_stride == block_table_stride &&
-      this->num_splits == num_splits) {
+      this->block_size == block_size && this->num_splits == num_splits) {
     return;
   }
   this->batch = batch;
   this->block_table_stride = block_table_stride;
+  this->block_size = block_size;
   this->num_splits = num_splits;
 
   hidden = tensor::Tensor(dtype, batch, hidden_dim, true, alloc);
@@ -73,7 +75,13 @@ void BatchScratch::ensure(int32_t batch, int32_t hidden_dim, int32_t dim, int32_
     // reinterprets it as (acc | m | l) fp32 rows. Sizing for the larger layout
     // also covers the plain bf16 split-partials fallback and the continuous
     // layout; the decode batches here are small, so the surplus is KBs.
-    const bool fp32_split = num_splits > 1 && head_size == 128 && block_table_stride > 0;
+    // Use the kernels' own geometry predicate (not a local copy of it) so the
+    // two can never disagree: paged_attention_cu_batch runs the fp32 split-KV
+    // kernel exactly when paged_decode_geometry_ok holds, and a pool with
+    // block_size < 4 (which the predicate rejects) would otherwise make this
+    // over-allocate 2x — harmless, but the kind of divergence that hides bugs.
+    const bool fp32_split =
+        num_splits > 1 && kernel::paged_decode_geometry_ok(head_size, block_table_stride, block_size);
     partial_batch = tensor::Tensor(
         dtype, kernel::flash_decoding_partials_elements(batch, head_num, num_splits, head_size,
                                                         fp32_split),
@@ -162,7 +170,7 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
   const base::DataType dtype = compute_dtype();
   entry->scratch->ensure(batch, m_hidden_dim, m_attn_dim, kv_dim, m_ffn_dim,
                          config_->head_num_, config_->head_size_, max_seq_len, table_stride,
-                         device_type_, dtype, alloc);
+                         dims.block_size, device_type_, dtype, alloc);
 
   // 2. Stage the new inputs at stable host addresses. forward_batch uploads
   // them to the device staging buffers, so the H2D copies become captured
@@ -563,6 +571,10 @@ std::string Model::decode(std::vector<int32_t> token_idxs) const {
 
 std::pair<tensor::Tensor, tensor::Tensor> Model::slice_kv_cache(int32_t layer_idx,
                                                                 int32_t token_pos) const {
+  // First touch of the legacy internal cache (predict/forward path): allocate
+  // it now, at the recorded cap. Drivers of the batched scheduler path never
+  // reach this, so they never pay for the cache.
+  ensure_internal_kv_cache();
   // Use the tensor's actual sequence dimension (dim 1) for stride, not config_->seq_len_,
   // so the internal KV cache can be resized independently of the model's max context length.
   int32_t cache_seq_len = get_buffer(ModelBufferType::kKeyCache).get_dim(1);
@@ -648,8 +660,53 @@ std::vector<int32_t> Model::post_processing_batch(const tensor::Tensor& logits) 
   return tokens;
 }
 
+void Model::ensure_internal_kv_cache() const {
+  if (buffers_.find(ModelBufferType::kKeyCache) != buffers_.end()) return;
+  CHECK(config_ != nullptr) << "ensure_internal_kv_cache: model not initialized";
+  const int32_t len = internal_kv_len_ > 0 ? internal_kv_len_ : config_->seq_len_;
+  CHECK_GT(len, 0) << "ensure_internal_kv_cache: model window is unknown (seq_len=0)";
+
+  auto alloc = (device_type_ == base::DeviceType::kDeviceCUDA)
+                   ? std::shared_ptr<base::DeviceAllocator>(
+                         base::CUDADeviceAllocatorFactory::get_instance())
+                   : base::CPUDeviceAllocatorFactory::get_instance();
+  const base::DataType dtype = compute_dtype();
+  tensor::Tensor key_cache(dtype, config_->layer_num_, len, config_->kv_dim_, true, alloc);
+  tensor::Tensor value_cache(dtype, config_->layer_num_, len, config_->kv_dim_, true, alloc);
+  if (key_cache.is_empty() || value_cache.is_empty()) {
+    const double mb = static_cast<double>(config_->layer_num_) * len * config_->kv_dim_ *
+                      static_cast<double>(base::DataTypeSize(dtype)) * 2.0 / (1024.0 * 1024.0);
+    LOG(FATAL) << "internal KV cache allocation failed: "
+               << config_->layer_num_ << " layers x " << len << " tokens x " << config_->kv_dim_
+               << " kv_dim (K+V, " << mb << " MB); shrink it with resize_internal_kv_cache()";
+  }
+  buffers_[ModelBufferType::kKeyCache] = std::move(key_cache);
+  buffers_[ModelBufferType::kValueCache] = std::move(value_cache);
+  internal_kv_len_ = len;
+}
+
 void Model::resize_internal_kv_cache(int32_t max_seq_len) {
   if (max_seq_len <= 0) return;
+  // Clamp to the model window: the RoPE sin/cos tables and the CPU score
+  // scratch are sized to config_->seq_len_, so a longer cache could never be
+  // used over its full length anyway (positions past the window would read
+  // out of those tables).
+  const int32_t window = config_ ? config_->seq_len_ : max_seq_len;
+  if (max_seq_len > window) {
+    LOG(WARNING) << "[MODEL] resize_internal_kv_cache(" << max_seq_len
+                 << ") exceeds the model window " << window << "; clamping";
+    max_seq_len = window;
+  }
+  internal_kv_len_ = max_seq_len;
+
+  // If the cache does not exist yet, that is all this call does: the internal
+  // cache is legacy single-sequence state (see ensure_internal_kv_cache) and is
+  // allocated on first use at the recorded cap. Reserving the whole pool here
+  // for every driver — as this function used to — is what made the 6 GB cache
+  // dead weight for the batched scheduler path.
+  auto it_key = buffers_.find(ModelBufferType::kKeyCache);
+  auto it_val = buffers_.find(ModelBufferType::kValueCache);
+  if (it_key == buffers_.end() || it_val == buffers_.end()) return;
 
   // Any captured decode graph may reference the old internal buffers
   // (single-sequence prefill path); invalidate the pool so the next decode
@@ -662,18 +719,14 @@ void Model::resize_internal_kv_cache(int32_t max_seq_len) {
   auto alloc = (device_type_ == base::DeviceType::kDeviceCUDA)
       ? std::shared_ptr<base::DeviceAllocator>(base::CUDADeviceAllocatorFactory::get_instance())
       : base::CPUDeviceAllocatorFactory::get_instance();
-
-  auto it_key = buffers_.find(ModelBufferType::kKeyCache);
-  auto it_val = buffers_.find(ModelBufferType::kValueCache);
-
-  if (it_key != buffers_.end() && it_val != buffers_.end()) {
-    int32_t num_layers = it_key->second.get_dim(0);
-    int32_t kv_dim = it_key->second.get_dim(2);
-
-    it_key->second = tensor::Tensor(it_key->second.data_type(),
-                                     num_layers, max_seq_len, kv_dim, true, alloc);
-    it_val->second = tensor::Tensor(it_val->second.data_type(),
-                                     num_layers, max_seq_len, kv_dim, true, alloc);
+  const int32_t num_layers = it_key->second.get_dim(0);
+  const int32_t kv_dim = it_key->second.get_dim(2);
+  const base::DataType dtype = it_key->second.data_type();
+  it_key->second = tensor::Tensor(dtype, num_layers, max_seq_len, kv_dim, true, alloc);
+  it_val->second = tensor::Tensor(dtype, num_layers, max_seq_len, kv_dim, true, alloc);
+  if (it_key->second.is_empty() || it_val->second.is_empty()) {
+    LOG(FATAL) << "internal KV cache resize failed: " << num_layers << " layers x " << max_seq_len
+               << " tokens x " << kv_dim << " kv_dim (K+V); out of memory?";
   }
 
   if (device_type_ == base::DeviceType::kDeviceCUDA) {

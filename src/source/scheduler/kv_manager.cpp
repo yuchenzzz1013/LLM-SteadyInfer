@@ -20,6 +20,17 @@ KVManager::KVManager(int num_layers, int max_batch, int max_seq_len, int kv_dim,
     // pool serves all layers (block i of layer l is key_cache[l][i]).
     // Pool capacity matches the continuous layout within one block per seq:
     //   num_blocks = max_batch * ceil(max_seq_len / block_size)
+    //
+    // Validate the block size here, where the value and its origin (Scheduler
+    // argument or LLAMA_BLOCK_SIZE) are still attributable: the kernels assume
+    // a power-of-two page that fits a warp's 4-position group
+    // (paged_decode_geometry_ok requires block_size >= 4) and
+    // paged_attention_cu_batch requires 256 % block_size == 0. Anything else
+    // would silently fall back to a slow path or mis-address the pool.
+    CHECK(block_size >= 4 && (block_size & (block_size - 1)) == 0 && 256 % block_size == 0)
+        << "Invalid paged KV block_size=" << block_size
+        << " (must be a power of two >= 4 dividing 256: 8, 16, 32, ...); "
+        << "set by the Scheduler block_size argument or LLAMA_BLOCK_SIZE";
     block_size_ = block_size;
     max_blocks_per_seq_ = (max_seq_len_ + block_size_ - 1) / block_size_;
     num_blocks_ = max_batch_ * max_blocks_per_seq_;
@@ -65,6 +76,31 @@ KVManager::KVManager(int num_layers, int max_batch, int max_seq_len, int kv_dim,
     value_cache_ = tensor::Tensor(kv_dtype, num_layers_, max_batch_, kv_dim_, max_seq_len_,
                                   true, alloc);
   }
+
+  // The KV pool is by far the largest allocation in the process and it is
+  // requested here, once, up front. If the device is out of memory the
+  // allocator returns an empty tensor; without this check that surfaces much
+  // later as a CUDA illegal address (or a null-pointer memcpy on CPU), with
+  // nothing pointing at the pool size or the knobs that control it. Fail at
+  // construction instead, with the numbers needed to size it down.
+  if (key_cache_.is_empty() || value_cache_.is_empty()) {
+    const double pool_gb =
+        static_cast<double>(pool_bytes()) / (1024.0 * 1024.0 * 1024.0);
+    LOG(FATAL) << "KV pool allocation failed: tried to allocate " << pool_gb << " GB ("
+               << (paged_ ? "paged" : "continuous") << " layout, layers=" << num_layers_
+               << " max_batch=" << max_batch_ << " max_seq_len=" << max_seq_len_
+               << " kv_dim=" << kv_dim_
+               << (paged_ ? " block_size=" + std::to_string(block_size_) : std::string())
+               << "). Lower max_batch / max_seq_len (or the driver's --gpu-mem-fraction) "
+                  "and retry.";
+  }
+}
+
+long long KVManager::pool_bytes() const {
+  // Derived from the dims, so a failed (empty) allocation still reports the
+  // size that was attempted — see the constructor's failure message.
+  return static_cast<long long>(key_cache_.byte_size()) +
+         static_cast<long long>(value_cache_.byte_size());
 }
 
 int KVManager::allocate() {

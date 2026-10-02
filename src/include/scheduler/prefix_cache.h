@@ -8,13 +8,23 @@
 
 namespace scheduler {
 
-// Prefix-cache effectivenes counters (Scheduler::prefix_cache_stats).
+// Prefix-cache effectiveness counters (Scheduler::prefix_cache_stats).
+//
+// Anchored to ADMISSION outcomes, not to lookup() calls: the scheduler may
+// query the cache several times for one request (admission retries while the
+// pool is full, re-queries on later steps) and only the match that is actually
+// mounted avoids prefill work. record_admission() is called exactly once per
+// admitted request, so the counters here answer "how much prompt prefill did
+// the cache remove", not "how many queries were issued".
 struct PrefixCacheStats {
-  int64_t lookups = 0;         // lookup() calls
-  int64_t hits = 0;            // lookups that matched >= 1 whole block
-  int64_t matched_blocks = 0;  // cumulative matched blocks over all lookups
+  int64_t lookups = 0;         // admitted requests (one record_admission each)
+  int64_t hits = 0;            // admissions that mounted >= 1 cached block
+  int64_t matched_blocks = 0;  // blocks actually mounted from the cache
   int64_t inserts = 0;         // entries inserted
   int64_t evictions = 0;       // entries evicted (LRU)
+  // evict() calls that freed fewer blocks than requested — the pool reclaim
+  // had to leave some cached KV pinned under a running sequence (see evict).
+  int64_t evict_shortfalls = 0;
   double hit_rate() const {
     return lookups > 0 ? static_cast<double>(hits) / static_cast<double>(lookups) : 0.0;
   }
@@ -60,8 +70,18 @@ class PrefixCache {
   // Longest whole-block prefix of `prompt_tokens` that can be shared. Fills
   // `shared_blocks` with the physical block ids (one per matched block, in
   // order) and returns the matched count. Touches the matched entries (LRU).
+  //
+  // Pure query: it updates no stats (use record_admission), and a caller that
+  // does not end up mounting the returned blocks (e.g. an admission retry that
+  // fails on pool space) leaves no trace.
   int lookup(const std::vector<int>& prompt_tokens, BlockAllocator& allocator,
              std::vector<int32_t>* shared_blocks);
+
+  // Record one admission outcome for the stats above. `matched_blocks` is the
+  // number of cached blocks actually mounted into the admitted row (0 = the
+  // request prefills everything). Called by the Scheduler after a successful
+  // admission; lookup() itself never counts.
+  void record_admission(int matched_blocks);
 
   // Record every committed full prompt block of a sequence (idempotent and
   // incremental — call it after each chunked-prefill step).
@@ -86,10 +106,13 @@ class PrefixCache {
                        int completed_tokens, const int32_t* row_table,
                        std::vector<uint64_t>* hash_chain, BlockAllocator& allocator);
 
-  // Evict up to `n` LRU entries (fewer when the tail entries are still in use),
-  // returning the number evicted. Entries whose block is still referenced by a
-  // sequence are skipped — releasing them would unpin KV a running row reads.
-  // This is the BlockAllocator's reclaim source when the free list runs dry.
+  // Evict up to `n` LRU entries, returning the number evicted. Entries whose
+  // block is still referenced by a sequence are skipped — releasing them would
+  // unpin KV a running row reads — but the walk keeps going past them, so a
+  // referenced tail does not starve reclaim (a bounded scan while it is making
+  // progress, then an unbounded walk only if it has freed nothing yet, see
+  // evict_lru). This is the BlockAllocator's reclaim source when the free list
+  // runs dry; a shortfall is counted in stats().evict_shortfalls.
   int evict(int n, BlockAllocator& allocator);
 
   // Whole-block prefix of `num_prompt_tokens` that may be cached/shared (see
@@ -125,7 +148,10 @@ class PrefixCache {
   void push_front(Entry* e);
   void touch(Entry* e);
 
-  // Evict up to `n` unreferenced entries from the tail; returns the count.
+  // Evict up to `n` unreferenced entries walking from the tail; returns the
+  // count. Bounded by kEvictScanCap entries while it is freeing blocks, and
+  // unbounded (until the list is exhausted) while it has freed none — a fully
+  // referenced tail must not make every call re-scan the same skipped entries.
   int evict_lru(int n, BlockAllocator& allocator);
 
   bool tokens_match(const Entry& e, const int* tokens) const;

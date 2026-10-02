@@ -3,13 +3,12 @@
 #include "kernels/kernels_interface.h"
 namespace op {
 MultiHeadAttention::MultiHeadAttention(base::DeviceType device_type, int32_t layer_index,
-                                       int32_t kv_head_num, int32_t kv_dim, int32_t seq_len,
-                                       int32_t head_num, int32_t head_size)
+                                       int32_t kv_head_num, int32_t kv_dim, int32_t head_num,
+                                       int32_t head_size)
     : Layer(device_type, LayerType::kLayerMHA, "MultiHead"),
       layer_index_(layer_index),
       kv_head_num_(kv_head_num),
       kv_dim_(kv_dim),
-      seq_len_(seq_len),
       head_num_(head_num),
       head_size_(head_size) {
   reset_input_size(5);
@@ -34,11 +33,10 @@ base::Status MultiHeadAttention::forward() {
   if (device_type_ == base::DeviceType::kDeviceCUDA) {
     CHECK(cuda_config_ != nullptr);
   }
-  // Use the key cache tensor's actual sequence-length dimension for the
-  // layer stride, not the seq_len_ constructor parameter, so the cache can
-  // be resized at runtime (e.g. to match a shorter prompt length).
-  // The sequence dim is the second-to-last: dim 1 for the 3-D internal
-  // cache [layers, seq, kv_dim], dim 0 for 2-D per-slot views [seq, kv_dim].
+  // The sequence length comes from the cache tensor itself (second-to-last
+  // dim: dim 1 for the 3-D internal cache [layers, seq, kv_dim], dim 0 for
+  // 2-D per-slot views [seq, kv_dim]), so a runtime resize is honored by
+  // construction — there is no constructor argument that could drift from it.
   CHECK_GE(key_cache_tensor.dims_size(), 2);
   int32_t cache_seq_len = key_cache_tensor.get_dim(key_cache_tensor.dims_size() - 2);
   kernel::get_mha_kernel(device_type_)(pos_, head_num_, layer_index_, cache_seq_len, kv_dim_,

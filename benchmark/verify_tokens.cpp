@@ -25,6 +25,8 @@
 #include "scheduler/scheduler.h"
 
 #include <cuda_runtime.h>
+#include <algorithm>
+#include <cstdint>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -86,7 +88,10 @@ int main(int argc, char* argv[]) {
   // ids across builds, so the shared/KV block bookkeeping must not be able to
   // influence the sampled tokens.
   {
-    scheduler::Scheduler warm_sched(model, 1, 128, 8, /*block_size=*/0,
+    // 128 tokens of warm-up capacity, but never past the model window (a small
+    // test model would otherwise fail the Scheduler's sizing CHECK).
+    const int warm_seq_len = std::min(128, model->seq_len());
+    scheduler::Scheduler warm_sched(model, 1, warm_seq_len, 8, /*block_size=*/0,
                                     /*enable_prefix_cache=*/false);
     auto t = model->encode("warm up");
     if (t.empty()) t = {1};
@@ -97,7 +102,22 @@ int main(int argc, char* argv[]) {
 
   auto tokens = model->encode(prompt);
   if (tokens.empty()) tokens = {1};
-  int max_seq_len = static_cast<int>(tokens.size()) + max_gen;
+  // Per-sequence capacity = prompt + generation, clamped to the model window:
+  // the RoPE sin/cos tables and the score scratch are window-sized, so a
+  // position past model->seq_len() would read out of them (silently wrong
+  // output, not a crash). The addition runs in int64 and is checked before the
+  // narrowing cast — `max_gen 2147483000` used to overflow int, wrap negative
+  // and collapse the pool to zero blocks.
+  const int64_t wanted_seq_len =
+      static_cast<int64_t>(tokens.size()) + static_cast<int64_t>(max_gen);
+  const int model_window = model->seq_len();
+  if (wanted_seq_len > model_window) {
+    std::cerr << "prompt (" << tokens.size() << ") + max_gen (" << max_gen
+              << ") = " << wanted_seq_len << " exceeds the model window " << model_window
+              << "; clamping max_seq_len to the window.\n";
+  }
+  const int max_seq_len =
+      static_cast<int>(std::min<int64_t>(wanted_seq_len, model_window));
   scheduler::Scheduler sched(model, 1, max_seq_len, max_gen, /*block_size=*/0,
                              /*enable_prefix_cache=*/false);
   const int seq_id = sched.add_request(tokens);
