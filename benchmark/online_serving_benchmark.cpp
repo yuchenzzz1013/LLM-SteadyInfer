@@ -72,6 +72,11 @@ struct Args {
   double duration = 0;       // 请求提交窗口秒数;<=0 不限制(提交完即排空)
   double ttft_sla_ms = -1;   // TTFT SLA 阈值;<=0 禁用
   double tpot_sla_ms = -1;   // TPOT SLA 阈值;<=0 禁用
+
+  // 前缀缓存(默认打开,与线上 serving 配置一致)。请求彼此独立时命中率低,
+  // 打开后测到的是带上缓存后的真实排队/占用;要看净收益用
+  // prefix_caching_benchmark 的 A/B,要回到底线口径用 --prefix-cache 0。
+  int prefix_cache = 1;
 };
 
 // 解析浮点参数,支持 "inf"(无穷大 → -1)
@@ -136,6 +141,8 @@ static Args parse_args(int argc, char** argv) {
     a.ttft_sla_ms = to_double(get_arg(argc, argv, "--ttft-sla-ms"));
   if (has_arg(argc, argv, "--tpot-sla-ms"))
     a.tpot_sla_ms = to_double(get_arg(argc, argv, "--tpot-sla-ms"));
+  if (has_arg(argc, argv, "--prefix-cache"))
+    a.prefix_cache = to_int(get_arg(argc, argv, "--prefix-cache"));
 
   // 参数兜底:负的 iterations/max_gen 此前会在 vector 分配处抛 length_error 崩溃,
   // rate==0 会让到达间隔变成 inf(请求永不提交,压测挂死)。
@@ -189,6 +196,9 @@ static void print_usage(const char* prog) {
       << "                         (默认 0 = 不限制)\n"
       << "  --ttft-sla-ms <ms>     TTFT SLA 阈值,用于 goodput 计算(默认关闭)\n"
       << "  --tpot-sla-ms <ms>     TPOT SLA 阈值,用于 goodput 计算(默认关闭)\n"
+      << "  --prefix-cache <0|1>   前缀缓存(默认 1 = 打开)。请求彼此独立时命中率\n"
+      << "                         低,打开后测到的是带上缓存后的真实排队与池占用;\n"
+      << "                         要看净收益用 prefix_caching_benchmark 的 A/B\n"
       << "  --output-csv <path>    结果 CSV 路径(默认 results/serving_metrics.csv)\n";
 }
 
@@ -225,8 +235,8 @@ struct ServingMetrics {
   double kv_cache_util_global = 0;   // 时间加权:已用 token 槽 / 已分配容量
   double kv_cache_frag_global = 0;   // 1 - util_global
   double kv_cache_frag_per_seq = 0;  // 每请求视角(与 offline 口径一致)
-  // Prefix-cache counters: all zero here, the serving benchmark runs with the
-  // cache off (independent prompts share no prefix).
+  // Prefix-cache counters (all zero when --prefix-cache 0).
+  bool enable_prefix_cache = false;
   scheduler::PrefixCacheStats prefix;
   double avg_busy_kv_slots = 0, peak_busy_kv_slots = 0;
 
@@ -310,12 +320,11 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
       max_batch = requested_batch;
     }
   }
-  // Prefix caching off (explicit, matching the comment): serving requests are
-  // independent, so caching would only add hashing work and pin KV blocks,
-  // changing the pool capacity / OOM boundary / utilisation this benchmark
-  // reports. See prefix_caching_benchmark for the cache A/B.
+  // 前缀缓存默认打开(--prefix-cache 0 关闭):线上 serving 配置就是开着的,
+  // 排队/占用/吞吐都应当带上它的开销与被钉住的池块。请求独立时命中率低,
+  // 缓存收益本身由 prefix_caching_benchmark 的 A/B 回答。
   Scheduler sched(model, max_batch, max_total_seq_len, args.max_gen, block_size,
-                  /*enable_prefix_cache=*/false);
+                  /*enable_prefix_cache=*/args.prefix_cache != 0);
 
   // ---- 预热:与正式压测共用同一 Scheduler(同 offline,统计中跳过) ----
   // 每轮提交 warmup_requests(默认 = max_batch)个相同 prompt,请求同步完成
@@ -542,6 +551,7 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
   m.gpu_sm_util_pct = sampler.sm_util_pct();
   m.gpu_mem_util_pct = sampler.mem_util_pct();
   m.gpu_mem_used_mb = sampler.mem_used_mb();
+  m.enable_prefix_cache = sched.prefix_cache_enabled();
   m.prefix = sched.prefix_cache_stats();
 
   return m;
@@ -568,6 +578,7 @@ static void write_csv(const std::string& path,
        "avg_busy_kv_slots,peak_busy_kv_slots,"
        "avg_batch_size,avg_batch_reconstruct_ms,p99_batch_reconstruct_ms,"
        "mfu,peak_tflops,gpu_sm_util_pct,gpu_mem_util_pct,gpu_mem_used_mb,"
+       "enable_prefix_cache,"
        "prefix_cache_lookups,prefix_cache_hits,prefix_cache_hit_rate,"
        "prefix_cache_matched_blocks,prefix_cache_inserts,prefix_cache_evictions\n";
   f << std::fixed << std::setprecision(6);
@@ -589,6 +600,7 @@ static void write_csv(const std::string& path,
       << r.avg_batch_reconstruct_ms << "," << r.p99_batch_reconstruct_ms << ","
       << r.mfu << "," << r.peak_tflops << "," << r.gpu_sm_util_pct << ","
       << r.gpu_mem_util_pct << "," << r.gpu_mem_used_mb << ","
+      << (r.enable_prefix_cache ? 1 : 0) << ","
       << r.prefix.lookups << "," << r.prefix.hits << ","
       << r.prefix.hit_rate() << "," << r.prefix.matched_blocks << ","
       << r.prefix.inserts << "," << r.prefix.evictions << "\n";
@@ -664,11 +676,11 @@ static void print_report(const ServingMetrics& r, const Args& args) {
   std::cout << "GPU SM util (NVML):                     " << r.gpu_sm_util_pct << "%\n";
   std::cout << "GPU mem util (NVML):                    " << r.gpu_mem_util_pct
             << "%  (used " << r.gpu_mem_used_mb << " MB)\n";
-  std::cout << "Prefix cache:                           lookups=" << r.prefix.lookups
-            << " hits=" << r.prefix.hits << " (" << r.prefix.hit_rate() * 100.0
-            << "%)  matched_blocks=" << r.prefix.matched_blocks
-            << "  inserts=" << r.prefix.inserts << "  evictions=" << r.prefix.evictions
-            << "\n";
+  std::cout << "Prefix cache (" << (r.enable_prefix_cache ? "on" : "off")
+            << "):                     lookups=" << r.prefix.lookups << " hits=" << r.prefix.hits
+            << " (" << r.prefix.hit_rate() * 100.0 << "%)  matched_blocks="
+            << r.prefix.matched_blocks << "  inserts=" << r.prefix.inserts
+            << "  evictions=" << r.prefix.evictions << "\n";
   std::cout << "====================================================\n";
 }
 

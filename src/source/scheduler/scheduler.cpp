@@ -314,56 +314,65 @@ void Scheduler::try_admit_sequences() {
 
     // Prefix cache: whole-block prompt prefixes are shared read-only — only
     // the non-shared remainder needs fresh blocks and prefill.
-    std::vector<int32_t> shared_blocks;
-    int matched = 0;
-    const auto lookup_prefix = [&]() {
-      matched = 0;
-      shared_blocks.clear();
-      if (prefix_cache_) {
-        matched = prefix_cache_->lookup(seq.prompt_tokens, *kv_manager_->block_allocator(),
-                                        &shared_blocks);
-      }
-    };
-
-    // Bounded retry: the pool can move under us between the match and the
-    // mount (allocation may reclaim cache entries, preemption frees other
-    // sequences' blocks), so each attempt re-validates the match. The request
-    // keeps waiting in FCFS order if no attempt lands.
+    //
+    // Order matters: match, claim a row, MOUNT the match, then allocate the
+    // private remainder. Mounting first references the matched blocks, and a
+    // referenced block is never evicted (allocation reclaim runs LRU eviction
+    // on the cache, which requires refcount 0), so the private allocation
+    // cannot pull a matched block out of the cache and hand it back as a
+    // private block of this same row — which would alias the prefix's KV with
+    // the private region's writes. The old order (allocate, then mount) had
+    // exactly that hole under pool pressure: the reclaim evicted the just
+    // matched, still unreferenced blocks, the LIFO free list returned one as
+    // the first private block, and the mount then placed it in the table a
+    // second time.
+    BlockAllocator* const allocator = kv_manager_->block_allocator();
+    PrefixMatch match;
     int row = -1;
     bool admitted_ok = false;
     for (int attempt = 0; attempt < 3 && !admitted_ok; ++attempt) {
-      lookup_prefix();
-      const int private_blocks = prompt_blocks - matched;
-      row = kv_manager_->block_allocator()->allocate_blocks(private_blocks);
+      if (prefix_cache_) {
+        prefix_cache_->lookup(seq.prompt_tokens, *allocator, &match);
+      }
+      // A fresh row with an empty table first: n == 0 never reclaims, so the
+      // match stays valid until it is mounted below.
+      row = allocator->allocate_blocks(0);
       if (row < 0) {
+        // Every row is taken by a running or preempted sequence. Preemption
+        // frees blocks but always leaves its victim ≥ 1 block (and its row),
+        // so it cannot help here: keep the request waiting in FCFS order.
+        break;
+      }
+      if (!match.empty() && !allocator->reserve_shared_prefix(row, match.blocks)) {
+        // Unreachable while the mount precedes every allocation: nothing can
+        // release a matched block in between. If it does fire, the match is
+        // simply re-run on the next attempt.
+        LOG(WARNING) << "[SCHED] seq id=" << seq.id
+                     << ": matched prefix blocks changed under us; retrying admission";
+        allocator->free_all(row);
+        row = -1;
+        continue;
+      }
+      const int private_blocks = prompt_blocks - match.size();
+      if (private_blocks > 0 && allocator->append_blocks(row, private_blocks) < 0) {
         // Pool exhausted even after the allocator reclaimed cached blocks
         // (only ones no sequence references, so nothing is lost that a
-        // re-prefill cannot rebuild): preempt tail blocks of other RUNNING
-        // sequences. If that does not free enough, the request keeps waiting.
-        if (attempt == 0 && !try_preempt_for(private_blocks, seq.id)) {
-          break;
+        // re-prefill cannot rebuild — and never a block mounted above).
+        // Roll back, then preempt tail blocks of other RUNNING sequences. If
+        // that does not free enough, the request keeps waiting.
+        allocator->free_all(row);
+        row = -1;
+        if (attempt == 0 && try_preempt_for(private_blocks, seq.id)) {
+          continue;  // re-run the admission with the newly freed blocks
         }
-        continue;  // re-validate the match: preemption may have evicted it
-      }
-      if (matched == 0) {
-        admitted_ok = true;
         break;
       }
-      // Mounting revives cached blocks (refcount 0 -> 1) and shares live ones;
-      // it only fails if a matched block was released meanwhile, in which case
-      // the row goes back and the match is looked up again.
-      if (kv_manager_->block_allocator()->reserve_shared_prefix(row, shared_blocks)) {
-        admitted_ok = true;
-        break;
-      }
-      LOG(WARNING) << "[SCHED] seq id=" << seq.id
-                   << ": matched prefix blocks changed under us; retrying admission";
-      kv_manager_->block_allocator()->free_all(row);
-      row = -1;
+      admitted_ok = true;
     }
     if (!admitted_ok) {
       break;  // keep the request waiting; other sequences still make progress
     }
+    const int matched = match.size();
     Sequence admitted = std::move(seq);
     waiting_queue_.pop_front();
     admitted.kv_slot_id = row;
@@ -384,8 +393,9 @@ void Scheduler::try_admit_sequences() {
     if (prefix_cache_) {
       // Count the outcome, not the queries: this request may have run lookup()
       // on every attempt above (and re-ran it across the waiting steps), but
-      // only the blocks mounted here actually saved prefill work.
-      prefix_cache_->record_admission(matched);
+      // only the blocks mounted here actually saved prefill work. Also the LRU
+      // is only touched here — a probe that never mounted leaves no trace.
+      prefix_cache_->commit_mounted(match);
     }
 #ifndef NDEBUG
     VLOG(1) << "[SCHED] admitted seq id=" << admitted.id

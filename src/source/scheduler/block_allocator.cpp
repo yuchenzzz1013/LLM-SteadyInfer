@@ -113,6 +113,9 @@ bool BlockAllocator::reserve_shared_prefix(int row, const std::vector<int32_t>& 
   const int n = static_cast<int>(blocks.size());
   if (used + n > max_blocks_per_seq_) return false;
 
+  const int32_t* old_table =
+      block_tables_.data() + static_cast<size_t>(row) * max_blocks_per_seq_;
+
   // Validate every block before mutating anything (same contract as
   // allocate_blocks: a failed call leaves the pool untouched). A CACHED block
   // has refcount 0 but is mountable — the cache pins its KV; a FREE block is
@@ -124,6 +127,19 @@ bool BlockAllocator::reserve_shared_prefix(int row, const std::vector<int32_t>& 
       LOG(ERROR) << "[BLOCK] reserve_shared_prefix: shared prefix block " << b
                  << " is not allocated (refcount 0, not cached)";
       return false;
+    }
+    // Reject a block this row already holds at another entry. The caller is
+    // supposed to mount before allocating, which makes this unreachable; if it
+    // ever fires, a matched block was released and handed back as a private
+    // block of this same row, and mounting it would alias the prefix's KV with
+    // the private region's writes. Refusing keeps the pool consistent and lets
+    // the caller re-match.
+    for (int j = 0; j < used; ++j) {
+      if (old_table[j] == b) {
+        LOG(ERROR) << "[BLOCK] reserve_shared_prefix: block " << b << " is already entry "
+                   << j << " of row " << row << " (alias); refusing to mount it twice";
+        return false;
+      }
     }
   }
 
@@ -283,16 +299,41 @@ int BlockAllocator::cached_block_count() const {
 }
 
 bool BlockAllocator::invariant_holds() const {
-  int refcounted = 0;
-  int cached_unreferenced = 0;
-  for (int i = 0; i < num_blocks_; ++i) {
-    if (ref_counts_[i] > 0) {
-      ++refcounted;
-    } else if (cached_[i]) {
-      ++cached_unreferenced;
+  // The pool has exactly three states, and every block must be in exactly one:
+  // FREE (on the free list), ALLOCATED (refcount == its number of block-table
+  // entries), or CACHED (refcount 0, off the free list). Checking the counts
+  // alone would miss an alias — a row holding one physical block at two table
+  // entries keeps the totals balanced while the second entry's KV writes
+  // clobber the first one's reads — so the tables are walked per row too.
+  std::vector<uint8_t> free_seen(num_blocks_, 0);
+  for (int b : free_blocks_) {
+    if (b < 0 || b >= num_blocks_ || free_seen[b]) return false;  // bad index / duplicate
+    free_seen[b] = 1;
+  }
+
+  std::vector<int> occurrences(num_blocks_, 0);
+  std::vector<int> row_stamp(num_blocks_, -1);
+  for (int r = 0; r < num_rows_; ++r) {
+    const int32_t* table = block_tables_.data() + static_cast<size_t>(r) * max_blocks_per_seq_;
+    for (int i = 0; i < max_blocks_per_seq_; ++i) {
+      const int b = table[i];
+      if (b < 0) continue;
+      if (b >= num_blocks_) return false;
+      if (row_stamp[b] == r) return false;  // alias: one row holds block b twice
+      row_stamp[b] = r;
+      ++occurrences[b];
     }
   }
-  return static_cast<int>(free_blocks_.size()) + refcounted + cached_unreferenced == num_blocks_;
+
+  for (int b = 0; b < num_blocks_; ++b) {
+    if (occurrences[b] != ref_counts_[b]) return false;  // refcount leak / double free
+    if (free_seen[b]) {
+      if (ref_counts_[b] != 0 || cached_[b]) return false;  // handed out while cached
+    } else if (ref_counts_[b] == 0 && !cached_[b]) {
+      return false;  // unreferenced, uncached and off the free list: stranded
+    }
+  }
+  return true;
 }
 
 std::string BlockAllocator::debug_string() const {
@@ -305,9 +346,25 @@ std::string BlockAllocator::debug_string() const {
       ++cached_unreferenced;
     }
   }
+  // Rows holding one physical block at two entries: the aliasing the invariant
+  // rejects, called out here so the FATAL message names the failure directly.
+  std::vector<int> row_stamp(num_blocks_, -1);
+  int aliased_rows = 0;
+  for (int r = 0; r < num_rows_; ++r) {
+    const int32_t* table = block_tables_.data() + static_cast<size_t>(r) * max_blocks_per_seq_;
+    bool alias = false;
+    for (int i = 0; i < max_blocks_per_seq_; ++i) {
+      const int b = table[i];
+      if (b < 0 || b >= num_blocks_) continue;
+      if (row_stamp[b] == r) alias = true;
+      row_stamp[b] = r;
+    }
+    if (alias) ++aliased_rows;
+  }
   return "blocks=" + std::to_string(num_blocks_) + " free=" +
          std::to_string(free_blocks_.size()) + " referenced=" + std::to_string(refcounted) +
-         " cached=" + std::to_string(cached_unreferenced);
+         " cached=" + std::to_string(cached_unreferenced) +
+         " aliased_rows=" + std::to_string(aliased_rows);
 }
 
 }  // namespace scheduler

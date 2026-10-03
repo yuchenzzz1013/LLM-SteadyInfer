@@ -47,7 +47,13 @@ class BlockAllocator {
 
   // Mount `blocks` at the front of `row`'s block table (existing entries
   // shift right) and bump their refcounts — prefix-cache read-only sharing.
-  // Returns false when the row does not exist or overflows the table width.
+  // Every block must be CACHED or referenced; a block already present in this
+  // row (which can only happen if the caller allocated private blocks before
+  // mounting — see the PrefixCache admission protocol) is refused, because a
+  // row holding one physical block at two entries aliases the prefix KV with
+  // the private region's writes. Returns false, leaving the pool untouched,
+  // when the row does not exist, overflows the table width, or a block is
+  // unmountable.
   bool reserve_shared_prefix(int row, const std::vector<int32_t>& blocks);
 
   // Release every block of a row (refcount--; a block shared by other rows
@@ -121,8 +127,11 @@ class BlockAllocator {
   void clear_reclaim_fn() { reclaim_fn_ = nullptr; }
 
   // Invariant check: free list + referenced + cached-but-unreferenced ==
-  // num_blocks. LOG(FATAL)s on violation — guards against leaks silently
-  // stranding blocks.
+  // num_blocks (see impl: also verifies refcount == table occurrences, no
+  // free-list duplicates, and that no row holds a physical block twice — the
+  // prefix-cache aliasing mode a pure count cannot see). Guards against leaks
+  // and aliases silently stranding or corrupting blocks; the Scheduler
+  // LOG(FATAL)s on violation at destruction.
   bool invariant_holds() const;
 
   // Human-readable pool accounting (diagnostics / benchmark summaries).

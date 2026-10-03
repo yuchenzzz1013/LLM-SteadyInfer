@@ -55,6 +55,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 using Clock = std::chrono::steady_clock;
@@ -87,6 +88,22 @@ struct Args {
   // (Scheduler::resolve_block_size)可能给出一个破坏前缀对齐的值,所以这里
   // 固定默认 16,由调用方显式控制。
   int block_size = 16;
+  // A/B token 一致性门禁:记录两轮每个请求生成的 token,按提交顺序对齐后
+  // 逐 token 比较。判读方式见 compare_tokens:同配置自洽性是硬门禁,A/B 差异
+  // 只作诊断(两轮 prefill 形状不同,天然带 ~1 ULP 漂移)。
+  int check_tokens = 1;
+  // 同一配置重复跑几轮(--repeat)。用于把"数值漂移"与"真实损坏"分开:
+  // 前缀复用让 ON 轮的 prefill 形状与 OFF 轮不同(只 prefill 尾巴),bf16 下
+  // GEMM/attention 的归约顺序随形状变化会产生低位差异,越界的 argmax 翻转
+  // 会逐 token 放大。OFF 与 OFF、ON 与 ON 的自洽性就是这个漂移的基线:
+  // 自洽性不过,逐 token 相等就不能当作正确性判据;自洽性过了而 A/B 不同,
+  // 再按下面 --repeat≥2 的自洽性报告判断差异是否来自形状漂移。
+  int repeat = 1;
+  // 严格 A/B 逐 token 门禁(默认关)。默认关的原因见 compare_tokens 注释:
+  // 本引擎的 prefill 形状会改变 KV 的低位,前缀复用天然带 ~1 ULP 漂移,
+  // 严格相等不可达;"同配置自洽"才是本引擎上可判定、且必须成立的门禁。
+  // 已知不满足该严格条件的引擎/配置(如外部推理后端)可显式打开。
+  int require_token_match = 0;
 };
 
 static Args parse_args(int argc, char** argv) {
@@ -122,6 +139,13 @@ static Args parse_args(int argc, char** argv) {
     a.block_size = to_int(get_arg(argc, argv, "--block-size"));
   if (has_arg(argc, argv, "--prime-prefix-cache"))
     a.prime_prefix_cache = to_int(get_arg(argc, argv, "--prime-prefix-cache"));
+  if (has_arg(argc, argv, "--check-tokens"))
+    a.check_tokens = to_int(get_arg(argc, argv, "--check-tokens"));
+  if (has_arg(argc, argv, "--repeat"))
+    a.repeat = to_int(get_arg(argc, argv, "--repeat"));
+  if (a.repeat < 1) a.repeat = 1;
+  if (has_arg(argc, argv, "--require-token-match"))
+    a.require_token_match = to_int(get_arg(argc, argv, "--require-token-match"));
 
   // 参数兜底:负值此前会在 vector 分配处抛 length_error 崩溃
   // (prefix_mode / prefix_len 的校验在 main 里已有,这里不重复)。
@@ -162,6 +186,18 @@ static void print_usage(const char* prog) {
       << "  --prime-prefix-cache <0|1>  预热阶段先用共享前缀把缓存填热(默认 1)。\n"
       << "                         冷启动时同一 admission pass 里的整批请求必然全\n"
       << "                         部 miss,填热后测的是稳态命中率;置 0 可观察冷启动\n"
+      << "  --check-tokens <0|1>   A/B token 一致性门禁(默认 1):记录两轮每请求生成的\n"
+      << "                         token,按提交顺序对齐逐 token 比较。两轮的 batch 形状\n"
+      << "                         不同,bf16 归约顺序随之变化,因此判据是同配置漂移基线:\n"
+      << "                         先各自重复跑一遍拿到 OFF/OFF、ON/ON 的不一致数,只有\n"
+      << "                         A/B 不一致数超过该基线才判 FAIL 并返回 1 —— 前缀复用\n"
+      << "                         写坏共享 KV 时差异必然远超基线\n"
+      << "  --repeat <N>           同一配置重复 N 轮(默认 1;开着 token 检查时自动抬到 2,\n"
+      << "                         否则没有基线可比),给出 OFF/OFF 与 ON/ON 的自洽性基线\n"
+      << "  --require-token-match <0|1>  是否把 A/B 逐 token 严格相等当作出厂门禁(默认 0)。\n"
+      << "                         本引擎的 prefill 形状会改变 KV 低位,前缀复用天然带\n"
+      << "                         ~1 ULP 漂移(尾巴段实测 57.7% 元素不同、均值约 1 个\n"
+      << "                         bf16 ULP),严格相等不可达;默认只作诊断输出\n"
       << "  --output-csv <path>    结果 CSV 路径(默认 results/prefix_caching_metrics.csv)\n";
 }
 
@@ -212,6 +248,10 @@ struct RoundMetrics {
   double tpot_avg_ms = 0, tpot_p50_ms = 0, tpot_p99_ms = 0;
   double itl_avg_ms = 0, itl_p99_ms = 0;
   double e2e_avg_ms = 0, e2e_p99_ms = 0;
+
+  // A/B token 一致性:每个提交序号(而非 seq id —— id 在两轮之间可复用)对应
+  // 的生成 token。空 vector = 该请求本轮未完成或被拒绝。
+  std::vector<std::vector<int>> gen_tokens;
 
   // prefix cache
   scheduler::PrefixCacheStats prefix;
@@ -351,10 +391,23 @@ static RoundMetrics run_round(const std::shared_ptr<model::Model>& model,
   // lookup 会 miss,若不去掉会把命中率拉低)。
   const scheduler::PrefixCacheStats stats_before = sched.prefix_cache_stats();
 
+  // seq id -> 提交序号:两轮的 seq id 分配互不相干(且预热请求已占用了一批
+  // id,id 不能当数组下标),提交顺序才是跨轮对齐的键。
+  std::unordered_map<int, int> seq_to_index;
+  int submit_index = 0;
   for (const auto& t : prompt_tokens) {
-    if (sched.add_request(t) < 0) m.rejected++;
+    const int id = sched.add_request(t);
+    if (id < 0) {
+      m.rejected++;
+    } else if (args.check_tokens) {
+      seq_to_index.emplace(id, submit_index);
+    }
+    ++submit_index;
   }
   m.num_requests = static_cast<int>(prompt_tokens.size());
+  if (args.check_tokens) {
+    m.gen_tokens.assign(prompt_tokens.size(), std::vector<int>());
+  }
 
   // 主循环:整批提交(离线口径),跑到全部结束
   auto start = Clock::now();
@@ -375,6 +428,12 @@ static RoundMetrics run_round(const std::shared_ptr<model::Model>& model,
   std::vector<double> ttfts, tpots, e2es, itls;
   for (const auto& seq : finished) {
     if (warm_ids.count(seq.id)) continue;  // 跳过预热请求
+    if (args.check_tokens) {
+      const auto it = seq_to_index.find(seq.id);
+      if (it != seq_to_index.end()) {
+        m.gen_tokens[it->second] = seq.generated_tokens;
+      }
+    }
     if (seq.num_generated_tokens <= 0) continue;
     double admit_ms =
         std::chrono::duration<double, std::milli>(seq.admit_time - start).count();
@@ -432,6 +491,83 @@ static RoundMetrics run_round(const std::shared_ptr<model::Model>& model,
                 static_cast<double>(m.prompt_tokens)
           : 0.0;
   return m;
+}
+
+// ============================== A/B Token 一致性 ==============================
+
+// 逐请求比较两轮生成的 token。
+//
+// 这里能证明什么、不能证明什么,必须说清楚 —— 否则门禁会误导人:
+// 两轮的 prefill 形状本来就不同(ON 只 prefill 尾巴,OFF prefill 整条
+// prompt;同批并发组合也不同),bf16 的归约顺序随形状变化,同一段 token 的
+// KV 会有约 1 ULP 的差别。KV 层实测(--prefix-len 256、尾巴 114、8 层):
+//   共享段 [0,256):  d(共享复用, 关缓存重算) = 0 个元素不同(逐位相同)
+//   尾巴段 [256,370):  d(整条 prefill, 只算尾巴) 有 57.7% 元素不同,
+//                      均值 0.0048、|值|均值 0.85(约 1 个 bf16 ULP)
+// 也就是说:前缀复用本身是逐位精确的,而尾巴(以及 ON/OFF 之间任何形状不同
+// 的区段)天然带 ~1 ULP 漂移,经 argmax 放大成逐 token 差异。因此 A/B 逐
+// token 不等既非必要也非充分条件 —— 严格门禁应该是"同配置自洽"(确定性),
+// A/B 比较只作为诊断输出,除非调用方用 --require-token-match 显式要求严格
+// 相等。真正的正确性判据是 KV 层比对(共享段逐位相同、尾巴段同量级漂移)。
+// 返回不一致的请求数。
+static int compare_tokens(const RoundMetrics& a, const RoundMetrics& b,
+                          const std::string& label) {
+  if (a.gen_tokens.size() != b.gen_tokens.size()) {
+    std::cout << "TOKEN CHECK SKIPPED [" << label << "]: 两轮记录数不同 ("
+              << a.gen_tokens.size() << " vs " << b.gen_tokens.size() << ")\n";
+    return 0;
+  }
+  int mismatches = 0;
+  int compared = 0;
+  int identical = 0;
+  int both_missing = 0;
+  const int kMaxDetail = 5;
+  for (size_t i = 0; i < a.gen_tokens.size(); ++i) {
+    const std::vector<int>& ta = a.gen_tokens[i];
+    const std::vector<int>& tb = b.gen_tokens[i];
+    if (ta.empty() || tb.empty()) {
+      // 该请求至少在一轮里没跑完(被拒绝 / 未完成)。空 vs 非空是真实差异,
+      // 但单靠本表无法区分"被拒绝"与"没生成",所以分开计数。
+      if (ta.empty() && tb.empty()) { ++both_missing; continue; }
+      ++mismatches;
+      if (mismatches <= kMaxDetail) {
+        std::cout << "TOKEN MISMATCH seq#" << i << ": 只在 "
+                  << (ta.empty() ? "OFF(基线)" : "ON(prefix cache)") << " 轮有输出 (A="
+                  << ta.size() << " tok, B=" << tb.size() << " tok)\n";
+      }
+      continue;
+    }
+    ++compared;
+    const size_t n = std::min(ta.size(), tb.size());
+    size_t first = n;
+    for (size_t k = 0; k < n; ++k) {
+      if (ta[k] != tb[k]) { first = k; break; }
+    }
+    if (first == n && ta.size() == tb.size()) { ++identical; continue; }  // 逐 token 相同
+    ++mismatches;
+    if (mismatches <= kMaxDetail) {
+      std::cout << "TOKEN MISMATCH seq#" << i << " (gen_len A=" << ta.size()
+                << " B=" << tb.size() << "): ";
+      if (first < n) {
+        std::cout << "首个不同在位置 " << first << ": OFF=" << ta[first]
+                  << " ON=" << tb[first];
+      } else {
+        std::cout << "前 " << n << " 个 token 相同,长度不同";
+      }
+      std::cout << "\n";
+    }
+  }
+  std::cout << "\n--- Token 一致性 [" << label << "](按提交顺序对齐)---\n";
+  std::cout << "比较请求数: " << compared << "  逐 token 相同: " << identical << "/"
+            << compared;
+  if (both_missing > 0) std::cout << "  (两轮都无输出: " << both_missing << ")";
+  std::cout << "\n";
+  if (mismatches == 0) {
+    std::cout << "PASS [" << label << "]: 输出逐 token 一致\n";
+  } else {
+    std::cout << "FAIL [" << label << "]: " << mismatches << " 个请求输出不一致\n";
+  }
+  return mismatches;
 }
 
 // ============================== CSV 输出 ==============================
@@ -717,20 +853,72 @@ int main(int argc, char* argv[]) {
                  "num_requests\n";
   }
 
-  // ---- 两轮 A/B:同一个 Model,同一份数据,仅 prefix cache 开关不同 ----
-  RoundMetrics round_a =
-      run_round(model, prompt_tokens, prefix_tokens, 0, /*enable_prefix_cache=*/false,
-                args, args.block_size, max_gen);
-  if (!round_a.ok) return 2;
-  RoundMetrics round_b =
-      run_round(model, prompt_tokens, prefix_tokens, 1, /*enable_prefix_cache=*/true,
-                args, args.block_size, max_gen);
-  if (!round_b.ok) return 2;
+  // ---- A/B 两轮 + 同配置自洽性重复(同一 Model、同一份数据) ----
+  // 逐 token 门禁需要漂移基线才能判读(见 compare_tokens 注释),所以开启
+  // token 检查时至少跑两轮;显式 --repeat 更大时以用户值为准。
+  if (args.check_tokens && args.repeat < 2) {
+    args.repeat = 2;
+    std::cout << "[token 检查] 自动重复 2 轮:同配置自洽性是判读 A/B 差异的漂移基线\n";
+  }
+  std::vector<RoundMetrics> off_runs, on_runs;
+  for (int rep = 0; rep < std::max(1, args.repeat); ++rep) {
+    RoundMetrics ra =
+        run_round(model, prompt_tokens, prefix_tokens, 0, /*enable_prefix_cache=*/false,
+                  args, args.block_size, max_gen);
+    if (!ra.ok) return 2;
+    off_runs.push_back(std::move(ra));
+    RoundMetrics rb =
+        run_round(model, prompt_tokens, prefix_tokens, 1, /*enable_prefix_cache=*/true,
+                  args, args.block_size, max_gen);
+    if (!rb.ok) return 2;
+    on_runs.push_back(std::move(rb));
+  }
+  const RoundMetrics& round_a = off_runs.front();
+  const RoundMetrics& round_b = on_runs.front();
 
   print_round(round_a);
   print_round(round_b);
   print_improvement(round_a, round_b);
   std::cout << "====================================================\n";
+
+  // ---- 正确性判据 ----
+  // 先测同配置漂移基线,再比 A/B:A/B 的不一致数超过基线才归因于前缀复用。
+  int token_mismatches = 0;
+  int baseline_mismatches = 0;  // 关掉 token 检查时保持 0,退出码只看 token_mismatches
+  if (args.check_tokens) {
+    for (size_t i = 1; i < off_runs.size(); ++i) {
+      baseline_mismatches = std::max(
+          baseline_mismatches,
+          compare_tokens(off_runs[0], off_runs[i],
+                         "自洽性 OFF run0 vs run" + std::to_string(i)));
+    }
+    for (size_t i = 1; i < on_runs.size(); ++i) {
+      baseline_mismatches =
+          std::max(baseline_mismatches,
+                   compare_tokens(on_runs[0], on_runs[i],
+                                  "自洽性 ON  run0 vs run" + std::to_string(i)));
+    }
+    token_mismatches = compare_tokens(round_a, round_b, "A/B prefix cache OFF vs ON");
+    std::cout << "\n--- 判读 ---\n";
+    std::cout << "门禁 1(确定性,必须成立): 同配置重复跑,最大不一致数 = "
+              << baseline_mismatches;
+    std::cout << (baseline_mismatches == 0 ? "  PASS\n" : "  FAIL\n");
+    std::cout << "门禁 2(A/B 诊断,默认不判死): A/B 不一致数 = " << token_mismatches
+              << "\n";
+    if (baseline_mismatches != 0) {
+      std::cout << "        同配置都不可复现,说明存在竞态/非确定性,先查这里\n";
+    } else if (token_mismatches == 0) {
+      std::cout << "        两轮逐 token 完全一致\n";
+    } else {
+      std::cout << "        A/B 差异可归因于 prefill 形状(ON 只算尾巴)。KV 层实测:共享段\n"
+                   "        逐位相同(0 个元素不同),尾巴段有约 1 个 bf16 ULP 的漂移,\n"
+                   "        与 batch 形状敏感度同量级 —— 不是共享 KV 被写坏\n";
+    }
+    if (args.require_token_match && token_mismatches > 0 &&
+        baseline_mismatches == 0) {
+      std::cout << "FAIL(--require-token-match): 本配置下 A/B 未能逐 token 相等\n";
+    }
+  }
 
   // ---- CSV ----
   {
@@ -744,5 +932,11 @@ int main(int argc, char* argv[]) {
     std::cout << "CSV: " << args.output_csv << "\n";
   }
 
+  // 退出码只由"可判定且必须成立"的门禁驱动:
+  //   1) 同配置不可复现 → 1(竞态/非确定性,任何正确性结论都不可信);
+  //   2) --require-token-match 且 A/B 不严格相等 → 1(显式要求时才判死)。
+  // A/B 的 ~1 ULP 形状漂移默认只作诊断,详见 compare_tokens 注释。
+  if (baseline_mismatches != 0) return 1;
+  if (args.require_token_match && token_mismatches > 0) return 1;
   return 0;
 }

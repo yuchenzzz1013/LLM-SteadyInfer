@@ -84,11 +84,11 @@ void PrefixCache::touch(Entry* e) {
 }
 
 int PrefixCache::lookup(const std::vector<int>& prompt_tokens, BlockAllocator& allocator,
-                        std::vector<int32_t>* shared_blocks) {
-  // Pure query: no stats. The scheduler may run this more than once for one
-  // request (admission retries, later re-queries) while only one outcome
-  // matters; record_admission() counts the outcome that was mounted.
-  shared_blocks->clear();
+                        PrefixMatch* match) {
+  // Pure query: no stats, no LRU update, no pool mutation. The scheduler may
+  // run this more than once for one request (admission retries) while only one
+  // outcome matters; commit_mounted() records the outcome that was mounted.
+  match->clear();
   const int max_blocks = cacheable_blocks(static_cast<int>(prompt_tokens.size()));
 
   uint64_t prev_hash = 0;
@@ -107,18 +107,34 @@ int PrefixCache::lookup(const std::vector<int>& prompt_tokens, BlockAllocator& a
 #endif
       break;
     }
-    if (!allocator.is_cached(e->block_id) && allocator.ref_count(e->block_id) <= 0) {
+    // Mountable while the cache still pins the block (CACHED) or a row still
+    // references it: both keep it out of the free list, so its KV cannot be
+    // overwritten. A block that is neither was released behind the entry —
+    // mounting it could alias a future writer's page.
+    if (allocator.ref_count(e->block_id) <= 0 && !allocator.is_cached(e->block_id)) {
 #ifndef NDEBUG
       VLOG(1) << "[PREFIX] entry block " << e->block_id << " no longer held; miss";
 #endif
       break;
     }
-    shared_blocks->push_back(e->block_id);
-    touch(e);  // matched entries are the most recently used: evict them last
+    match->blocks.push_back(e->block_id);
+    match->hashes.push_back(h);
     prev_hash = h;  // only a matched block lets the chain advance
   }
 
-  return static_cast<int>(shared_blocks->size());
+  return match->size();
+}
+
+void PrefixCache::commit_mounted(const PrefixMatch& match) {
+  // Touch only what the caller actually mounted. The entries cannot have been
+  // evicted in between — the mount references their blocks, and eviction
+  // requires refcount 0 — so the hash lookup finds them all; the guard keeps
+  // this robust to a future caller that drops the mount-before-allocate rule.
+  for (uint64_t h : match.hashes) {
+    const auto it = entries_.find(h);
+    if (it != entries_.end()) touch(it->second);
+  }
+  record_admission(match.size());
 }
 
 void PrefixCache::record_admission(int matched_blocks) {

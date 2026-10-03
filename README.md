@@ -119,6 +119,12 @@ make -j$(nproc)
 `benchmark/offline_batch_benchmark.cpp`、`online_serving_benchmark.cpp`、
 `prefix_caching_benchmark.cpp`。
 
+Offline / Online 两个基准**默认打开前缀缓存**（与线上 serving 配置一致，`--prefix-cache 0`
+可关掉），CSV 里的 `enable_prefix_cache` 列与报告里的开关状态均取自 Scheduler 的实际状态，
+`LLAMA_ENABLE_PREFIX_CACHE` 环境变量强制覆盖时也会如实反映。压测数据是彼此独立的请求，
+命中率通常很低，所以这里量的是"开着缓存时的真实吞吐与池占用"；缓存的净收益看
+`prefix_caching_benchmark` 的 ON/OFF A/B。
+
 ### Offline Batch
 * Output Token Throughput
 * Total Token Throughput
@@ -140,6 +146,12 @@ make -j$(nproc)
 * TTFT / TPOT / ITL / E2E
 * Output Token Throughput / Total Token Throughput / Completed RPS
 * `skipped_prefill_ratio`
+
+**正确性门禁**：ON/OFF 两轮的 prefill 形状不同（ON 只算尾巴），bf16 归约顺序随之变化，
+同一段 token 的 KV 会有约 1 个 ULP 的差别，经 argmax 会放大成 token 分歧——所以逐 token
+的 A/B 相等不是可用的判据。门禁因此分成两条：同配置重复必须逐 token 相同（确定性，硬
+门禁，不满足即返回 1）；A/B 不一致数只作诊断输出（`--repeat` 自动抬到 2 以给出漂移基线）。
+`--require-token-match 1` 可另开严格 A/B 相等。
 
 ---
 

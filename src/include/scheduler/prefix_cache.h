@@ -8,12 +8,27 @@
 
 namespace scheduler {
 
+// One lookup() result: the matched cached prefix, as physical block ids (in
+// prompt-block order) plus the chained hashes that produced the match (the
+// commit key — see commit_mounted). A match is only a proposal: the caller
+// must mount the blocks (BlockAllocator::reserve_shared_prefix) before it may
+// act on it, and the proposal is valid only until the next allocation-side
+// mutation of the pool (allocate/append/reclaim). The scheduler's admission
+// path mounts before it allocates, which is what keeps the two in sync.
+struct PrefixMatch {
+  std::vector<int32_t> blocks;   // physical block ids, prompt-block order
+  std::vector<uint64_t> hashes;  // chained hash of each matched block
+  int size() const { return static_cast<int>(blocks.size()); }
+  bool empty() const { return blocks.empty(); }
+  void clear() { blocks.clear(); hashes.clear(); }
+};
+
 // Prefix-cache effectiveness counters (Scheduler::prefix_cache_stats).
 //
 // Anchored to ADMISSION outcomes, not to lookup() calls: the scheduler may
 // query the cache several times for one request (admission retries while the
 // pool is full, re-queries on later steps) and only the match that is actually
-// mounted avoids prefill work. record_admission() is called exactly once per
+// mounted avoids prefill work. commit_mounted() is called exactly once per
 // admitted request, so the counters here answer "how much prompt prefill did
 // the cache remove", not "how many queries were issued".
 struct PrefixCacheStats {
@@ -48,6 +63,13 @@ struct PrefixCacheStats {
 //     entry points at. Blocks are released only by LRU eviction (when no
 //     sequence references them) or by the pool reclaiming them under pressure.
 //
+// Property 2 covers *resident* entries; a lookup() result is not resident yet.
+// The admission protocol closes that gap: mount the matched blocks (which
+// references them) BEFORE allocating the private remainder, so the reclaim
+// that the allocation may run cannot evict a matched block into the free list
+// and hand it straight back as a private block of the same row — an alias
+// whose later writes would clobber the prefix KV the mount promised.
+//
 // The last prompt block is deliberately never cached/shared: the first decode
 // step re-runs the last prompt token at its own position (prefill produces no
 // logits), which rewrites that token's KV slot. Landing that write in a shared
@@ -68,20 +90,29 @@ class PrefixCache {
   ~PrefixCache();
 
   // Longest whole-block prefix of `prompt_tokens` that can be shared. Fills
-  // `shared_blocks` with the physical block ids (one per matched block, in
-  // order) and returns the matched count. Touches the matched entries (LRU).
+  // `match` with the physical block ids (one per matched block, in order) and
+  // returns the matched count.
   //
-  // Pure query: it updates no stats (use record_admission), and a caller that
-  // does not end up mounting the returned blocks (e.g. an admission retry that
-  // fails on pool space) leaves no trace.
+  // Pure query: no stats, no LRU update, no pool mutation. An entry is only
+  // proposed while its block is still shareable (pinned by the cache or
+  // referenced by a row — both keep it out of the free list); an entry whose
+  // block was released behind the cache's back ends the match.
+  //
+  // The result is a *proposal*: it can be invalidated by the next allocation
+  // that has to reclaim cache entries. Callers must mount it (see
+  // BlockAllocator::reserve_shared_prefix) before allocating anything else,
+  // then report the outcome with commit_mounted(). A caller that never mounts
+  // it (admission retry that fails on pool space) leaves no trace.
   int lookup(const std::vector<int>& prompt_tokens, BlockAllocator& allocator,
-             std::vector<int32_t>* shared_blocks);
+             PrefixMatch* match);
 
-  // Record one admission outcome for the stats above. `matched_blocks` is the
-  // number of cached blocks actually mounted into the admitted row (0 = the
-  // request prefills everything). Called by the Scheduler after a successful
-  // admission; lookup() itself never counts.
-  void record_admission(int matched_blocks);
+  // Record an admission outcome: LRU-touch every entry the mount actually
+  // used, and count one lookup (plus a hit / the matched blocks when the
+  // mount was non-empty) in the stats above. Call exactly once per admitted
+  // request, after reserve_shared_prefix succeeded — touching entries that
+  // were only queried would let a never-mounted probe distort LRU order (and
+  // with it which pinned KV reclaim gets to free first).
+  void commit_mounted(const PrefixMatch& match);
 
   // Record every committed full prompt block of a sequence (idempotent and
   // incremental — call it after each chunked-prefill step).
@@ -147,6 +178,9 @@ class PrefixCache {
   void unlink(Entry* e);
   void push_front(Entry* e);
   void touch(Entry* e);
+
+  // Count one admission outcome (see commit_mounted, its only caller).
+  void record_admission(int matched_blocks);
 
   // Evict up to `n` unreferenced entries walking from the tail; returns the
   // count. Bounded by kEvictScanCap entries while it is freeing blocks, and
