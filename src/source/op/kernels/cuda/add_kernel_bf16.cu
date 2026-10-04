@@ -1,5 +1,6 @@
 // CUDA element-wise add (BF16): raw bfloat16 operands, math in float,
 // bf16-rounded result.
+#include <base/cuda_check.h>
 #include <cuda_bf16.h>
 #include "add_kernel.cuh"
 namespace kernel {
@@ -27,10 +28,12 @@ void add_kernel_cu(const tensor::Tensor& input1, const tensor::Tensor& input2,
     add_kernel_bf16_kernel<<<block_num, thread_num, 0, stream_>>>(
         size, input1.ptr<__nv_bfloat16>(), input2.ptr<__nv_bfloat16>(),
         const_cast<__nv_bfloat16*>(output.ptr<__nv_bfloat16>()));
+    CUDA_KERNEL_CHECK();
   } else {
     add_kernel_bf16_kernel<<<block_num, thread_num>>>(
         size, input1.ptr<__nv_bfloat16>(), input2.ptr<__nv_bfloat16>(),
         const_cast<__nv_bfloat16*>(output.ptr<__nv_bfloat16>()));
+    CUDA_KERNEL_CHECK();
   }
 }
 }  // namespace kernel

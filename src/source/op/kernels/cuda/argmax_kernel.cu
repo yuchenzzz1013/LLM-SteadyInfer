@@ -1,3 +1,4 @@
+#include <base/cuda_check.h>
 #include "../kernels_interface.h"
 #include "argmax_kernel.cuh"
 #include "tensor/tensor.h"
@@ -118,10 +119,12 @@ size_t argmax_kernel_cu(const uint16_t* input_ptr, size_t size, void* stream) {
   size_t output_index = 0;
   if (!stream) {
     argmax_kernel<<<1, 512>>>(input_ptr, size, index);
+    CUDA_KERNEL_CHECK();
     cudaMemcpy(&output_index, index, sizeof(size_t), cudaMemcpyDeviceToHost);
   } else {
     cudaStream_t stream_ = static_cast<cudaStream_t>(stream);
     argmax_kernel<<<1, 512, 0, stream_>>>(input_ptr, size, index);
+    CUDA_KERNEL_CHECK();
     cudaMemcpyAsync(&output_index, index, sizeof(size_t), cudaMemcpyDeviceToHost, stream_);
     // The async copy is still in flight when this function returns the host
     // value; sync before reading output_index.
@@ -144,11 +147,13 @@ void argmax_kernel_cu_batch(const uint16_t* input_ptr, size_t row_stride, size_t
   if (stream) {
     cudaStream_t stream_ = static_cast<cudaStream_t>(stream);
     argmax_kernel_batch<<<batch, 512, 0, stream_>>>(input_ptr, row_stride, size, dev_idx);
+    CUDA_KERNEL_CHECK();
     cudaMemcpyAsync(out_tokens, dev_idx, static_cast<size_t>(batch) * sizeof(int32_t),
                     cudaMemcpyDeviceToHost, stream_);
     cudaStreamSynchronize(stream_);
   } else {
     argmax_kernel_batch<<<batch, 512>>>(input_ptr, row_stride, size, dev_idx);
+    CUDA_KERNEL_CHECK();
     cudaMemcpy(out_tokens, dev_idx, static_cast<size_t>(batch) * sizeof(int32_t),
                cudaMemcpyDeviceToHost);
   }

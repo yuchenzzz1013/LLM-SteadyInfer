@@ -1,4 +1,5 @@
 // CUDA embedding gather (BF16): copies embedding rows as raw bf16 elements.
+#include <base/cuda_check.h>
 #include <cuda_bf16.h>
 #include "emb_kernel.cuh"
 namespace kernel {
@@ -46,9 +47,11 @@ void emb_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight,
     cudaStream_t stream_ = static_cast<cudaStream_t>(stream);
     emb_kernel_bf16_kernel<<<grid_size, thread_num, 0, stream_>>>(
         vocab_size, input_num, weight_dim, in_ptr, wei_ptr, out_ptr);
+    CUDA_KERNEL_CHECK();
   } else {
     emb_kernel_bf16_kernel<<<grid_size, thread_num>>>(vocab_size, input_num, weight_dim,
                                                           in_ptr, wei_ptr, out_ptr);
+    CUDA_KERNEL_CHECK();
   }
 }
 }  // namespace kernel

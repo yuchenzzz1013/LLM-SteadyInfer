@@ -7,6 +7,7 @@
 // used across the migration; identical to the other BF16 kernels here).
 // The custom kernel is the pre-Ampere / error fallback: it computes the same
 // products in float but stores bf16, i.e. a software simulation of BF16 math.
+#include <base/cuda_check.h>
 #include <tensor/tensor.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime_api.h>
@@ -104,9 +105,11 @@ void matmul_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight,
   if (config && config->stream) {
     matmul_kernel_bf16_custom<128><<<K, 128, 0, config->stream>>>(
         input_ptr, weight_ptr, output_ptr, scale, M, K, batch);
+    CUDA_KERNEL_CHECK();
   } else {
     matmul_kernel_bf16_custom<128><<<K, 128>>>(input_ptr, weight_ptr, output_ptr, scale, M, K,
                                                   batch);
+    CUDA_KERNEL_CHECK();
   }
 }
 }  // namespace kernel

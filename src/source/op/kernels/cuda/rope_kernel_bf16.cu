@@ -4,6 +4,7 @@
 // widened back exactly on load: every bfloat16 is representable in fp32).
 // Rotation math runs in float on the bf16 operands; results are rounded back
 // to bf16.
+#include <base/cuda_check.h>
 #include <cuda_bf16.h>
 #include "rope_kernel.cuh"
 namespace kernel {
@@ -108,11 +109,13 @@ void sin_cos_cache_calc_cu(int head_size, int max_seq_len, const tensor::Tensor&
     sin_cos_calc_bf16<<<1, threads, 0, stream>>>(
         head_size, max_seq_len, const_cast<__nv_bfloat16*>(sin_cache.ptr<__nv_bfloat16>()),
         const_cast<__nv_bfloat16*>(cos_cache.ptr<__nv_bfloat16>()), rope_theta);
+    CUDA_KERNEL_CHECK();
   } else {
     sin_cos_calc_bf16<<<1, threads>>>(head_size, max_seq_len,
                                       const_cast<__nv_bfloat16*>(sin_cache.ptr<__nv_bfloat16>()),
                                       const_cast<__nv_bfloat16*>(cos_cache.ptr<__nv_bfloat16>()),
                                       rope_theta);
+    CUDA_KERNEL_CHECK();
   }
 }
 
@@ -137,10 +140,12 @@ void rope_kernel_cu(int32_t dim, int32_t kv_dim, int32_t head_size, const tensor
       rope_kernel_single<<<blocks, threads, 0, stream_>>>(
           pos, dim, kv_dim, head_size, const_cast<__nv_bfloat16*>(input_q.ptr<__nv_bfloat16>()),
           const_cast<__nv_bfloat16*>(input_k.ptr<__nv_bfloat16>()), sin_ptr, cos_ptr);
+      CUDA_KERNEL_CHECK();
     } else {
       rope_kernel_single<<<blocks, threads>>>(
           pos, dim, kv_dim, head_size, const_cast<__nv_bfloat16*>(input_q.ptr<__nv_bfloat16>()),
           const_cast<__nv_bfloat16*>(input_k.ptr<__nv_bfloat16>()), sin_ptr, cos_ptr);
+      CUDA_KERNEL_CHECK();
     }
   } else {
     const int32_t* pos_ptr = input_pos.ptr<int32_t>();
@@ -154,10 +159,12 @@ void rope_kernel_cu(int32_t dim, int32_t kv_dim, int32_t head_size, const tensor
         rope_kernel_single<<<blocks, threads, 0, stream_>>>(
             pos, dim, kv_dim, head_size, const_cast<__nv_bfloat16*>(q_b),
             const_cast<__nv_bfloat16*>(k_b), sin_ptr, cos_ptr);
+        CUDA_KERNEL_CHECK();
       } else {
         rope_kernel_single<<<blocks, threads>>>(
             pos, dim, kv_dim, head_size, const_cast<__nv_bfloat16*>(q_b),
             const_cast<__nv_bfloat16*>(k_b), sin_ptr, cos_ptr);
+        CUDA_KERNEL_CHECK();
       }
     }
   }
@@ -180,11 +187,13 @@ void rope_kernel_cu_batch(int32_t dim, int32_t kv_dim, int32_t head_size,
         input_pos.ptr<int32_t>(), dim, kv_dim, head_size, input_q.ptr<__nv_bfloat16>(),
         input_k.ptr<__nv_bfloat16>(), sin_cache.ptr<__nv_bfloat16>(),
         cos_cache.ptr<__nv_bfloat16>());
+    CUDA_KERNEL_CHECK();
   } else {
     rope_kernel_batch<<<grid, threads>>>(
         input_pos.ptr<int32_t>(), dim, kv_dim, head_size, input_q.ptr<__nv_bfloat16>(),
         input_k.ptr<__nv_bfloat16>(), sin_cache.ptr<__nv_bfloat16>(),
         cos_cache.ptr<__nv_bfloat16>());
+    CUDA_KERNEL_CHECK();
   }
 }
 
@@ -217,10 +226,12 @@ void kv_scatter_cu(const tensor::Tensor& src, tensor::Tensor& dst_cache,
     kv_scatter_kernel<<<batch, 256, 0, stream_>>>(
         src.ptr<__nv_bfloat16>(), dst, kv_offsets.ptr<int32_t>(), positions.ptr<int32_t>(),
         kv_dim, num_slots, max_seq_len, layer_idx);
+    CUDA_KERNEL_CHECK();
   } else {
     kv_scatter_kernel<<<batch, 256>>>(
         src.ptr<__nv_bfloat16>(), dst, kv_offsets.ptr<int32_t>(), positions.ptr<int32_t>(),
         kv_dim, num_slots, max_seq_len, layer_idx);
+    CUDA_KERNEL_CHECK();
   }
 }
 }  // namespace kernel

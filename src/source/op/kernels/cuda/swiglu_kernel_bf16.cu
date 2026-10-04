@@ -1,5 +1,6 @@
 // CUDA SwiGLU (BF16): out = silu(in1) * in2 with bf16 operands, sigmoid and
 // product in float, bf16-rounded result.
+#include <base/cuda_check.h>
 #include <cuda_bf16.h>
 #include "swiglu_kernel.cuh"
 namespace kernel {
@@ -68,6 +69,7 @@ void swiglu_kernel_cu_fused(const tensor::Tensor& fused_in, const tensor::Tensor
   swiglu_fused_pair_kernel_bf16<<<grid, threads, 0, stream_>>>(
       fused_in.ptr<__nv_bfloat16>(), const_cast<__nv_bfloat16*>(output.ptr<__nv_bfloat16>()),
       chunks_per_row);
+  CUDA_KERNEL_CHECK();
 }
 
 void swiglu_kernel_cu(const tensor::Tensor& input1, const tensor::Tensor& input2,
@@ -86,11 +88,13 @@ void swiglu_kernel_cu(const tensor::Tensor& input1, const tensor::Tensor& input2
     swiglu_kernel_bf16_kernel<<<blocks, threads>>>(
         size, input1.ptr<__nv_bfloat16>(), input2.ptr<__nv_bfloat16>(),
         const_cast<__nv_bfloat16*>(output.ptr<__nv_bfloat16>()));
+    CUDA_KERNEL_CHECK();
   } else {
     cudaStream_t stream_ = static_cast<cudaStream_t>(stream);
     swiglu_kernel_bf16_kernel<<<blocks, threads, 0, stream_>>>(
         size, input1.ptr<__nv_bfloat16>(), input2.ptr<__nv_bfloat16>(),
         const_cast<__nv_bfloat16*>(output.ptr<__nv_bfloat16>()));
+    CUDA_KERNEL_CHECK();
   }
 }
 }  // namespace kernel

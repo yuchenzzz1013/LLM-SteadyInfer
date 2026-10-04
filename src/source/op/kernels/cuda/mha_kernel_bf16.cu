@@ -29,9 +29,11 @@
 // would round the split's running accumulator before the combine. Callers size
 // with flash_decoding_partials_elements (mha_kernel.cuh).
 #include <base/cuda_config.h>
+#include <base/cuda_check.h>
 #include <tensor/tensor.h>
 #include <cfloat>
 #include <cstdlib>
+#include <map>
 #include <vector>
 #include <cuda_bf16.h>
 #include <cub/cub.cuh>
@@ -39,6 +41,65 @@
 #include "paged_kernels.cuh"
 #include "model/qkv_split.h"
 namespace kernel {
+
+// ========== Dynamic shared-memory opt-in ==========
+// The flash-decoding kernels size their K/V tile scratch from max_seq_len /
+// num_splits, so beyond ~97K context (head_size 128, 8 splits) the requested
+// dynamic smem exceeds the 48KB default. A launch above a kernel's granted
+// dynamic-smem limit fails with cudaErrorInvalidValue; that failure used to be
+// silent, leaving the split partials stale and attention returning garbage.
+// Raise each kernel's limit to the device maximum once, then fail loudly if
+// the requested size is beyond what the device can ever grant.
+static int max_dynamic_smem_for(const void* kernel, const char* name) {
+  static std::map<const void*, int> granted_limits;
+  auto it = granted_limits.find(kernel);
+  if (it != granted_limits.end()) {
+    return it->second;
+  }
+  int device = 0;
+  int max_optin = 0;
+  int granted = 0;
+  cudaFuncAttributes attrs{};
+  cudaError_t err = cudaGetDevice(&device);
+  if (err == cudaSuccess) {
+    err = cudaDeviceGetAttribute(&max_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+  }
+  if (err == cudaSuccess) {
+    err = cudaFuncGetAttributes(&attrs, kernel);
+  }
+  if (err == cudaSuccess) {
+    // Static __shared__ bytes count against the opt-in limit, so the dynamic
+    // ceiling is the device limit minus them (these kernels carry 48B of cub
+    // temp storage). Asking for the full device limit fails with
+    // cudaErrorInvalidValue, which is why the ceiling is derived, not assumed.
+    const int ceiling = max_optin - static_cast<int>(attrs.sharedSizeBytes);
+    err = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, ceiling);
+    if (err == cudaSuccess) {
+      granted = ceiling;
+    }
+  }
+  if (err != cudaSuccess) {
+    // Do not leave the failed driver call as the thread's last error: the
+    // debug-build launch check would otherwise blame the next kernel launch.
+    cudaGetLastError();
+    LOG(ERROR) << "[MHA] failed to opt " << name << " into dynamic shared memory: "
+               << cudaGetErrorString(err) << " (device=" << device
+               << ", max_optin=" << max_optin << "); launches above 48KB will fail.";
+  }
+  granted_limits.emplace(kernel, granted);
+  return granted;
+}
+
+static void check_dynamic_smem_fits(const void* kernel, const char* name, int smem_bytes,
+                                    int32_t max_seq_len) {
+  if (smem_bytes <= 48 * 1024) {
+    return;
+  }
+  const int limit = max_dynamic_smem_for(kernel, name);
+  CHECK_GE(limit, smem_bytes)
+      << name << " needs " << (smem_bytes >> 10) << "KB of dynamic shared memory (max_seq_len="
+      << max_seq_len << "), above the device's opt-in limit of " << (limit >> 10) << "KB.";
+}
 
 // Flash-softmax helper: scores live in fp32 smem (computed from bf16 inputs);
 // the flash statistic is never stored in bf16.
@@ -169,6 +230,7 @@ void mha_kernel_cu(int32_t pos, int32_t head_num, int32_t layer_index, int32_t s
   multi_head_attention_kernel_bf16<<<head_num, 256, smem_bytes, stream>>>(
       pos, seq_len, query, output, key_cache, value_cache, kv_dim, kv_head_num, head_num,
       head_size, layer_offset);
+  CUDA_KERNEL_CHECK();
 }
 
 // ========== Flash Decoding (continuous KV layout) ==========
@@ -334,12 +396,16 @@ void mha_kernel_cu_batch(int32_t head_num, int32_t layer_idx, int32_t num_slots,
   // s_p must hold the largest tile any split can own.
   int max_tile = (max_seq_len + num_splits - 1) / num_splits;
   int smem_bytes = (head_size + max_tile) * sizeof(float);
+  check_dynamic_smem_fits((const void*)flash_decoding_kernel_bf16, "flash_decoding_kernel_bf16",
+                          smem_bytes, max_seq_len);
   int total_blocks = batch * head_num * num_splits;
   flash_decoding_kernel_bf16<<<total_blocks, 256, smem_bytes, stream>>>(
       positions.ptr<int32_t>(), kv_offsets.ptr<int32_t>(), num_slots, max_seq_len, layer_idx, dim,
       query, partials, kcache, vcache, kv_dim, kv_head_num, head_num, head_size, num_splits);
+  CUDA_KERNEL_CHECK();
   flash_decoding_combine_kernel_bf16<<<batch * head_num, 256, 0, stream>>>(
       partials, output, dim, head_num, head_size, num_splits, batch);
+  CUDA_KERNEL_CHECK();
 }
 
 // ========== Paged KV scatter ==========
@@ -380,10 +446,12 @@ void paged_kv_scatter_cu(const tensor::Tensor& src, tensor::Tensor& dst_cache,
     paged_kv_scatter_kernel_bf16<<<batch, 256, 0, stream_>>>(
         src.ptr<__nv_bfloat16>(), dst, block_table.ptr<int32_t>(), table_stride,
         positions.ptr<int32_t>(), kv_dim, num_blocks, block_size, layer_idx);
+    CUDA_KERNEL_CHECK();
   } else {
     paged_kv_scatter_kernel_bf16<<<batch, 256>>>(
         src.ptr<__nv_bfloat16>(), dst, block_table.ptr<int32_t>(), table_stride,
         positions.ptr<int32_t>(), kv_dim, num_blocks, block_size, layer_idx);
+    CUDA_KERNEL_CHECK();
   }
 }
 
@@ -1012,9 +1080,11 @@ void paged_attention_cu_batch(int32_t head_num, int32_t layer_idx, int32_t num_b
           positions.ptr<int32_t>(), batch, block_table.ptr<int32_t>(), table_stride, num_blocks,
           block_size, block_shift, layer_idx, dim, query, partials_f, kcache, vcache, kv_dim,
           kv_head_num, head_num, head_size, num_splits);
+      CUDA_KERNEL_CHECK();
       const int combine_threads = head_size <= 64 ? 64 : 128;
       paged_attn_warp2_split_combine_kernel_bf16<<<batch * head_num, combine_threads, 0, stream>>>(
           partials_f, output, head_num, head_size, num_splits, batch);
+      CUDA_KERNEL_CHECK();
       return;
     }
     const int warps_per_block = 256 / 32;
@@ -1024,6 +1094,7 @@ void paged_attention_cu_batch(int32_t head_num, int32_t layer_idx, int32_t num_b
         positions.ptr<int32_t>(), batch, block_table.ptr<int32_t>(), table_stride, num_blocks,
         block_size, block_shift, layer_idx, dim, query, output, kcache, vcache, kv_dim,
         kv_head_num, head_num, head_size);
+    CUDA_KERNEL_CHECK();
     return;
   }
   // Fallback (any head_size): per (batch row, q head, split) flash decoding
@@ -1032,13 +1103,17 @@ void paged_attention_cu_batch(int32_t head_num, int32_t layer_idx, int32_t num_b
   // s_p must hold the largest tile any split can own.
   int max_tile = (max_seq_len + num_splits - 1) / num_splits;
   int smem_bytes = (head_size + max_tile) * sizeof(float);
+  check_dynamic_smem_fits((const void*)paged_flash_decoding_kernel_bf16,
+                          "paged_flash_decoding_kernel_bf16", smem_bytes, max_seq_len);
   int total_blocks = batch * head_num * num_splits;
   paged_flash_decoding_kernel_bf16<<<total_blocks, 256, smem_bytes, stream>>>(
       positions.ptr<int32_t>(), block_table.ptr<int32_t>(), table_stride, num_blocks, block_size,
       layer_idx, dim, query, partials, kcache, vcache, kv_dim, kv_head_num, head_num, head_size,
       num_splits);
+  CUDA_KERNEL_CHECK();
   paged_flash_decoding_combine_kernel_bf16<<<batch * head_num, 256, 0, stream>>>(
       partials, output, dim, head_num, head_size, num_splits, batch);
+  CUDA_KERNEL_CHECK();
 }
 
 // ========== Paged prefill attention (FA2-style, one KV read per tile) =======
@@ -1383,41 +1458,49 @@ void paged_prefill_attention_cu_batch(int32_t row_begin, int32_t head_num, int32
       paged_prefill_kernel_bf16<1><<<grid, block, 0, stream>>>(
           pos, row_map, table, table_stride, num_blocks, block_size, block_shift, layer_idx, dim,
           query, output, kcache, vcache, kv_dim, kv_head_num, head_num, head_size);
+      CUDA_KERNEL_CHECK();
       break;
     case 2:
       paged_prefill_kernel_bf16<2><<<grid, block, 0, stream>>>(
           pos, row_map, table, table_stride, num_blocks, block_size, block_shift, layer_idx, dim,
           query, output, kcache, vcache, kv_dim, kv_head_num, head_num, head_size);
+      CUDA_KERNEL_CHECK();
       break;
     case 3:
       paged_prefill_kernel_bf16<3><<<grid, block, 0, stream>>>(
           pos, row_map, table, table_stride, num_blocks, block_size, block_shift, layer_idx, dim,
           query, output, kcache, vcache, kv_dim, kv_head_num, head_num, head_size);
+      CUDA_KERNEL_CHECK();
       break;
     case 4:
       paged_prefill_kernel_bf16<4><<<grid, block, 0, stream>>>(
           pos, row_map, table, table_stride, num_blocks, block_size, block_shift, layer_idx, dim,
           query, output, kcache, vcache, kv_dim, kv_head_num, head_num, head_size);
+      CUDA_KERNEL_CHECK();
       break;
     case 5:
       paged_prefill_kernel_bf16<5><<<grid, block, 0, stream>>>(
           pos, row_map, table, table_stride, num_blocks, block_size, block_shift, layer_idx, dim,
           query, output, kcache, vcache, kv_dim, kv_head_num, head_num, head_size);
+      CUDA_KERNEL_CHECK();
       break;
     case 6:
       paged_prefill_kernel_bf16<6><<<grid, block, 0, stream>>>(
           pos, row_map, table, table_stride, num_blocks, block_size, block_shift, layer_idx, dim,
           query, output, kcache, vcache, kv_dim, kv_head_num, head_num, head_size);
+      CUDA_KERNEL_CHECK();
       break;
     case 7:
       paged_prefill_kernel_bf16<7><<<grid, block, 0, stream>>>(
           pos, row_map, table, table_stride, num_blocks, block_size, block_shift, layer_idx, dim,
           query, output, kcache, vcache, kv_dim, kv_head_num, head_num, head_size);
+      CUDA_KERNEL_CHECK();
       break;
     default:
       paged_prefill_kernel_bf16<8><<<grid, block, 0, stream>>>(
           pos, row_map, table, table_stride, num_blocks, block_size, block_shift, layer_idx, dim,
           query, output, kcache, vcache, kv_dim, kv_head_num, head_num, head_size);
+      CUDA_KERNEL_CHECK();
       break;
   }
 }
@@ -1506,6 +1589,7 @@ void split_fused_qkv_bf16_cu(const void* fused_src, void* dst_q, void* dst_k, vo
   split_fused_qkv_kernel_bf16<<<batch, 256, 0, stream>>>(
       reinterpret_cast<const uint4*>(fused_src), reinterpret_cast<uint4*>(dst_q),
       reinterpret_cast<uint4*>(dst_k), reinterpret_cast<uint4*>(dst_v), q_vec, kv_vec, row_vec);
+  CUDA_KERNEL_CHECK();
 }
 
 }  // namespace kernel

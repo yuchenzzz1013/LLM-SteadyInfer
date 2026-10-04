@@ -132,12 +132,9 @@ void CUDADeviceAllocator::release(void* ptr) const {
   if (!ptr) {
     return;
   }
-  if (cuda_buffers_map_.empty()) {
-    LOG(WARNING) << "[CUDA_FREE] release called but cuda_buffers_map_ is empty, cudaFree directly";
-    cudaError_t state = cudaFree(ptr);
-    CHECK(state == cudaSuccess) << "Error: CUDA error when release memory on device";
-    return;
-  }
+  // Waterline flush: hand idle small buffers back to the driver when the pool
+  // hoards more than the threshold. The pointer being released is still busy
+  // at this point, so the flush can never free it under our feet.
   cudaError_t state = cudaSuccess;
   for (auto& it : cuda_buffers_map_) {
     if (no_busy_cnt_[it.first] > idle_flush_threshold(it.first)) {
@@ -145,11 +142,12 @@ void CUDADeviceAllocator::release(void* ptr) const {
       VLOG(1) << "[CUDA_FREE] idle above waterline ("
               << (idle_flush_threshold(it.first) >> 20) << "MB), flushing all non-busy small buffers";
 #endif
+      state = cudaSetDevice(it.first);
+      CHECK(state == cudaSuccess) << "Error: CUDA error selecting device " << it.first;
       auto& cuda_buffers = it.second;
       std::vector<CudaMemoryBuffer> temp;
       for (int i = 0; i < cuda_buffers.size(); i++) {
         if (!cuda_buffers[i].busy) {
-          state = cudaSetDevice(it.first);
           state = cudaFree(cuda_buffers[i].data);
           CHECK(state == cudaSuccess)
               << "Error: CUDA error when release memory on device " << it.first;
@@ -166,6 +164,7 @@ void CUDADeviceAllocator::release(void* ptr) const {
     }
   }
 
+  // Small pool: mark the entry idle and account the idle size.
   for (auto& it : cuda_buffers_map_) {
     auto& cuda_buffers = it.second;
     for (int i = 0; i < cuda_buffers.size(); i++) {
@@ -180,7 +179,16 @@ void CUDADeviceAllocator::release(void* ptr) const {
         return;
       }
     }
-    auto& big_buffers = big_buffers_map_[it.first];
+  }
+
+  // Large pool: traverse it on its own. This lookup used to live inside the
+  // small-map loop and index big_buffers_map_ with the small map's device key,
+  // so a large buffer whose device had no small-buffer entry (or any release
+  // after free_idle()/the flush above emptied the small pool) was cudaFree'd
+  // below while its pool entry stayed marked busy — the ledger kept accounting
+  // that memory as in use and the entry was never reusable.
+  for (auto& it : big_buffers_map_) {
+    auto& big_buffers = it.second;
     for (int i = 0; i < big_buffers.size(); i++) {
       if (big_buffers[i].data == ptr) {
         big_buffers[i].busy = false;
@@ -192,7 +200,9 @@ void CUDADeviceAllocator::release(void* ptr) const {
       }
     }
   }
-  // Not found in pool — free directly
+
+  // Neither pool knows this pointer: it did not come from this allocator (or
+  // its pool was already flushed). Free it directly.
   LOG(WARNING) << "[CUDA_FREE] ptr not found in pool, cudaFree directly";
   state = cudaFree(ptr);
   CHECK(state == cudaSuccess) << "Error: CUDA error when release memory on device";

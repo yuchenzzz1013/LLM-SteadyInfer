@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 #include <glog/logging.h>
 #include <numeric>
+#include <stdexcept>
 
 namespace tensor {
 template <typename T, typename Tp>
@@ -43,7 +44,7 @@ Tensor::Tensor(base::DataType data_type, int32_t dim0, bool need_alloc,
   dims_.push_back(dim0);
   size_ = dim0;
   if (need_alloc && alloc) {
-    allocate(alloc);
+    allocate_or_throw(alloc);
   } else {
     if (ptr != nullptr) {
       CHECK(need_alloc == false)
@@ -60,7 +61,7 @@ Tensor::Tensor(base::DataType data_type, int32_t dim0, int32_t dim1, bool need_a
   dims_.push_back(dim1);
   size_ = static_cast<int64_t>(dim0) * dim1;
   if (need_alloc && alloc) {
-    allocate(alloc);
+    allocate_or_throw(alloc);
   } else {
     init_buffer(alloc, data_type_, need_alloc, ptr);
   }
@@ -74,7 +75,7 @@ Tensor::Tensor(base::DataType data_type, int32_t dim0, int32_t dim1, int32_t dim
   dims_.push_back(dim2);
   size_ = static_cast<int64_t>(dim0) * dim1 * dim2;
   if (need_alloc && alloc) {
-    allocate(alloc);
+    allocate_or_throw(alloc);
   } else {
     init_buffer(alloc, data_type_, need_alloc, ptr);
   }
@@ -89,7 +90,7 @@ Tensor::Tensor(base::DataType data_type, int32_t dim0, int32_t dim1, int32_t dim
   dims_.push_back(dim3);
   size_ = static_cast<int64_t>(dim0) * dim1 * dim2 * dim3;
   if (need_alloc && alloc) {
-    allocate(alloc);
+    allocate_or_throw(alloc);
   } else {
     init_buffer(alloc, data_type_, need_alloc, ptr);
   }
@@ -100,21 +101,31 @@ Tensor::Tensor(base::DataType data_type, std::vector<int32_t> dims, bool need_al
     : dims_(std::move(dims)), data_type_(data_type) {
   size_ = reduce_dimension(dims_.begin(), dims_.end(), 1LL);
   if (need_alloc && alloc) {
-    allocate(alloc);
+    allocate_or_throw(alloc);
   } else {
     init_buffer(alloc, data_type_, need_alloc, ptr);
   }
 }
 
 void Tensor::to_cuda(cudaStream_t stream) {
-  CHECK_NE(buffer_, nullptr);
+  CHECK_NE(buffer_, nullptr) << "to_cuda: the tensor has no buffer.";
   const base::DeviceType device_type = this->device_type();
   if (device_type == base::DeviceType::kDeviceUnknown) {
     LOG(ERROR) << "The device type of the tensor is unknown.";
+    throw std::runtime_error("Tensor::to_cuda: unknown device type");
   } else if (device_type == base::DeviceType::kDeviceCPU) {
+    if (buffer_->ptr() == nullptr) {
+      LOG(ERROR) << "Tensor::to_cuda: the CPU source buffer has a null data pointer.";
+      throw std::runtime_error("Tensor::to_cuda: null source pointer");
+    }
     size_t byte_size = this->byte_size();
     auto cu_alloc = base::CUDADeviceAllocatorFactory::get_instance();
     auto cu_buffer = std::make_shared<base::Buffer>(byte_size, cu_alloc);
+    if (cu_buffer->ptr() == nullptr) {
+      LOG(ERROR) << "Tensor::to_cuda: failed to allocate " << byte_size
+                 << " bytes on the CUDA device.";
+      throw std::runtime_error("Tensor::to_cuda: CUDA allocation failed");
+    }
     cu_alloc->memcpy(buffer_->ptr(), cu_buffer->ptr(), byte_size, base::MemcpyKind::kMemcpyCPU2CUDA,
                      stream);
     this->buffer_ = cu_buffer;
@@ -131,10 +142,19 @@ void Tensor::to_cpu() {
 
   if (device_type == base::DeviceType::kDeviceUnknown) {
     LOG(ERROR) << "The device type of the tensor is unknown.";
+    throw std::runtime_error("Tensor::to_cpu: unknown device type");
   } else if (device_type == base::DeviceType::kDeviceCUDA) {
+    if (buffer_->ptr() == nullptr) {
+      LOG(ERROR) << "Tensor::to_cpu: the CUDA source buffer has a null data pointer.";
+      throw std::runtime_error("Tensor::to_cpu: null source pointer");
+    }
     size_t byte_size = this->byte_size();
     auto cpu_alloc = base::CPUDeviceAllocatorFactory::get_instance();
     auto cpu_buffer = std::make_shared<base::Buffer>(byte_size, cpu_alloc);
+    if (cpu_buffer->ptr() == nullptr) {
+      LOG(ERROR) << "Tensor::to_cpu: failed to allocate " << byte_size << " bytes on the host.";
+      throw std::runtime_error("Tensor::to_cpu: host allocation failed");
+    }
     cpu_alloc->memcpy(buffer_->ptr(), cpu_buffer->ptr(), byte_size,
                       base::MemcpyKind::kMemcpyCUDA2CPU);
     this->buffer_ = cpu_buffer;
@@ -193,18 +213,31 @@ bool Tensor::allocate(std::shared_ptr<base::DeviceAllocator> allocator, bool nee
     return false;
   }
 
-  if (buffer_ && byte_size <= buffer_->byte_size()) {
+  if (buffer_ && buffer_->ptr() && byte_size <= buffer_->byte_size()) {
     if (!need_realloc) {
       return true;
     }
   }
 
-  buffer_ = std::make_shared<base::Buffer>(byte_size, allocator, nullptr);
-  if (!buffer_->ptr()) {
-    LOG(ERROR) << "The memory allocated is a null pointer!";
+  auto new_buffer = std::make_shared<base::Buffer>(byte_size, allocator, nullptr);
+  if (!new_buffer->ptr()) {
+    // Drop the buffer instead of keeping a null-backed one: is_empty() would
+    // report the tensor as empty, yet a later allocate() would see buffer_ &&
+    // byte_size <= byte_size and "succeed" without ever allocating.
+    LOG(ERROR) << "The memory allocated is a null pointer! (byte_size=" << byte_size
+               << ", device=" << int(allocator->device_type()) << ")";
+    buffer_ = nullptr;
     return false;
   }
+  buffer_ = new_buffer;
   return true;
+}
+
+void Tensor::allocate_or_throw(const std::shared_ptr<base::DeviceAllocator>& allocator) {
+  if (!allocate(allocator, /*need_realloc=*/true)) {
+    throw std::runtime_error("Tensor allocation failed: " + std::to_string(byte_size()) +
+                             " bytes, dtype=" + std::to_string(static_cast<int>(data_type_)));
+  }
 }
 
 const std::vector<int32_t>& Tensor::dims() const { return this->dims_; }
@@ -286,7 +319,7 @@ void Tensor::init_buffer(std::shared_ptr<base::DeviceAllocator> alloc, base::Dat
         std::make_shared<base::Buffer>(data_type_size(data_type) * size_, nullptr, ptr, true);
     this->buffer_ = buffer;
   } else {
-    allocate(alloc, true);
+    allocate_or_throw(alloc);
   }
 }
 }  // namespace tensor

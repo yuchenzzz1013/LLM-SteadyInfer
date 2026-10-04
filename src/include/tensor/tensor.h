@@ -88,6 +88,12 @@ class Tensor {
   tensor::Tensor clone() const;
 
  private:
+  // Allocation entry point for the constructors / init_buffer. They cannot
+  // return a status, and a Tensor that silently owns no storage would make
+  // every later kernel read or write through a null pointer, so a failed
+  // allocation throws std::runtime_error here instead of being dropped.
+  void allocate_or_throw(const std::shared_ptr<base::DeviceAllocator>& allocator);
+
   size_t size_ = 0;
   std::vector<int32_t> dims_;
   std::shared_ptr<base::Buffer> buffer_;

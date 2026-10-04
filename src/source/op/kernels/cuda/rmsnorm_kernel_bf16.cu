@@ -2,6 +2,7 @@
 // operands and products (exact in float), fp32 accumulation — the same
 // semantics as the cuBLAS BF16 path and the fp32 CPU reference, so the
 // BF16/FP32 numerical gap stays within bf16 rounding error.
+#include <base/cuda_check.h>
 #include <device_launch_parameters.h>
 #include <cuda_bf16.h>
 #include <cub/block/block_reduce.cuh>
@@ -132,8 +133,10 @@ void rmsnorm_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight
   if (stream) {
     cudaStream_t stream_ = static_cast<cudaStream_t>(stream);
     row_rmsnorm_bf16<128><<<1, threads_num, 0, stream_>>>(in_ptr, wei_ptr, out_ptr, size, eps);
+    CUDA_KERNEL_CHECK();
   } else {
     row_rmsnorm_bf16<128><<<1, threads_num>>>(in_ptr, wei_ptr, out_ptr, size, eps);
+    CUDA_KERNEL_CHECK();
   }
 }
 
@@ -169,9 +172,11 @@ void rmsnorm_kernel_cu_dim(const tensor::Tensor& input, const tensor::Tensor& we
       cudaStream_t stream_ = static_cast<cudaStream_t>(stream);
       row_rmsnorm_bf16_dim128_warp<<<blocks, threads_num, 0, stream_>>>(in_ptr, wei_ptr, out_ptr,
                                                                         dim_size, eps);
+      CUDA_KERNEL_CHECK();
     } else {
       row_rmsnorm_bf16_dim128_warp<<<blocks, threads_num>>>(in_ptr, wei_ptr, out_ptr, dim_size,
                                                             eps);
+      CUDA_KERNEL_CHECK();
     }
     return;
   }
@@ -180,8 +185,10 @@ void rmsnorm_kernel_cu_dim(const tensor::Tensor& input, const tensor::Tensor& we
     cudaStream_t stream_ = static_cast<cudaStream_t>(stream);
     row_rmsnorm_bf16_dim<<<dim_size, threads_num, 0, stream_>>>(in_ptr, wei_ptr, out_ptr,
                                                                 dim_size, size, eps);
+    CUDA_KERNEL_CHECK();
   } else {
     row_rmsnorm_bf16_dim<<<dim_size, threads_num>>>(in_ptr, wei_ptr, out_ptr, dim_size, size, eps);
+    CUDA_KERNEL_CHECK();
   }
 }
 }  // namespace kernel
