@@ -184,12 +184,24 @@ int64_t SafetensorsReader::numel(const std::string& name) const {
                          std::multiplies<int64_t>());
 }
 
-int64_t SafetensorsReader::read_bf16(const std::string& name, uint16_t* dst) const {
+int64_t SafetensorsReader::read_tensor(const std::string& name, base::DataType dst_dtype,
+                                       void* dst) const {
   if (!has(name) || !dst) {
     return -1;
   }
+  const bool dst_bf16 = dst_dtype == base::DataType::kDataTypeBF16;
+  const bool dst_fp32 = dst_dtype == base::DataType::kDataTypeFp32;
+  CHECK(dst_bf16 || dst_fp32) << "[safetensors] unsupported target dtype "
+                              << static_cast<int>(dst_dtype);
   const SafetensorMeta& m = meta(name);
   const int64_t n = numel(name);
+  const bool src_bf16 = m.dtype == "BF16";
+  const bool src_fp32 = m.dtype == "F32";
+  if (!src_bf16 && !src_fp32) {
+    LOG(ERROR) << "[safetensors] unsupported dtype '" << m.dtype << "' for tensor '" << name
+               << "' (expected BF16 or F32)";
+    return -1;
+  }
   const std::string file_path = dir_ + "/" + m.shard;
 
   FILE* file = fopen(file_path.c_str(), "rb");
@@ -212,21 +224,25 @@ int64_t SafetensorsReader::read_bf16(const std::string& name, uint16_t* dst) con
   }
 
   int64_t rc = -1;
-  if (m.dtype == "BF16") {
-    if (fread(dst, sizeof(uint16_t), static_cast<size_t>(n), file) ==
-        static_cast<size_t>(n)) {
+  const size_t count = static_cast<size_t>(n);
+  if (src_bf16 == dst_bf16) {
+    // Same element layout (BF16 bits as uint16_t, or IEEE fp32): copy verbatim.
+    const size_t elem_size = src_bf16 ? sizeof(uint16_t) : sizeof(float);
+    if (fread(dst, elem_size, count, file) == count) {
       rc = n;
     }
-  } else if (m.dtype == "F32") {
-    std::vector<float> tmp(static_cast<size_t>(n));
-    if (fread(tmp.data(), sizeof(float), static_cast<size_t>(n), file) ==
-        static_cast<size_t>(n)) {
-      base::fp32_to_bf16_batch(tmp.data(), dst, static_cast<size_t>(n));
+  } else if (src_fp32) {  // F32 -> BF16 (CUDA models downcast at load)
+    std::vector<float> tmp(count);
+    if (fread(tmp.data(), sizeof(float), count, file) == count) {
+      base::fp32_to_bf16_batch(tmp.data(), static_cast<base::bf16_t*>(dst), count);
       rc = n;
     }
-  } else {
-    LOG(ERROR) << "[safetensors] unsupported dtype '" << m.dtype << "' for tensor '"
-               << name << "' (expected BF16 or F32)";
+  } else {  // BF16 -> F32 (CPU models upconvert once at load)
+    std::vector<base::bf16_t> tmp(count);
+    if (fread(tmp.data(), sizeof(uint16_t), count, file) == count) {
+      base::bf16_to_fp32_batch(tmp.data(), static_cast<float*>(dst), count);
+      rc = n;
+    }
   }
 
   if (rc < 0) {

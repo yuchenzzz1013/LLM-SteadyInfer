@@ -10,9 +10,9 @@
 // Every safetensors file is:  <uint64 LE header_len> <JSON header> <raw data>.
 // The JSON header maps tensor name -> {dtype, shape, data_offsets:[b,e]}, and
 // the optional index file maps tensor name -> shard file name. dtype is
-// restricted to "BF16"/"F32": both are delivered to the caller as BF16 bits
-// (uint16_t), converting F32 on the fly so the in-memory model is uniformly
-// BF16 (see base/bf16_utils.h).
+// restricted to "BF16"/"F32"; read_tensor converts to the caller's target
+// dtype only when it differs, so an FP32 model never round-trips its weights
+// through BF16 (see base/bf16_utils.h).
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -47,11 +47,11 @@ class SafetensorsReader {
 
   int64_t numel(const std::string& name) const;
 
-  // Read one tensor into `dst` as BF16 raw bits (little-endian uint16_t per
-  // element). `dst` must hold numel(name) elements. F32 tensors are converted
-  // during the read; "BF16" is copied verbatim. Returns numel on success and
-  // -1 on failure (error details are logged).
-  int64_t read_bf16(const std::string& name, uint16_t* dst) const;
+  // Read one tensor into `dst` as `dst_dtype` (kDataTypeBF16 raw bits /
+  // kDataTypeFp32), converting only when the checkpoint dtype differs so an
+  // FP32 target never round-trips through BF16. `dst` must hold numel(name)
+  // elements. Returns numel on success and -1 on failure (details logged).
+  int64_t read_tensor(const std::string& name, base::DataType dst_dtype, void* dst) const;
 
  private:
   base::Status parse_shard(const std::string& file_path, const std::string& shard_name,

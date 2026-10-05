@@ -437,19 +437,22 @@ class Model {
   mutable int32_t internal_kv_len_ = 0;
   std::unique_ptr<sampler::Sampler> sampler_;
 
-  // ---------- HF safetensors weight storage (host, BF16 raw bits) ----------
-  // HF tensor name -> raw bfloat16 storage (little-endian uint16_t). Layers
-  // hold non-owning views into these buffers (they outlive the views: the
-  // map lives as long as the Model). populate: load_hf_model().
-  std::unordered_map<std::string, std::shared_ptr<std::vector<uint16_t>>> weight_map_;
-  // Lazy FP32 copies of weight_map_ (CPU device only): weights are converted
-  // at first get_weight_data() access, so FP32 models never carry BF16 tensors.
-  std::unordered_map<std::string, std::shared_ptr<std::vector<float>>> weight_map_fp32_;
+  // ---------- HF safetensors weight storage (host) ----------
+  // HF tensor name -> host copy of the weights, already in the model's
+  // compute dtype (BF16 bits on CUDA models, FP32 on CPU models): the
+  // checkpoint dtype is converted at load time only when it differs, so an
+  // FP32 run never round-trips weights through BF16. Layers hold non-owning
+  // views into these buffers (they outlive the views: the map lives as long
+  // as the Model). Populated by load_hf_model().
+  struct HostWeight {
+    std::shared_ptr<std::vector<uint8_t>> bytes;  // base::DataTypeSize(dtype) * numel
+    int64_t numel = 0;
+  };
+  std::unordered_map<std::string, HostWeight> weight_map_;
 
-  // Host pointer to the storage of the HF tensor `name`. Element type is
-  // compute_dtype(): uint16_t BF16 bits on CUDA models, float on CPU models
-  // (converted lazily and cached). Stable for the model lifetime; CHECK-fails
-  // when the tensor is unknown.
+  // Host pointer to the storage of the HF tensor `name`, laid out as
+  // compute_dtype() (uint16_t BF16 bits on CUDA models, float on CPU models).
+  // Stable for the model lifetime; CHECK-fails when the tensor is unknown.
   const void* get_weight_data(const std::string& name);
 
   size_t get_weight_numel(const std::string& name) const;

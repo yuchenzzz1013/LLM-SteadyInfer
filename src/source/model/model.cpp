@@ -7,7 +7,6 @@
 #include <fstream>
 #include <limits>
 #include <nlohmann/json.hpp>
-#include "base/bf16_utils.h"
 #include "model/safetensors_reader.h"
 #include "../op/kernels/cuda/mha_kernel.cuh"
 #include "../op/kernels/cuda/paged_kernels.cuh"  // paged_decode_geometry_ok (partials sizing)
@@ -351,26 +350,31 @@ base::Status Model::load_hf_model() {
     return load_status;
   }
 
+  // Store every weight in the model's compute dtype right away: BF16 bits on
+  // CUDA models, FP32 on CPU models. The checkpoint dtype is converted only
+  // when it differs, so an FP32 (CPU) run keeps the checkpoint's full
+  // precision instead of round-tripping F32 -> BF16 -> F32.
+  const base::DataType dtype = compute_dtype();
   weight_map_.clear();
-  weight_map_fp32_.clear();
   for (const std::string& name : reader.tensor_names()) {
     const int64_t n = reader.numel(name);
     if (n <= 0) {
       LOG(WARNING) << "[MODEL] skip empty tensor '" << name << "'";
       continue;
     }
-    auto storage = std::make_shared<std::vector<uint16_t>>(static_cast<size_t>(n));
-    if (reader.read_bf16(name, storage->data()) != n) {
+    auto storage = std::make_shared<std::vector<uint8_t>>(
+        static_cast<size_t>(n) * base::DataTypeSize(dtype));
+    if (reader.read_tensor(name, dtype, storage->data()) != n) {
       return error::ModelParseError("Failed to read the weight tensor '" + name + "' from " +
                                     model_path_);
     }
-    weight_map_.emplace(name, std::move(storage));
+    weight_map_.emplace(name, HostWeight{std::move(storage), n});
   }
   if (weight_map_.empty()) {
     return error::ModelParseError("No weight tensor was loaded from the model dir " + model_path_);
   }
   LOG(INFO) << "[MODEL] loaded " << weight_map_.size() << " weight tensors ("
-            << (compute_dtype() == base::DataType::kDataTypeBF16 ? "BF16" : "FP32-converted")
+            << (dtype == base::DataType::kDataTypeBF16 ? "BF16" : "FP32")
             << ") from " << model_path_;
   return error::Success();
 }
@@ -378,24 +382,13 @@ base::Status Model::load_hf_model() {
 const void* Model::get_weight_data(const std::string& name) {
   auto it = weight_map_.find(name);
   CHECK(it != weight_map_.end()) << "Unknown model weight tensor '" << name << "'";
-  if (compute_dtype() == base::DataType::kDataTypeBF16) {
-    return it->second->data();
-  }
-  // FP32 run (CPU device): convert once and cache.
-  auto fit = weight_map_fp32_.find(name);
-  if (fit == weight_map_fp32_.end()) {
-    const std::vector<uint16_t>& bf16 = *it->second;
-    auto fp32 = std::make_shared<std::vector<float>>(bf16.size());
-    base::bf16_to_fp32_batch(bf16.data(), fp32->data(), bf16.size());
-    fit = weight_map_fp32_.emplace(name, std::move(fp32)).first;
-  }
-  return fit->second->data();
+  return it->second.bytes->data();
 }
 
 size_t Model::get_weight_numel(const std::string& name) const {
   auto it = weight_map_.find(name);
   CHECK(it != weight_map_.end()) << "Unknown model weight tensor '" << name << "'";
-  return it->second->size();
+  return static_cast<size_t>(it->second.numel);
 }
 
 base::Status Model::generate_model_infos(const HfConfig& config) const {
@@ -532,7 +525,7 @@ base::Status Model::gen_model_from_file() {
                  << "; logits beyond the tokenizer range are clipped at sampling";
   }
 
-  // 3. Safetensors weights -> weight_map_ (BF16 raw bits on the host).
+  // 3. Safetensors weights -> weight_map_ (host, already in compute_dtype()).
   auto weight_status = load_hf_model();
   if (!weight_status) {
     LOG(ERROR) << "Load weights from the model dir " << model_path_ << " failed!";
@@ -626,13 +619,11 @@ tensor::Tensor Model::fill_input(const tensor::Tensor& pos_tensor,
 
   // The embedding table / activations carry the model's compute dtype; the
   // returned 1-D tensor is a view over the (device-resident) embedding row.
-  std::shared_ptr<base::Buffer> input_emb_buffer = std::make_shared<base::Buffer>(
-      static_cast<size_t>(model_dim) * elem_size, nullptr,
-      static_cast<void*>(input_embeddings.ptr<uint8_t>() +
-                         static_cast<size_t>(index) * model_dim * elem_size),
-      true);
-  tensor::Tensor input(dtype, model_dim);
-  CHECK(input.assign(input_emb_buffer));
+  // Constructed directly over the row pointer (not assign()): the tensor owns
+  // its view buffer exclusively, so set_device_type is allowed to retag it.
+  tensor::Tensor input(dtype, model_dim, false, nullptr,
+                       static_cast<void*>(input_embeddings.ptr<uint8_t>() +
+                                          static_cast<size_t>(index) * model_dim * elem_size));
   input.set_device_type(device_type_);
   return input;
 }

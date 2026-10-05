@@ -157,7 +157,6 @@ base::Status MatmulLayer::set_bias(int32_t idx, int32_t dim, const void* bias_pt
 
   if (!is_quant_layer_) {
     tensor::Tensor bias(data_type, dim);
-    bias.set_device_type(device_type);
     CHECK(bias.assign(buffer));
     bias_.at(idx) = bias;
     // The layer computes in its weight dtype (BF16 on CUDA, FP32 on CPU).
@@ -165,7 +164,6 @@ base::Status MatmulLayer::set_bias(int32_t idx, int32_t dim, const void* bias_pt
   } else {
     // is quant layer
     tensor::Tensor bias(base::DataType::kDataTypeInt8, dim);
-    bias.set_device_type(device_type);
     CHECK(bias.assign(buffer));
     bias_.at(idx) = bias;
 

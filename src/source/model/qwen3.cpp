@@ -1323,11 +1323,11 @@ base::Status Qwen3Model::forward_batch(
     STATUS_CHECK(final_norm->forward(lm_hidden, lm_hidden));
 
     // NOTE: the caller's logits tensor is deliberately NOT reshaped here.
-    // reshape() reallocates when the requested element count exceeds the
-    // tensor's current one, and the two views above would then point into the
-    // released buffer (the LM head's GEMM writing into freed memory). The
-    // views carry the shapes the GEMM and the sampler actually read, so the
-    // caller's dims are left alone.
+    // A reshape to [lm_rows, vocab] would shrink the caller's batch dim
+    // whenever lm_rows < batch (mixed decode+prefill steps), and the caller
+    // reads the logits with its own batch accounting. The views carry the
+    // shapes the GEMM and the sampler actually read, so the caller's dims
+    // are left alone.
     auto& cls = qwen_layers_->cls_layer_;
     std::dynamic_pointer_cast<op::MatmulLayer>(cls)->set_batch_size(lm_rows);
     STATUS_CHECK(cls->forward(lm_hidden, lm_logits));

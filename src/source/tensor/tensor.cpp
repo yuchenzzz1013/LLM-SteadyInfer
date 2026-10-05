@@ -185,10 +185,17 @@ bool Tensor::assign(std::shared_ptr<base::Buffer> buffer) {
     LOG(ERROR) << "The buffer parameter in the assign function is null pointer!";
     return false;
   }
-  if (buffer_) {
-    if (buffer_->device_type() != buffer->device_type()) {
-      LOG(ERROR) << "The device type of the new buffer is different from the original one.";
-    }
+  if (buffer_ && buffer_->device_type() != base::DeviceType::kDeviceUnknown &&
+      buffer->device_type() != base::DeviceType::kDeviceUnknown &&
+      buffer_->device_type() != buffer->device_type()) {
+    // Continuing here would leave the tensor tagged with a device its data is
+    // not on: every later kernel dispatch would read the wrong memory. An
+    // unknown device on either side means "not tagged yet", which is safe.
+    LOG(ERROR) << "The device type of the new buffer ("
+               << static_cast<int>(buffer->device_type())
+               << ") is different from the original one ("
+               << static_cast<int>(buffer_->device_type()) << ").";
+    return false;
   }
 
   size_t byte_size = this->byte_size();
@@ -243,9 +250,16 @@ void Tensor::allocate_or_throw(const std::shared_ptr<base::DeviceAllocator>& all
 const std::vector<int32_t>& Tensor::dims() const { return this->dims_; }
 
 void Tensor::set_device_type(base::DeviceType device_type) const {
-  if (buffer_) {
-    buffer_->set_device_type(device_type);
-  }
+  // Retagging mutates the Buffer, which other tensors may share: a copy of
+  // this tensor, a buffer handed out by assign(), a view. Silently changing
+  // the device type they observe would make them dispatch kernels against the
+  // wrong device. Only a buffer this tensor owns exclusively may be retagged;
+  // shared views must tag the Buffer directly at creation time.
+  CHECK(buffer_ != nullptr) << "set_device_type: the tensor has no buffer to tag.";
+  CHECK_EQ(buffer_.use_count(), 1)
+      << "set_device_type: the buffer is shared with another tensor; tag the Buffer "
+         "directly instead of retagging it through one of its views.";
+  buffer_->set_device_type(device_type);
 }
 
 void Tensor::reset(base::DataType data_type, const std::vector<int32_t>& dims) {
@@ -261,22 +275,18 @@ base::DataType Tensor::data_type() const { return data_type_; }
 
 void Tensor::reshape(const std::vector<int32_t>& dims) {
   size_t size = reduce_dimension(dims.begin(), dims.end(), 1LL);
-  if (!buffer_) {
-    this->dims_ = dims;
-    this->size_ = size;
-    return;
-  }
-
-  if (size > size_) {
-    // Buffer's constructor already allocates through the same allocator;
-    // calling allocate() on top of it would allocate a second block and leak
-    // the first one.
-    auto new_buffer = std::make_shared<base::Buffer>(size * base::DataTypeSize(this->data_type_),
-                                                     buffer_->allocator());
-    CHECK(new_buffer->ptr() != nullptr)
-        << "reshape: failed to grow the buffer to " << size << " elements";
-    new_buffer->copy_from(buffer_.get());
-    this->buffer_ = new_buffer;
+  if (buffer_) {
+    // Reshape only changes the shape metadata; the storage stays as
+    // allocated. It used to silently allocate and copy a new buffer whenever
+    // the requested element count exceeded the *current* size, which replaced
+    // the storage under every other view of it (and hid capacity bugs). The
+    // only real limit is the buffer's capacity.
+    const size_t elem_size = base::DataTypeSize(data_type_);
+    CHECK_NE(elem_size, 0) << "reshape: the tensor has an unknown data type.";
+    const size_t capacity = buffer_->byte_size() / elem_size;
+    CHECK_LE(size, capacity) << "reshape would grow the tensor from " << size_ << " to " << size
+                             << " elements, beyond its buffer capacity of " << capacity
+                             << "; allocate a larger buffer first.";
   }
   this->dims_ = dims;
   this->size_ = size;
@@ -285,11 +295,17 @@ void Tensor::reshape(const std::vector<int32_t>& dims) {
 std::shared_ptr<base::Buffer> Tensor::get_buffer() const { return buffer_; }
 
 Tensor Tensor::clone() const {
+  CHECK(buffer_ != nullptr && buffer_->ptr() != nullptr)
+      << "clone: the tensor has no data to clone.";
   Tensor new_tensor = *this;
   size_t byte_size = this->byte_size();
 
   auto allocator = buffer_->allocator();
+  CHECK(allocator != nullptr)
+      << "clone: the source buffer has no allocator, cannot allocate a copy.";
   new_tensor.buffer_ = std::make_shared<base::Buffer>(byte_size, allocator);
+  CHECK(new_tensor.buffer_->ptr() != nullptr)
+      << "clone: failed to allocate " << byte_size << " bytes for the copy.";
   new_tensor.buffer_->copy_from(buffer_.get());
   return new_tensor;
 }

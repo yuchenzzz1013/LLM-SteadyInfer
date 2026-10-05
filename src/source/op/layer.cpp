@@ -208,7 +208,6 @@ base::Status LayerParam::set_weight(int32_t idx, const std::vector<int32_t>& dim
     // Non-owning view over the caller's weight storage (weight_map_ / HF
     // tensors, raw bfloat16 bits when data_type == kDataTypeBF16).
     tensor::Tensor weight(data_type, dims);
-    weight.set_device_type(device_type);
     CHECK(weight.assign(buffer));
     weights_.at(idx) = weight;
     // The layer computes in its weight dtype (BF16 on CUDA, FP32 on CPU).
@@ -216,7 +215,6 @@ base::Status LayerParam::set_weight(int32_t idx, const std::vector<int32_t>& dim
   } else {
     // is quant layer
     tensor::Tensor weight(base::DataType::kDataTypeInt8, dims);
-    weight.set_device_type(device_type);
     CHECK(weight.assign(buffer));
     weights_.at(idx) = weight;
 
