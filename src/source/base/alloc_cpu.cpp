@@ -1,4 +1,5 @@
 #include <glog/logging.h>
+#include <cuda_runtime_api.h>
 #include <cstdlib>
 #include "base/alloc.h"
 
@@ -36,5 +37,30 @@ void CPUDeviceAllocator::release(void* ptr) const {
   }
 }
 
+PinnedCPUDeviceAllocator::PinnedCPUDeviceAllocator() : DeviceAllocator(DeviceType::kDeviceCPU) {
+}
+
+void* PinnedCPUDeviceAllocator::allocate(size_t byte_size) const {
+  if (!byte_size) {
+    return nullptr;
+  }
+  void* data = nullptr;
+  const cudaError_t err = cudaHostAlloc(&data, byte_size, cudaHostAllocDefault);
+  if (err != cudaSuccess) {
+    LOG(ERROR) << "cudaHostAlloc(" << byte_size << ") failed: " << cudaGetErrorString(err);
+    return nullptr;
+  }
+  return data;
+}
+
+void PinnedCPUDeviceAllocator::release(void* ptr) const {
+  if (ptr) {
+    // Errors can only mean the context is already gone (teardown ordering),
+    // so there is nothing useful to do with them here.
+    cudaFreeHost(ptr);
+  }
+}
+
 std::shared_ptr<CPUDeviceAllocator> CPUDeviceAllocatorFactory::instance = nullptr;
+std::shared_ptr<PinnedCPUDeviceAllocator> PinnedCPUDeviceAllocatorFactory::instance = nullptr;
 }  // namespace base

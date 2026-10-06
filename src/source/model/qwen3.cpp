@@ -1373,8 +1373,9 @@ base::Status Qwen3Model::forward_batch(
     st.on = false;
   }
 
-  // No stream sync here: the caller (Scheduler) syncs via sync_stream()
-  // right before post_processing_batch reads the logits.
+  // No stream sync here: the sampler runs on this same stream and the caller
+  // waits on the sampler's own completion event before reading the logits, so
+  // a full-stream drain would only serialize this step against later work.
   return base::error::Success();
 }
 

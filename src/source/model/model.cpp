@@ -61,12 +61,21 @@ void BatchScratch::ensure(int32_t batch, int32_t hidden_dim, int32_t dim, int32_
   // Fused gate/up FFN output [batch, 2*ffn_dim], same reasoning.
   w13_out = tensor::Tensor(dtype, batch, 2 * ffn_dim, true, alloc);
 
-  auto alloc_cpu = base::CPUDeviceAllocatorFactory::get_instance();
-  input_ids = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc_cpu);
-  positions = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc_cpu);
+  // Host staging for the captured H2D upload nodes (tokens / positions /
+  // block table). Page-locked on CUDA so each graph replay's uploads are real
+  // DMAs; with pageable staging the driver stages through a bounce buffer and
+  // blocks the replaying thread for the duration of every copy.
+  auto alloc_host = (device == base::DeviceType::kDeviceCUDA)
+                        ? std::shared_ptr<base::DeviceAllocator>(
+                              base::PinnedCPUDeviceAllocatorFactory::get_instance())
+                        : std::shared_ptr<base::DeviceAllocator>(
+                              base::CPUDeviceAllocatorFactory::get_instance());
+  input_ids = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc_host);
+  positions = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc_host);
   block_table = tensor::Tensor(base::DataType::kDataTypeInt32, batch, block_table_stride,
-                               true, alloc_cpu);
-  input_token_num = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc_cpu);
+                               true, alloc_host);
+  input_token_num = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true,
+                                   base::CPUDeviceAllocatorFactory::get_instance());
 
   if (device == base::DeviceType::kDeviceCUDA) {
     // Sized for the fp32 split-KV partials (2x the bf16 (o | m | l) footprint)
@@ -155,6 +164,11 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
       }
     }
     if (evict_batch >= 0 && evict_batch != batch) {
+      // The evicted entry's captured graphs bake in the addresses of its
+      // scratch — including the pinned host staging its H2D copy nodes read
+      // from — and a replay may still be queued on the stream. Drain before
+      // the buffers are released. Rare path (only past 16 live batch sizes).
+      sync_stream();
       decode_graph_pool_.erase(evict_batch);
     }
   }
@@ -641,12 +655,17 @@ std::vector<int32_t> Model::post_processing_batch(const tensor::Tensor& logits) 
   if (encode_layer_ && encode_layer_->vocab_size() > 0) {
     sample_vocab = std::min(sample_vocab, encode_layer_->vocab_size());
   }
+  // Sample on the model's stream — the same stream the LM head wrote the
+  // logits on. The sampler orders itself after the forward and waits for its
+  // own D2H event, so callers must NOT drain the stream first (that only adds
+  // a host round trip between the forward and the argmax).
+  void* stream = cuda_config_ ? cuda_config_->stream : nullptr;
   if (logits.data_type() == base::DataType::kDataTypeBF16) {
     sampler_->sample_batch_bf16(logits.ptr<uint16_t>(), vocab_size, sample_vocab, batch,
-                                tokens.data(), nullptr);
+                                tokens.data(), stream);
   } else {
     sampler_->sample_batch(logits.ptr<float>(), vocab_size, sample_vocab, batch, tokens.data(),
-                           nullptr);
+                           stream);
   }
   return tokens;
 }
@@ -704,6 +723,9 @@ void Model::resize_internal_kv_cache(int32_t max_seq_len) {
   // re-captures against the resized cache. Cheap: resize happens at
   // benchmark setup time, not per decode step.
   if (!decode_graph_pool_.empty()) {
+    // A queued replay may still read the old cache or this entry's pinned
+    // staging; drain before dropping the buffers. Setup-time path only.
+    sync_stream();
     decode_graph_pool_.clear();
   }
 

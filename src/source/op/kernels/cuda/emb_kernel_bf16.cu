@@ -26,13 +26,6 @@ __global__ void emb_kernel_bf16_kernel(int32_t vocab_size, int32_t token_num,
 
 void emb_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight,
                         const tensor::Tensor& output, int32_t vocab_size, void* stream) {
-  // Shallow copy shares the buffer when the tokens already live on the
-  // device (CUDA-Graph path); host tokens are cloned and uploaded once.
-  tensor::Tensor input_cu = input;
-  if (input.device_type() != base::DeviceType::kDeviceCUDA) {
-    input_cu = input.clone();
-    input_cu.to_cuda();
-  }
   const int32_t input_num = static_cast<int32_t>(input.size());
   const int32_t weight_dim = weight.get_dim(1);
   CHECK(weight.device_type() == output.device_type());
@@ -40,11 +33,37 @@ void emb_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight,
 
   constexpr int32_t thread_num = 128;
   int32_t grid_size = input_num;
-  int32_t* in_ptr = input_cu.ptr<int32_t>();
+  cudaStream_t stream_ = static_cast<cudaStream_t>(stream);
+
+  // Host token ids (prefill / mixed path): upload them into a pooled device
+  // buffer on the caller's stream. The previous clone() + to_cuda() pair
+  // allocated a host copy, copied host-to-host, issued the H2D on the legacy
+  // default stream and freed the copy — three host-side operations per step
+  // for a few KB of ids, with the calling thread blocked through the upload.
+  // The source must stay alive until the stream drains, the same contract as
+  // forward_batch's other H2D staging copies (the device buffer is released to
+  // the pool immediately, but any reuse is stream-ordered after this kernel).
+  const int32_t* in_ptr = input.ptr<int32_t>();
+  if (input.device_type() != base::DeviceType::kDeviceCUDA) {
+    tensor::Tensor tokens_cu(base::DataType::kDataTypeInt32, input_num, true,
+                             base::CUDADeviceAllocatorFactory::get_instance());
+    CHECK(tokens_cu.ptr<int32_t>() != nullptr)
+        << "Failed to stage the embedding input tokens on the device";
+    const size_t bytes = static_cast<size_t>(input_num) * sizeof(int32_t);
+    if (stream_) {
+      CHECK_EQ(cudaMemcpyAsync(tokens_cu.ptr<int32_t>(), input.ptr<int32_t>(), bytes,
+                               cudaMemcpyHostToDevice, stream_),
+               cudaSuccess);
+    } else {
+      CHECK_EQ(cudaMemcpy(tokens_cu.ptr<int32_t>(), input.ptr<int32_t>(), bytes,
+                          cudaMemcpyHostToDevice),
+               cudaSuccess);
+    }
+    in_ptr = tokens_cu.ptr<int32_t>();
+  }
   const __nv_bfloat16* wei_ptr = weight.ptr<__nv_bfloat16>();
   __nv_bfloat16* out_ptr = const_cast<__nv_bfloat16*>(output.ptr<__nv_bfloat16>());
-  if (stream) {
-    cudaStream_t stream_ = static_cast<cudaStream_t>(stream);
+  if (stream_) {
     emb_kernel_bf16_kernel<<<grid_size, thread_num, 0, stream_>>>(
         vocab_size, input_num, weight_dim, in_ptr, wei_ptr, out_ptr);
     CUDA_KERNEL_CHECK();

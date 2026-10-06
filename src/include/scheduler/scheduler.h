@@ -138,13 +138,23 @@ class Scheduler {
   // runs dry.
   std::unique_ptr<PrefixCache> prefix_cache_;
   tensor::Tensor logits_;  // preallocated [max_batch_size, vocab_size], model compute dtype
+  // Per-step batch staging: the H2D sources for input_ids / positions /
+  // block_table, sized once at the row cap and reshaped per step (a reshaped
+  // copy shares the buffer, so nothing is reallocated on the hot path). On
+  // CUDA these are page-locked: a pageable source makes every upload in
+  // forward_batch a driver-staged copy that blocks the calling thread, and
+  // page-locking per step (cudaHostAlloc/cudaFreeHost) would cost as much as
+  // it saves. Persistent for exactly that reason.
+  tensor::Tensor host_input_ids_;    // [row_cap] int32, pinned on CUDA
+  tensor::Tensor host_positions_;    // [row_cap] int32, pinned on CUDA
+  tensor::Tensor host_block_table_;  // [row_cap, table_stride] int32, pinned on CUDA
   // Prefill row map for mixed steps: seq_row_start[i] is the first batch row of
   // the i-th prefill sequence (prefill rows are contiguous per sequence), the
   // last entry is the batch size (sentinel). The attention layer dispatches the
   // prefill rows to the prefill kernel by these groups. Host staging + device
   // copy live here (not in Model) because the Scheduler owns the row order;
-  // both are sized lazily to row_cap_for(max_batch_size_) + 2 entries and
-  // reused every step (one small H2D per mixed step).
+  // both are sized at row_cap_for(max_batch_size_) + 2 entries and reused
+  // every step (one small H2D per mixed step).
   tensor::Tensor seq_row_start_host_;
   tensor::Tensor seq_row_start_cu_;
   // Sequences holding a row in the batch currently being built: preempting one

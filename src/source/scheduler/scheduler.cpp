@@ -152,6 +152,27 @@ Scheduler::Scheduler(std::shared_ptr<model::Model> model,
   // rows), not just max_batch decode rows — prefill-only forward_batch calls
   // never use the buffer, but mixed steps compute the LM head over every row.
   logits_ = tensor::Tensor(logits_dtype, row_cap_for(max_batch_size), vocab_size, true, alloc);
+
+  // Pinned per-step batch staging (see the members). CUDA only: cudaHostAlloc
+  // needs a CUDA context, and a CPU run has no device copy to speed up.
+  const std::shared_ptr<base::DeviceAllocator> host_alloc =
+      model_->device_type() == base::DeviceType::kDeviceCUDA
+          ? std::shared_ptr<base::DeviceAllocator>(
+                base::PinnedCPUDeviceAllocatorFactory::get_instance())
+          : std::shared_ptr<base::DeviceAllocator>(
+                base::CPUDeviceAllocatorFactory::get_instance());
+  const int host_rows = row_cap_for(max_batch_size_);
+  host_input_ids_ = tensor::Tensor(base::DataType::kDataTypeInt32, host_rows, true, host_alloc);
+  host_positions_ = tensor::Tensor(base::DataType::kDataTypeInt32, host_rows, true, host_alloc);
+  host_block_table_ = tensor::Tensor(base::DataType::kDataTypeInt32, host_rows,
+                                     kv_manager_->max_blocks_per_seq(), true, host_alloc);
+  seq_row_start_host_ = tensor::Tensor(base::DataType::kDataTypeInt32, host_rows + 2, true,
+                                       host_alloc);
+  if (host_input_ids_.is_empty() || host_positions_.is_empty() ||
+      host_block_table_.is_empty() || seq_row_start_host_.is_empty()) {
+    LOG(FATAL) << "[SCHED] Failed to allocate the pinned batch staging buffers ("
+               << host_rows << " rows)";
+  }
   const bool logits_ok =
       logits_dtype == base::DataType::kDataTypeBF16 ? logits_.ptr<uint16_t>() != nullptr
                                                     : logits_.ptr<float>() != nullptr;
@@ -163,6 +184,17 @@ Scheduler::Scheduler(std::shared_ptr<model::Model> model,
 }
 
 Scheduler::~Scheduler() {
+  // The persistent batch staging tensors (input ids / positions / block table
+  // / prefill row map) are pinned on CUDA and are the source of this
+  // scheduler's asynchronous H2D uploads. Drain the model stream before the
+  // destructor body returns and those buffers are released, so no queued
+  // upload is ever left reading freed memory. Runs at teardown only; a normal
+  // run has long since drained at the last sampling event, and an aborted run
+  // (force_finish_all) can otherwise end with a prefill's uploads still
+  // queued.
+  if (model_) {
+    model_->sync_stream();
+  }
 #ifdef USE_PAGED_ATTENTION
   // The block pool is pure bookkeeping: refcount leaks (or double frees)
   // silently strand blocks. Verify the invariant before the pool dies.
@@ -768,12 +800,8 @@ void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
   // pointer changes.
   int num_prefill_seqs = 0;
   if (any_prefill) {
-    if (seq_row_start_host_.is_empty() || seq_row_start_host_.get_dim(0) < batch + 1) {
-      const int cap = row_cap_for(max_batch_size_) + 2;
-      seq_row_start_host_ =
-          tensor::Tensor(base::DataType::kDataTypeInt32, cap, true,
-                         base::CPUDeviceAllocatorFactory::get_instance());
-    }
+    CHECK_GE(seq_row_start_host_.get_dim(0), batch + 1)
+        << "seq_row_start staging is undersized for batch=" << batch;
     int32_t* row_start = seq_row_start_host_.ptr<int32_t>();
     row_start[0] = num_decode_rows;
     num_prefill_seqs = 1;
@@ -785,16 +813,21 @@ void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
     row_start[num_prefill_seqs] = batch;  // sentinel
   }
 
-  auto alloc_cpu = base::CPUDeviceAllocatorFactory::get_instance();
-  tensor::Tensor input_ids(base::DataType::kDataTypeInt32, batch, true, alloc_cpu);
-  tensor::Tensor positions(base::DataType::kDataTypeInt32, batch, true, alloc_cpu);
+  // Per-step H2D sources over the persistent pinned staging (see the members):
+  // reshape only touches the copy's shape metadata, the storage is reused.
+  const int32_t table_stride = kv_manager_->max_blocks_per_seq();
+  CHECK_LE(batch, host_input_ids_.get_dim(0));
+  tensor::Tensor input_ids = host_input_ids_;
+  tensor::Tensor positions = host_positions_;
+  tensor::Tensor block_table = host_block_table_;
+  input_ids.reshape({batch});
+  positions.reshape({batch});
   // block_table: per-row physical block ids (paged) or slot ids (continuous).
 #ifdef USE_PAGED_ATTENTION
-  const int32_t table_stride = kv_manager_->max_blocks_per_seq();
-  tensor::Tensor block_table(base::DataType::kDataTypeInt32, batch, table_stride, true, alloc_cpu);
+  block_table.reshape({batch, table_stride});
 #else
-  const int32_t table_stride = 1;
-  tensor::Tensor block_table(base::DataType::kDataTypeInt32, batch, true, alloc_cpu);
+  block_table.reshape({batch});
+  (void)table_stride;
 #endif
 
   for (int i = 0; i < batch; ++i) {
@@ -875,7 +908,7 @@ void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
                                       kv_manager_->key_cache(),
                                       kv_manager_->value_cache(),
                                       logits_view);
-    auto h_sync = std::chrono::steady_clock::now();
+    auto h_launched = std::chrono::steady_clock::now();
     if (!status) {
       force_finish_all("batch decode failed");
       return;
@@ -883,29 +916,18 @@ void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
 
     // Post-processing on GPU: the sampler (ArgmaxSampler) launches a CUDA
     // kernel to find the argmax index directly on the GPU, then copies only
-    // the result (a single index) back to the host.  Do NOT call logits.to_cpu()
-    // here — that would replace the GPU pointer with a CPU pointer, and the
-    // sampler's CUDA kernel would attempt to read host memory from the device,
-    // causing an illegal memory access and corrupting the CUDA context.
-    // The sampling kernels run on the default stream, so the model stream
-    // must be drained before they read the logits.
-    model_->sync_stream();
-    auto h_sample = std::chrono::steady_clock::now();
+    // the result (one index per row) back to the host. Do NOT call
+    // logits.to_cpu() here — that would replace the GPU pointer with a CPU
+    // pointer, and the sampler's CUDA kernel would attempt to read host memory
+    // from the device, causing an illegal memory access and corrupting the
+    // CUDA context. No stream sync here either: the sampler runs on the model
+    // stream (ordered right after the decode kernels) and waits only on its
+    // own D2H event.
     auto next_tokens = model_->post_processing_batch(logits_view);
+    auto h_sampled = std::chrono::steady_clock::now();
 
     // Update sequences
-    auto now = std::chrono::steady_clock::now();
-    if (hostlog && hostlog_count++ < 3000) {
-      double d_build = std::chrono::duration<double, std::milli>(h_sync - h_launch).count();
-      double d_wait = std::chrono::duration<double, std::milli>(h_sample - h_sync).count();
-      double d_post = std::chrono::duration<double, std::milli>(now - h_sample).count();
-      static auto t_first = now;
-      double d_cad = std::chrono::duration<double, std::milli>(now - t_first).count();
-      fprintf(stderr,
-              "[HOSTLOG] dec=%d t=%.1f launch_gap=%.3f gpu_wait=%.3f sample_post=%.3f "
-              "ms\n",
-              batch, d_cad, d_build, d_wait, d_post);
-    }
+    auto now = h_sampled;
     for (int i = 0; i < batch; ++i) {
       Sequence* seq = ordered[i]->seq;
       if (seq->generated_tokens.empty()) {
@@ -919,6 +941,18 @@ void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
       seq->last_token_time = now;
       seq->generated_tokens.push_back(next_tokens[i]);
       seq->num_generated_tokens++;
+    }
+    if (hostlog && hostlog_count++ < 3000) {
+      auto h_bookkept = std::chrono::steady_clock::now();
+      double d_build = std::chrono::duration<double, std::milli>(h_launched - h_launch).count();
+      double d_sample = std::chrono::duration<double, std::milli>(h_sampled - h_launched).count();
+      double d_post = std::chrono::duration<double, std::milli>(h_bookkept - h_sampled).count();
+      static auto t_first = h_sampled;
+      double d_cad = std::chrono::duration<double, std::milli>(h_sampled - t_first).count();
+      fprintf(stderr,
+              "[HOSTLOG] dec=%d t=%.1f launch_gap=%.3f sample_wait=%.3f bookkeep=%.3f "
+              "ms\n",
+              batch, d_cad, d_build, d_sample, d_post);
     }
   } else {
     // Prefill step (pure, or mixed with decode rows): plain forward_batch —
@@ -951,7 +985,8 @@ void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
       tensor::Tensor logits_view(logits_dtype, num_decode_rows, model_->vocab_size(), false,
                                  nullptr, logits_ptr);
       logits_view.set_device_type(model_->device_type());
-      model_->sync_stream();
+      // Sampling orders itself on the model stream (see the pure-decode
+      // branch above); the forward/argmax pair needs no host-side drain.
       auto next_tokens = model_->post_processing_batch(logits_view);
 
       auto now = std::chrono::steady_clock::now();

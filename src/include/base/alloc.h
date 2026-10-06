@@ -86,6 +86,35 @@ class CPUDeviceAllocatorFactory {
   static std::shared_ptr<CPUDeviceAllocator> instance;
 };
 
+// Page-locked (pinned) host memory. Tensors built on it behave as ordinary
+// CPU tensors (same device type, index<>/ptr<> work as usual), but the
+// storage is page-locked, so cudaMemcpyAsync to/from it is a true
+// asynchronous DMA. With pageable memory the driver first copies through an
+// internal bounce buffer, which blocks the calling thread for the duration of
+// the transfer — making the "async" staging copies on the decode hot path
+// effectively synchronous.
+class PinnedCPUDeviceAllocator : public DeviceAllocator {
+ public:
+  explicit PinnedCPUDeviceAllocator();
+
+  void* allocate(size_t byte_size) const override;
+
+  void release(void* ptr) const override;
+};
+
+class PinnedCPUDeviceAllocatorFactory {
+ public:
+  static std::shared_ptr<PinnedCPUDeviceAllocator> get_instance() {
+    if (instance == nullptr) {
+      instance = std::make_shared<PinnedCPUDeviceAllocator>();
+    }
+    return instance;
+  }
+
+ private:
+  static std::shared_ptr<PinnedCPUDeviceAllocator> instance;
+};
+
 class CUDADeviceAllocatorFactory {
  public:
   static std::shared_ptr<CUDADeviceAllocator> get_instance() {

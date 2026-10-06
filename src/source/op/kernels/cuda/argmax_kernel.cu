@@ -1,8 +1,8 @@
 #include <base/cuda_check.h>
-#include "../kernels_interface.h"
 #include "argmax_kernel.cuh"
-#include "tensor/tensor.h"
 #include <cfloat>
+#include <cstdint>
+
 namespace kernel {
 __forceinline__ __device__ void warp_reduce_argmax(float& val, size_t& ptr) {
   float tmp_val;
@@ -59,104 +59,80 @@ __forceinline__ __device__ float bf16_bits_to_fp32(uint16_t bits) {
   return conv.f;
 }
 
-__global__ void argmax_kernel(const uint16_t* input_ptr, size_t size, size_t* output_idx) {
+// Keep the (value, lowest index) maximum seen so far. A NaN value compares
+// false both ways, so it is skipped — same as the plain `v > max` compare this
+// replaced. `best_idx` seeds to SIZE_MAX so the first real value always wins.
+__forceinline__ __device__ void argmax_update(uint16_t bits, size_t idx, float& best,
+                                              size_t& best_idx) {
+  const float v = bf16_bits_to_fp32(bits);
+  if (v > best || (v == best && idx < best_idx)) {
+    best = v;
+    best_idx = idx;
+  }
+}
+
+constexpr int kArgmaxThreads = 1024;
+constexpr int kArgmaxVecElems = 8;  // one uint4 = 8 x bf16
+
+// One block per row. Each thread streams a strided slice of the row through
+// 8-wide vector loads, then the block reduces (value, index) pairs with the
+// same deterministic tie-break as before (lowest index wins).
+//
+// The previous shape — 512 threads, one scalar 2-byte load per iteration,
+// ~297 serial iterations per thread — was latency-bound at ~170us per step
+// regardless of batch size: the row's 300 KB were read by a single block
+// issuing 64 B per warp instruction, with the dependent max chain exposing
+// roughly one DRAM round trip per iteration. Vectorized loads plus 1024
+// threads cut the iteration count ~16x and the instruction count 8x.
+__global__ void argmax_kernel_bf16(const uint16_t* __restrict__ logits, size_t row_stride,
+                                   size_t size, int32_t* __restrict__ out_idx) {
   __shared__ size_t shared_max_ptr[32];
   __shared__ float shared_max_value[32];
-  uint32_t tid = threadIdx.x;
-  // Do NOT early-return: block_reduce_argmax uses a full-mask __ballot_sync,
-  // which requires every thread in the block to participate. Guard the reads
-  // instead so the kernel is correct for any `size` (incl. size < blockDim).
-  bool valid = tid < size;
-  size_t max_index = threadIdx.x;
-  float max_value = valid ? bf16_bits_to_fp32(input_ptr[max_index]) : -FLT_MAX;
-  for (size_t i = tid; i < size; i += blockDim.x) {
-    const float v = bf16_bits_to_fp32(input_ptr[i]);
-    if (v > max_value) {
-      max_index = i;
-      max_value = v;
+  const uint16_t* row = logits + static_cast<size_t>(blockIdx.x) * row_stride;
+
+  float best = -FLT_MAX;
+  size_t best_idx = SIZE_MAX;
+  size_t done = 0;  // elements covered by the vector loop
+
+  // Vector path: 8 bf16 per thread per iteration. Needs a 16B-aligned row
+  // start (row_stride is the config vocab, usually a multiple of 8 — but not
+  // guaranteed, so misaligned rows fall through to the scalar loop).
+  if ((reinterpret_cast<uintptr_t>(row) & 15u) == 0) {
+    const uint4* row_vec = reinterpret_cast<const uint4*>(row);
+    const size_t groups = size / kArgmaxVecElems;  // full 8-element groups
+    for (size_t g = threadIdx.x; g < groups; g += blockDim.x) {
+      const uint4 u = row_vec[g];
+      const size_t base = g * kArgmaxVecElems;
+      const uint32_t words[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+      for (int k = 0; k < 4; ++k) {
+        argmax_update(static_cast<uint16_t>(words[k] & 0xFFFFu), base + 2 * k, best, best_idx);
+        argmax_update(static_cast<uint16_t>(words[k] >> 16), base + 2 * k + 1, best, best_idx);
+      }
     }
+    done = groups * kArgmaxVecElems;
   }
 
-  block_reduce_argmax(max_value, max_index, shared_max_value, shared_max_ptr);
+  // Scalar tail (or the whole row when the vector path did not apply).
+  for (size_t i = done + threadIdx.x; i < size; i += blockDim.x) {
+    argmax_update(row[i], i, best, best_idx);
+  }
+
+  block_reduce_argmax(best, best_idx, shared_max_value, shared_max_ptr);
   __syncthreads();
   if (threadIdx.x == 0) {
-    *output_idx = max_index;
+    // SIZE_MAX = the row held no comparable value (size == 0 or all-NaN
+    // logits); token 0 is the only sane fallback.
+    out_idx[blockIdx.x] = (best_idx == SIZE_MAX) ? 0 : static_cast<int32_t>(best_idx);
   }
 }
 
-__global__ void argmax_kernel_batch(const uint16_t* input_ptr, size_t row_stride, size_t size,
-                                    int32_t* output_idx) {
-  __shared__ size_t shared_max_ptr[32];
-  __shared__ float shared_max_value[32];
-  uint32_t tid = threadIdx.x;
-  // Same rule as argmax_kernel: no early return (full-mask ballot),
-  // guard the reads instead.
-  const uint16_t* row = input_ptr + blockIdx.x * row_stride;
-  bool valid = tid < size;
-  size_t max_index = threadIdx.x;
-  float max_value = valid ? bf16_bits_to_fp32(row[max_index]) : -FLT_MAX;
-  for (size_t i = tid; i < size; i += blockDim.x) {
-    const float v = bf16_bits_to_fp32(row[i]);
-    if (v > max_value) {
-      max_index = i;
-      max_value = v;
-    }
+void argmax_kernel_launch(const uint16_t* logits, size_t row_stride, size_t size, int32_t batch,
+                          int32_t* out_idx, cudaStream_t stream) {
+  if (batch <= 0) {
+    return;
   }
-
-  block_reduce_argmax(max_value, max_index, shared_max_value, shared_max_ptr);
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    // Token indices are int32 in this codebase; max_index < size <= 2^31.
-    output_idx[blockIdx.x] = static_cast<int32_t>(max_index);
-  }
-}
-
-size_t argmax_kernel_cu(const uint16_t* input_ptr, size_t size, void* stream) {
-  std::shared_ptr<base::DeviceAllocator> alloc_cu =
-      base::CUDADeviceAllocatorFactory::get_instance();
-  size_t* index = static_cast<size_t*>(alloc_cu->allocate(sizeof(size_t)));
-  CHECK(index != nullptr) << "Failed to allocate the argmax index buffer";
-  size_t output_index = 0;
-  if (!stream) {
-    argmax_kernel<<<1, 512>>>(input_ptr, size, index);
-    CUDA_KERNEL_CHECK();
-    cudaMemcpy(&output_index, index, sizeof(size_t), cudaMemcpyDeviceToHost);
-  } else {
-    cudaStream_t stream_ = static_cast<cudaStream_t>(stream);
-    argmax_kernel<<<1, 512, 0, stream_>>>(input_ptr, size, index);
-    CUDA_KERNEL_CHECK();
-    cudaMemcpyAsync(&output_index, index, sizeof(size_t), cudaMemcpyDeviceToHost, stream_);
-    // The async copy is still in flight when this function returns the host
-    // value; sync before reading output_index.
-    cudaStreamSynchronize(stream_);
-  }
-  // Back to the pool — a live allocation per generated token would grow it
-  // without bound (nothing else ever releases these blocks).
-  alloc_cu->release(index);
-  return output_index;
-}
-
-void argmax_kernel_cu_batch(const uint16_t* input_ptr, size_t row_stride, size_t size,
-                            int32_t batch, int32_t* out_tokens, void* stream) {
-  std::shared_ptr<base::DeviceAllocator> alloc_cu =
-      base::CUDADeviceAllocatorFactory::get_instance();
-  int32_t* dev_idx =
-      static_cast<int32_t*>(alloc_cu->allocate(static_cast<size_t>(batch) * sizeof(int32_t)));
-  CHECK(dev_idx != nullptr) << "Failed to allocate device argmax index buffer";
-
-  if (stream) {
-    cudaStream_t stream_ = static_cast<cudaStream_t>(stream);
-    argmax_kernel_batch<<<batch, 512, 0, stream_>>>(input_ptr, row_stride, size, dev_idx);
-    CUDA_KERNEL_CHECK();
-    cudaMemcpyAsync(out_tokens, dev_idx, static_cast<size_t>(batch) * sizeof(int32_t),
-                    cudaMemcpyDeviceToHost, stream_);
-    cudaStreamSynchronize(stream_);
-  } else {
-    argmax_kernel_batch<<<batch, 512>>>(input_ptr, row_stride, size, dev_idx);
-    CUDA_KERNEL_CHECK();
-    cudaMemcpy(out_tokens, dev_idx, static_cast<size_t>(batch) * sizeof(int32_t),
-               cudaMemcpyDeviceToHost);
-  }
-  alloc_cu->release(dev_idx);  // one block per decode step, otherwise pooled forever
+  argmax_kernel_bf16<<<batch, kArgmaxThreads, 0, stream>>>(logits, row_stride, size, out_idx);
+  CUDA_KERNEL_CHECK();
 }
 }  // namespace kernel
