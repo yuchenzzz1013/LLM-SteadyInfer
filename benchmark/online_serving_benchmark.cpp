@@ -73,10 +73,11 @@ struct Args {
   double ttft_sla_ms = -1;   // TTFT SLA 阈值;<=0 禁用
   double tpot_sla_ms = -1;   // TPOT SLA 阈值;<=0 禁用
 
-  // 前缀缓存(默认打开,与线上 serving 配置一致)。请求彼此独立时命中率低,
-  // 打开后测到的是带上缓存后的真实排队/占用;要看净收益用
-  // prefix_caching_benchmark 的 A/B,要回到底线口径用 --prefix-cache 0。
-  int prefix_cache = 1;
+  // 前缀缓存(默认关闭)。请求彼此独立时命中率极低,开着只会带来哈希开销、
+  // 并把已完成请求的 prompt 块钉在池里。要看净收益用
+  // prefix_caching_benchmark 的 A/B;需要按线上 serving 口径跑时用
+  // --prefix-cache 1 打开。
+  int prefix_cache = 0;
 };
 
 // 解析浮点参数,支持 "inf"(无穷大 → -1)
@@ -92,16 +93,21 @@ static Args parse_args(int argc, char** argv) {
   //   [output_csv] [iterations]
   bool positional = argc > 1 && std::string(argv[1]).rfind("--", 0) != 0;
   if (positional) {
-    if (argc > 1) a.model_dir = argv[1];
-    if (argc > 2) a.tokenizer = argv[2];
-    if (argc > 3) a.num_requests = to_int(argv[3]);
-    if (argc > 4) {
+    // 只取开头连续的、不以 "--" 开头的参数:后面接的 --flag 交给下面的 flag
+    // 解析。否则 `... 512 32 256 --prefix-cache 1` 会把 "--prefix-cache" 当成
+    // output_csv、把它的值当成 iterations 解析报错。
+    int n = 0;
+    while (1 + n < argc && std::string(argv[1 + n]).rfind("--", 0) != 0) ++n;
+    if (n > 0) a.model_dir = argv[1];
+    if (n > 1) a.tokenizer = argv[2];
+    if (n > 2) a.num_requests = to_int(argv[3]);
+    if (n > 3) {
       a.max_batch = to_int(argv[4]);
       a.max_batch_explicit = true;
     }
-    if (argc > 5) a.max_gen = to_int(argv[5]);
-    if (argc > 6) a.output_csv = argv[6];
-    if (argc > 7) a.iterations = to_int(argv[7]);
+    if (n > 4) a.max_gen = to_int(argv[5]);
+    if (n > 5) a.output_csv = argv[6];
+    if (n > 6) a.iterations = to_int(argv[7]);
   }
 
   // --flag 覆盖(两种模式均生效;--flag 优先于位置参数)
@@ -196,9 +202,10 @@ static void print_usage(const char* prog) {
       << "                         (默认 0 = 不限制)\n"
       << "  --ttft-sla-ms <ms>     TTFT SLA 阈值,用于 goodput 计算(默认关闭)\n"
       << "  --tpot-sla-ms <ms>     TPOT SLA 阈值,用于 goodput 计算(默认关闭)\n"
-      << "  --prefix-cache <0|1>   前缀缓存(默认 1 = 打开)。请求彼此独立时命中率\n"
-      << "                         低,打开后测到的是带上缓存后的真实排队与池占用;\n"
-      << "                         要看净收益用 prefix_caching_benchmark 的 A/B\n"
+      << "  --prefix-cache <0|1>   前缀缓存(默认 0 = 关闭)。请求彼此独立时命中率\n"
+      << "                         极低,开着只会把已完成请求的 prompt 块钉在池里并\n"
+      << "                         计入哈希开销;要看净收益用\n"
+      << "                         prefix_caching_benchmark 的 A/B\n"
       << "  --output-csv <path>    结果 CSV 路径(默认 results/serving_metrics.csv)\n";
 }
 
@@ -320,9 +327,9 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
       max_batch = requested_batch;
     }
   }
-  // 前缀缓存默认打开(--prefix-cache 0 关闭):线上 serving 配置就是开着的,
-  // 排队/占用/吞吐都应当带上它的开销与被钉住的池块。请求独立时命中率低,
-  // 缓存收益本身由 prefix_caching_benchmark 的 A/B 回答。
+  // 前缀缓存默认关闭(--prefix-cache 1 打开):请求独立时命中率极低,开着只会
+  // 把已完成请求的 prompt 块钉在池里、并把哈希开销计入延迟。缓存收益本身由
+  // prefix_caching_benchmark 的 A/B 回答。
   Scheduler sched(model, max_batch, max_total_seq_len, args.max_gen, block_size,
                   /*enable_prefix_cache=*/args.prefix_cache != 0);
 

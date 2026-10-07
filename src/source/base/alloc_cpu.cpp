@@ -61,6 +61,4 @@ void PinnedCPUDeviceAllocator::release(void* ptr) const {
   }
 }
 
-std::shared_ptr<CPUDeviceAllocator> CPUDeviceAllocatorFactory::instance = nullptr;
-std::shared_ptr<PinnedCPUDeviceAllocator> PinnedCPUDeviceAllocatorFactory::instance = nullptr;
 }  // namespace base

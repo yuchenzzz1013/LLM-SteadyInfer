@@ -65,11 +65,11 @@ struct Args {
   int seed = 42;  // 已弃用:数据集改为顺序读取,不再抽样;保留仅为兼容命令行
   int warmup_requests = 0;   // 预热请求数,0 = max_batch
   int warmup_iterations = 3; // 预热轮数(每轮完整 prefill + decode)
-  // 前缀缓存(默认打开,与线上 serving 配置一致)。压测数据是互不相干的独立
-  // 问题,命中率通常偏低,所以这里测的是"开着缓存时的真实吞吐/占用":
-  // 哈希开销、被钉住的缓存块都会计入。要看缓存的净收益用
-  // prefix_caching_benchmark 的 A/B;要回到底线口径用 --prefix-cache 0。
-  int prefix_cache = 1;
+  // 前缀缓存(默认关闭)。压测数据是互不相干的独立问题,命中率极低,开着
+  // 只会带来哈希开销、并把已完成请求的 prompt 块钉在池里(计入
+  // kv_cache_frag_global)。要看缓存的净收益用 prefix_caching_benchmark 的
+  // A/B;需要按线上 serving 口径跑时用 --prefix-cache 1 打开。
+  int prefix_cache = 0;
 };
 
 static Args parse_args(int argc, char** argv) {
@@ -79,13 +79,18 @@ static Args parse_args(int argc, char** argv) {
   //   [output_csv] [iterations]
   bool positional = argc > 1 && std::string(argv[1]).rfind("--", 0) != 0;
   if (positional) {
-    if (argc > 1) a.model_dir = argv[1];
-    if (argc > 2) a.tokenizer = argv[2];
-    if (argc > 3) a.num_requests = to_int(argv[3]);
-    if (argc > 4) a.max_batch = to_int(argv[4]);
-    if (argc > 5) a.max_gen = to_int(argv[5]);
-    if (argc > 6) a.output_csv = argv[6];
-    if (argc > 7) a.iterations = to_int(argv[7]);
+    // 只取开头连续的、不以 "--" 开头的参数:后面接的 --flag 交给下面的 flag
+    // 解析。否则 `... 512 32 256 --prefix-cache 1` 会把 "--prefix-cache" 当成
+    // output_csv、把它的值当成 iterations 解析报错。
+    int n = 0;
+    while (1 + n < argc && std::string(argv[1 + n]).rfind("--", 0) != 0) ++n;
+    if (n > 0) a.model_dir = argv[1];
+    if (n > 1) a.tokenizer = argv[2];
+    if (n > 2) a.num_requests = to_int(argv[3]);
+    if (n > 3) a.max_batch = to_int(argv[4]);
+    if (n > 4) a.max_gen = to_int(argv[5]);
+    if (n > 5) a.output_csv = argv[6];
+    if (n > 6) a.iterations = to_int(argv[7]);
   }
 
   // --flag 覆盖(两种模式均生效;--flag 优先于位置参数)
@@ -157,9 +162,10 @@ static void print_usage(const char* prog) {
       << "  --warmup-requests <N>  预热请求数,0 = max_batch(默认 0)\n"
       << "  --warmup-iterations <N> 预热轮数,每轮跑完整 prefill+decode 以稳定 GPU\n"
       << "                         频率并预构建 CUDA graph(默认 3)\n"
-      << "  --prefix-cache <0|1>   前缀缓存(默认 1 = 打开)。压测数据是互相独立的\n"
-      << "                         问题,命中率通常很低,打开后测到的是带上缓存后的\n"
-      << "                         真实开销与池占用;要看净收益用 prefix_caching_benchmark\n"
+      << "  --prefix-cache <0|1>   前缀缓存(默认 0 = 关闭)。压测数据是互相独立的\n"
+      << "                         问题,命中率极低,开着只会把已完成请求的 prompt 块\n"
+      << "                         钉在池里并计入哈希开销;要看净收益用\n"
+      << "                         prefix_caching_benchmark 的 A/B\n"
       << "  --output-csv <path>    结果 CSV 路径(默认 results/metrics.csv)\n";
 }
 
@@ -234,10 +240,10 @@ static RunMetrics run_once(const std::shared_ptr<model::Model>& model,
   // 分页块大小按工作负载平均 prompt 长度自适应(短文本 8/长文本 32/默认 16)。
   const long long avg_prompt_len =
       prompt_tokens.empty() ? 0 : prompt_len_sum / static_cast<long long>(prompt_tokens.size());
-  // 前缀缓存默认打开(可用 --prefix-cache 0 关掉):线上 serving 配置就是开着
-  // 的,压测应当带上它的开销与被钉住的池块。离线数据是互不相干的独立问题,
-  // 命中率低,所以这里测的不是缓存的收益(那由 prefix_caching_benchmark 的 A/B
-  // 回答),而是"开着缓存时的真实池占用与吞吐"。
+  // 前缀缓存默认关闭(可用 --prefix-cache 1 打开):离线数据是互不相干的独立
+  // 问题,命中率极低,开着只会带来哈希开销,并把已完成请求的 prompt 块钉在
+  // 池里(几乎全部计入 kv_cache_frag_global)。缓存收益由
+  // prefix_caching_benchmark 的 A/B 回答。
   Scheduler sched(model, max_batch, max_total_seq_len, max_gen_len,
                   Scheduler::resolve_block_size(avg_prompt_len),
                   /*enable_prefix_cache=*/enable_prefix_cache);

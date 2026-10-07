@@ -119,11 +119,11 @@ make -j$(nproc)
 `benchmark/offline_batch_benchmark.cpp`、`online_serving_benchmark.cpp`、
 `prefix_caching_benchmark.cpp`。
 
-Offline / Online 两个基准**默认打开前缀缓存**（与线上 serving 配置一致，`--prefix-cache 0`
-可关掉），CSV 里的 `enable_prefix_cache` 列与报告里的开关状态均取自 Scheduler 的实际状态，
+Offline / Online 两个基准**默认关闭前缀缓存**（`--prefix-cache 1` 可打开，与 Scheduler 的
+默认一致），CSV 里的 `enable_prefix_cache` 列与报告里的开关状态均取自 Scheduler 的实际状态，
 `LLAMA_ENABLE_PREFIX_CACHE` 环境变量强制覆盖时也会如实反映。压测数据是彼此独立的请求，
-命中率通常很低，所以这里量的是"开着缓存时的真实吞吐与池占用"；缓存的净收益看
-`prefix_caching_benchmark` 的 ON/OFF A/B。
+命中率极低，开着缓存只会把已完成请求的 prompt 块钉在池里并计入哈希开销（虚高的
+`kv_cache_frag_global` 就是这么来的）；缓存的净收益看 `prefix_caching_benchmark` 的 ON/OFF A/B。
 
 ### Offline Batch
 * Output Token Throughput

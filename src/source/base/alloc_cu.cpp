@@ -3,113 +3,185 @@
 #include "base/alloc.h"
 namespace base {
 
+namespace {
+// cudaMalloc hands out 256-byte aligned pointers; rounding requests up to that
+// keeps blocks of one region tiling it exactly.
+constexpr size_t kAlignment = 256;
+// Do not leave a splinter smaller than one alignment unit behind when
+// splitting a block.
+constexpr size_t kMinSplitBytes = kAlignment;
+// Never cache less than this much idle memory: the pool exists to absorb
+// per-step allocation spikes, so the waterline is at least 1GB even on small
+// cards (on large cards the 5%-of-total term dominates).
+constexpr size_t kMinIdleFlushBytes = 1024ull * 1024 * 1024;
+
+size_t round_up(size_t value, size_t alignment) {
+  return ((value + alignment - 1) / alignment) * alignment;
+}
+
+// cudaMalloc/cudaFree act on the calling thread's *current* device. Switch to
+// `device_id` for the duration of one pool operation and put the thread back
+// where it was: without the restore, reclaiming memory inside allocate() would
+// leave the thread on another device and the retried cudaMalloc would land
+// there while the pool booked the buffer under the original device.
+class DeviceGuard {
+ public:
+  explicit DeviceGuard(int device_id) {
+    int current = -1;
+    if (cudaGetDevice(&current) != cudaSuccess) {
+      cudaGetLastError();
+      return;
+    }
+    saved_ = current;
+    if (current != device_id) {
+      switched_ = (cudaSetDevice(device_id) == cudaSuccess);
+    }
+  }
+  ~DeviceGuard() {
+    if (switched_) {
+      cudaSetDevice(saved_);
+    }
+  }
+
+  DeviceGuard(const DeviceGuard&) = delete;
+  DeviceGuard& operator=(const DeviceGuard&) = delete;
+
+ private:
+  int saved_ = -1;
+  bool switched_ = false;
+};
+}  // namespace
+
 CUDADeviceAllocator::CUDADeviceAllocator() : DeviceAllocator(DeviceType::kDeviceCUDA) {}
 
-// Flush-idle threshold per device: max(total_mem * 5%, 1GB). Fixed 1GB is
-// wasteful on small (24GB) cards; on large cards the 5% floor keeps the pool
-// warm enough to absorb allocation spikes.
-size_t CUDADeviceAllocator::idle_flush_threshold(int device_id) const {
-  auto it = idle_thresholds_.find(device_id);
-  if (it != idle_thresholds_.end()) {
-    return it->second;
+CUDADeviceAllocator::~CUDADeviceAllocator() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  for (auto& entry : pools_) {
+    DevicePool& pool = entry.second;
+    size_t live_bytes = 0;
+    for (const Block& block : pool.blocks) {
+      if (block.busy) {
+        live_bytes += block.byte_size;
+      }
+    }
+    if (live_bytes != 0) {
+      // The pool owns the memory, so it is released either way; a live block
+      // at destruction means a Buffer outlived its owner.
+      LOG(WARNING) << "[CUDA_ALLOC] destroying allocator on device " << entry.first << " with "
+                   << (live_bytes >> 20) << "MB still handed out to live buffers";
+    }
+    DeviceGuard guard(entry.first);
+    for (const auto& region : pool.regions) {
+      if (cudaFree(region.first) != cudaSuccess) {
+        // Expected on teardown after the context is gone; nothing to do.
+        VLOG(1) << "[CUDA_ALLOC] cudaFree(" << region.first
+                << ") failed during allocator destruction: " << cudaGetErrorString(cudaGetLastError());
+        cudaGetLastError();
+      }
+    }
+    pool.blocks.clear();
+    pool.regions.clear();
+    pool.idle_bytes = 0;
+    pool.reserved_bytes = 0;
+  }
+}
+
+size_t CUDADeviceAllocator::idle_flush_threshold(int device_id, DevicePool& pool) const {
+  if (pool.flush_threshold != 0) {
+    return pool.flush_threshold;
   }
   size_t total_mem = 0, free_mem = 0;
-  if (cudaMemGetInfo(&free_mem, &total_mem) != cudaSuccess) {
-    total_mem = 0;
+  {
+    DeviceGuard guard(device_id);
+    if (cudaMemGetInfo(&free_mem, &total_mem) != cudaSuccess) {
+      cudaGetLastError();
+      total_mem = 0;
+    }
   }
-  const size_t threshold = std::max<size_t>(total_mem / 20, 1024ull * 1024 * 1024);
-  idle_thresholds_[device_id] = threshold;
-  return threshold;
+  pool.flush_threshold = std::max<size_t>(total_mem / 20, kMinIdleFlushBytes);
+  return pool.flush_threshold;
 }
 
 void* CUDADeviceAllocator::allocate(size_t byte_size) const {
-  int id = -1;
-  cudaError_t state = cudaGetDevice(&id);
-  CHECK(state == cudaSuccess);
   if (byte_size == 0) {
     LOG(WARNING) << "[CUDA_ALLOC] Attempted to allocate 0 bytes; returning nullptr";
     return nullptr;
   }
-  // On OOM, recycle idle pooled buffers once and retry before giving up
-  // (spin-reclaim: frees what the pool hoards before surfacing the error).
-  auto malloc_with_retry = [this](void** ptr, size_t size) -> cudaError_t {
-    cudaError_t st = cudaMalloc(ptr, size);
-    if (st != cudaSuccess) {
-      LOG(WARNING) << "[CUDA_ALLOC] cudaMalloc(" << (size >> 20)
-                   << "MB) failed; recycling idle pool buffers and retrying once.";
-      free_idle();
-      st = cudaMalloc(ptr, size);
-    }
-    return st;
-  };
+  int device_id = -1;
+  cudaError_t state = cudaGetDevice(&device_id);
+  CHECK(state == cudaSuccess) << "cudaGetDevice failed: " << cudaGetErrorString(state);
 
-  if (byte_size > 1024 * 1024) {
-    auto& big_buffers = big_buffers_map_[id];
-    int sel_id = -1;
-    for (int i = 0; i < big_buffers.size(); i++) {
-      if (big_buffers[i].byte_size >= byte_size && !big_buffers[i].busy &&
-          big_buffers[i].byte_size - byte_size < 1 * 1024 * 1024) {
-        if (sel_id == -1 || big_buffers[sel_id].byte_size > big_buffers[i].byte_size) {
-          sel_id = i;
-        }
-      }
-    }
-    if (sel_id != -1) {
-      big_buffers[sel_id].busy = true;
+  std::lock_guard<std::mutex> lock(mutex_);
+  void* ptr = allocate_locked(device_id, pools_[device_id], byte_size);
 #ifndef NDEBUG
-      VLOG(1) << "[CUDA_ALLOC] BIG reuse id=" << sel_id
-                << " size=" << (byte_size >> 10) << "KB"
-                << " (pool big_buffers cnt=" << big_buffers.size() << ")";
+  check_ledger_locked();
 #endif
-      return big_buffers[sel_id].data;
-    }
+  return ptr;
+}
 
-    void* ptr = nullptr;
-    state = malloc_with_retry(&ptr, byte_size);
-    if (cudaSuccess != state) {
-      char buf[256];
-      snprintf(buf, 256,
-               "Error: CUDA error when allocating %lu MB: %s (%d)! maybe there's no enough memory "
-               "left on  device.",
-               byte_size >> 20, cudaGetErrorString(state), static_cast<int>(state));
-      LOG(ERROR) << buf;
-      return nullptr;
-    }
-    big_buffers.emplace_back(ptr, byte_size, true);
-#ifndef NDEBUG
-    VLOG(1) << "[CUDA_ALLOC] BIG new size=" << (byte_size >> 10) << "KB"
-              << " (pool big_buffers cnt=" << big_buffers.size() << ")";
-#endif
-    return ptr;
-  }
+void* CUDADeviceAllocator::allocate_locked(int device_id, DevicePool& pool,
+                                           size_t byte_size) const {
+  const size_t wanted = round_up(byte_size, kAlignment);
 
-  auto& cuda_buffers = cuda_buffers_map_[id];
-  // Best-fit: hand out the smallest idle buffer that satisfies the request.
-  // First-fit instead lets a small tensor consume a large pooled buffer, so
-  // the next large-tensor request finds nothing reusable and cudaMallocs a
-  // fresh one every step — the pool then grows without bound until the
-  // device OOMs (observed: +808KB/step of partial_batch buffers).
-  int sel_id = -1;
-  for (int i = 0; i < cuda_buffers.size(); i++) {
-    if (cuda_buffers[i].byte_size >= byte_size && !cuda_buffers[i].busy &&
-        (sel_id == -1 || cuda_buffers[i].byte_size < cuda_buffers[sel_id].byte_size)) {
-      sel_id = i;
+  // Best fit: the smallest idle block that still satisfies the request. The
+  // old code required |have - asked| < 1MB, so once allocation sizes drifted
+  // apart every request cudaMalloc'd a fresh block and the pool grew without
+  // bound instead of reusing what it already held.
+  size_t best = pool.blocks.size();
+  for (size_t i = 0; i < pool.blocks.size(); ++i) {
+    const Block& block = pool.blocks[i];
+    if (block.busy || block.byte_size < wanted) {
+      continue;
+    }
+    if (best == pool.blocks.size() || block.byte_size < pool.blocks[best].byte_size) {
+      best = i;
     }
   }
-  if (sel_id != -1) {
-    cuda_buffers[sel_id].busy = true;
-    no_busy_cnt_[id] -= cuda_buffers[sel_id].byte_size;
+  if (best != pool.blocks.size()) {
+    const size_t have = pool.blocks[best].byte_size;
+    const size_t leftover = have - wanted;
+    void* const data = pool.blocks[best].data;
+    void* const region = pool.blocks[best].region;
+    if (leftover >= kMinSplitBytes) {
+      // Split: hand out the head, keep the tail pooled and reusable. The
+      // block was idle and only its head becomes busy, so the ledger drops by
+      // exactly the requested size.
+      pool.blocks[best].byte_size = wanted;
+      pool.blocks[best].busy = true;
+      pool.idle_bytes -= wanted;
+      pool.blocks.push_back(Block{static_cast<char*>(data) + wanted, leftover, false, region});
+    } else {
+      // Internal fragmentation smaller than one alignment unit: hand out the
+      // whole block.
+      pool.blocks[best].busy = true;
+      pool.idle_bytes -= have;
+    }
 #ifndef NDEBUG
-    VLOG(1) << "[CUDA_ALLOC] SMALL reuse id=" << sel_id
-              << " asked=" << byte_size << "B"
-              << " have=" << cuda_buffers[sel_id].byte_size << "B"
-              << " (pool small cnt=" << cuda_buffers.size()
-              << " idle=" << (no_busy_cnt_[id] >> 10) << "KB)";
+    VLOG(1) << "[CUDA_ALLOC] reuse asked=" << byte_size << "B have=" << have << "B"
+              << " (pool blocks=" << pool.blocks.size() << " idle=" << (pool.idle_bytes >> 10)
+              << "KB)";
 #endif
-    return cuda_buffers[sel_id].data;
+    return data;
   }
+
+  // Miss: grow the pool with a region holding exactly this block. Sizes are
+  // tracked per region so the whole region can later go back to the driver.
   void* ptr = nullptr;
-  state = malloc_with_retry(&ptr, byte_size);
+  cudaError_t state = cudaSuccess;
+  {
+    DeviceGuard guard(device_id);
+    state = cudaMalloc(&ptr, wanted);
+    if (state != cudaSuccess) {
+      cudaGetLastError();
+      LOG(WARNING) << "[CUDA_ALLOC] cudaMalloc(" << (wanted >> 20)
+                   << "MB) failed; returning idle pool regions and retrying once.";
+      // Reclaiming idle regions (small and large) before surfacing the error
+      // is what keeps a fragmented pool from failing a request the device
+      // could still satisfy.
+      free_regions_locked(device_id, pool);
+      state = cudaMalloc(&ptr, wanted);
+    }
+  }
   if (cudaSuccess != state) {
     char buf[256];
     snprintf(buf, 256,
@@ -117,13 +189,16 @@ void* CUDADeviceAllocator::allocate(size_t byte_size) const {
              "left on  device.",
              byte_size >> 20, cudaGetErrorString(state), static_cast<int>(state));
     LOG(ERROR) << buf;
+    cudaGetLastError();
     return nullptr;
   }
-  cuda_buffers.emplace_back(ptr, byte_size, true);
+  pool.regions[ptr] = wanted;
+  pool.reserved_bytes += wanted;
+  pool.blocks.push_back(Block{ptr, wanted, true, ptr});
 #ifndef NDEBUG
-  VLOG(1) << "[CUDA_ALLOC] SMALL new size=" << byte_size << "B"
-            << " (pool small cnt=" << cuda_buffers.size()
-            << " idle=" << (no_busy_cnt_[id] >> 10) << "KB)";
+  VLOG(1) << "[CUDA_ALLOC] new size=" << byte_size << "B"
+            << " (pool blocks=" << pool.blocks.size() << " reserved="
+            << (pool.reserved_bytes >> 20) << "MB)";
 #endif
   return ptr;
 }
@@ -132,113 +207,207 @@ void CUDADeviceAllocator::release(void* ptr) const {
   if (!ptr) {
     return;
   }
-  // Waterline flush: hand idle small buffers back to the driver when the pool
-  // hoards more than the threshold. The pointer being released is still busy
-  // at this point, so the flush can never free it under our feet.
-  cudaError_t state = cudaSuccess;
-  for (auto& it : cuda_buffers_map_) {
-    if (no_busy_cnt_[it.first] > idle_flush_threshold(it.first)) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  for (auto& entry : pools_) {
+    if (release_locked(entry.second, ptr)) {
 #ifndef NDEBUG
-      VLOG(1) << "[CUDA_FREE] idle above waterline ("
-              << (idle_flush_threshold(it.first) >> 20) << "MB), flushing all non-busy small buffers";
+      check_ledger_locked();
 #endif
-      state = cudaSetDevice(it.first);
-      CHECK(state == cudaSuccess) << "Error: CUDA error selecting device " << it.first;
-      auto& cuda_buffers = it.second;
-      std::vector<CudaMemoryBuffer> temp;
-      for (int i = 0; i < cuda_buffers.size(); i++) {
-        if (!cuda_buffers[i].busy) {
-          state = cudaFree(cuda_buffers[i].data);
-          CHECK(state == cudaSuccess)
-              << "Error: CUDA error when release memory on device " << it.first;
-        } else {
-          temp.push_back(cuda_buffers[i]);
-        }
-      }
-      cuda_buffers.clear();
-      it.second = temp;
-      no_busy_cnt_[it.first] = 0;
-#ifndef NDEBUG
-      VLOG(1) << "[CUDA_FREE] flush done, small pool now " << temp.size() << " busy buffers";
-#endif
+      flush_over_waterline_locked();
+      return;
     }
   }
 
-  // Small pool: mark the entry idle and account the idle size.
-  for (auto& it : cuda_buffers_map_) {
-    auto& cuda_buffers = it.second;
-    for (int i = 0; i < cuda_buffers.size(); i++) {
-      if (cuda_buffers[i].data == ptr) {
-        no_busy_cnt_[it.first] += cuda_buffers[i].byte_size;
-        cuda_buffers[i].busy = false;
-#ifndef NDEBUG
-        VLOG(1) << "[CUDA_FREE] SMALL release idx=" << i
-                  << " size=" << cuda_buffers[i].byte_size << "B"
-                  << " idle_now=" << (no_busy_cnt_[it.first] >> 10) << "KB";
-#endif
-        return;
-      }
-    }
-  }
-
-  // Large pool: traverse it on its own. This lookup used to live inside the
-  // small-map loop and index big_buffers_map_ with the small map's device key,
-  // so a large buffer whose device had no small-buffer entry (or any release
-  // after free_idle()/the flush above emptied the small pool) was cudaFree'd
-  // below while its pool entry stayed marked busy — the ledger kept accounting
-  // that memory as in use and the entry was never reusable.
-  for (auto& it : big_buffers_map_) {
-    auto& big_buffers = it.second;
-    for (int i = 0; i < big_buffers.size(); i++) {
-      if (big_buffers[i].data == ptr) {
-        big_buffers[i].busy = false;
-#ifndef NDEBUG
-        VLOG(1) << "[CUDA_FREE] BIG release idx=" << i
-                  << " size=" << (big_buffers[i].byte_size >> 10) << "KB";
-#endif
-        return;
-      }
-    }
-  }
-
-  // Neither pool knows this pointer: it did not come from this allocator (or
-  // its pool was already flushed). Free it directly.
+  // No pool knows this pointer: it did not come from this allocator (or the
+  // region was already handed back). Free it directly.
   LOG(WARNING) << "[CUDA_FREE] ptr not found in pool, cudaFree directly";
-  state = cudaFree(ptr);
-  CHECK(state == cudaSuccess) << "Error: CUDA error when release memory on device";
-}
-void CUDADeviceAllocator::free_idle() const {
-  for (auto& it : cuda_buffers_map_) {
-    int device_id = it.first;
-    auto& buffers = it.second;
-    cudaSetDevice(device_id);
-    std::vector<CudaMemoryBuffer> kept;
-    for (auto& buf : buffers) {
-      if (!buf.busy) {
-        cudaFree(buf.data);
-      } else {
-        kept.push_back(buf);
-      }
-    }
-    buffers = std::move(kept);
-    no_busy_cnt_[device_id] = 0;
-  }
-  for (auto& it : big_buffers_map_) {
-    int device_id = it.first;
-    auto& buffers = it.second;
-    cudaSetDevice(device_id);
-    std::vector<CudaMemoryBuffer> kept;
-    for (auto& buf : buffers) {
-      if (!buf.busy) {
-        cudaFree(buf.data);
-      } else {
-        kept.push_back(buf);
-      }
-    }
-    buffers = std::move(kept);
+  if (cudaFree(ptr) != cudaSuccess) {
+    // The context can already be gone during process teardown.
+    cudaGetLastError();
   }
 }
 
-std::shared_ptr<CUDADeviceAllocator> CUDADeviceAllocatorFactory::instance = nullptr;
+bool CUDADeviceAllocator::release_locked(DevicePool& pool, void* ptr) const {
+  for (size_t i = 0; i < pool.blocks.size(); ++i) {
+    Block& block = pool.blocks[i];
+    if (block.data != ptr) {
+      continue;
+    }
+    if (!block.busy) {
+      // The pool already owns this block: a second release would make the
+      // allocator hand the same memory to two live buffers (silent aliasing).
+      // Surface it loudly and leave the pool untouched.
+      LOG(ERROR) << "[CUDA_FREE] double release of pooled buffer " << ptr << " ("
+                 << (block.byte_size >> 10) << "KB); ignoring";
+      return true;
+    }
+    block.busy = false;
+    pool.idle_bytes += block.byte_size;
+    merge_idle_neighbours_locked(pool, i);
+#ifndef NDEBUG
+    VLOG(1) << "[CUDA_FREE] release size=" << (block.byte_size >> 10)
+              << "KB idle_now=" << (pool.idle_bytes >> 10) << "KB";
+#endif
+    return true;
+  }
+  return false;
+}
+
+void CUDADeviceAllocator::merge_idle_neighbours_locked(DevicePool& pool, size_t index) const {
+  // Repeatedly absorb adjacent idle blocks of the same region. Merging one
+  // side can make the other side adjacent to the next block, hence the loop.
+  bool merged = true;
+  while (merged) {
+    merged = false;
+    char* begin = static_cast<char*>(pool.blocks[index].data);
+    char* end = begin + pool.blocks[index].byte_size;
+    const void* region = pool.blocks[index].region;
+    for (size_t j = 0; j < pool.blocks.size(); ++j) {
+      if (j == index) {
+        continue;
+      }
+      const Block& other = pool.blocks[j];
+      if (other.busy || other.region != region) {
+        continue;
+      }
+      char* other_begin = static_cast<char*>(other.data);
+      char* other_end = other_begin + other.byte_size;
+      if (other_end == begin) {
+        pool.blocks[index].data = other_begin;
+        pool.blocks[index].byte_size += other.byte_size;
+      } else if (end == other_begin) {
+        pool.blocks[index].byte_size += other.byte_size;
+      } else {
+        continue;
+      }
+      pool.blocks.erase(pool.blocks.begin() + static_cast<std::ptrdiff_t>(j));
+      if (j < index) {
+        --index;
+      }
+      merged = true;
+      break;
+    }
+  }
+}
+
+void CUDADeviceAllocator::merge_all_idle_locked(DevicePool& pool) const {
+  // Cold-path safety net: release() already merges on every free, so this only
+  // has work if the invariant was broken elsewhere.
+  bool merged = true;
+  while (merged) {
+    merged = false;
+    for (size_t i = 0; i < pool.blocks.size() && !merged; ++i) {
+      if (pool.blocks[i].busy) {
+        continue;
+      }
+      const size_t before = pool.blocks.size();
+      merge_idle_neighbours_locked(pool, i);
+      merged = pool.blocks.size() != before;
+    }
+  }
+}
+
+size_t CUDADeviceAllocator::free_regions_locked(int device_id, DevicePool& pool) const {
+  DeviceGuard guard(device_id);
+  size_t freed_bytes = 0;
+  std::vector<Block> kept;
+  kept.reserve(pool.blocks.size());
+  for (const Block& block : pool.blocks) {
+    // Only a block covering its whole region can go back to the driver:
+    // cudaFree cannot release part of a cudaMalloc.
+    const auto region = pool.regions.find(block.region);
+    const bool whole_region_idle = !block.busy && block.data == block.region &&
+                                   region != pool.regions.end() &&
+                                   region->second == block.byte_size;
+    if (whole_region_idle && cudaFree(block.data) == cudaSuccess) {
+      pool.reserved_bytes -= block.byte_size;
+      pool.idle_bytes -= block.byte_size;
+      pool.regions.erase(block.region);
+      freed_bytes += block.byte_size;
+      continue;
+    }
+    if (whole_region_idle) {
+      LOG(WARNING) << "[CUDA_FREE] cudaFree(" << block.data
+                   << ") failed: " << cudaGetErrorString(cudaGetLastError());
+      cudaGetLastError();
+    }
+    kept.push_back(block);
+  }
+  pool.blocks = std::move(kept);
+#ifndef NDEBUG
+  if (freed_bytes != 0) {
+    VLOG(1) << "[CUDA_FREE] flushed " << (freed_bytes >> 20) << "MB idle to the driver"
+              << " (pool now blocks=" << pool.blocks.size() << " reserved="
+              << (pool.reserved_bytes >> 20) << "MB)";
+  }
+#endif
+  return freed_bytes;
+}
+
+void CUDADeviceAllocator::flush_over_waterline_locked() const {
+  for (auto& entry : pools_) {
+    DevicePool& pool = entry.second;
+    if (pool.idle_bytes <= idle_flush_threshold(entry.first, pool)) {
+      continue;
+    }
+#ifndef NDEBUG
+    VLOG(1) << "[CUDA_FREE] idle above waterline (" << (idle_flush_threshold(entry.first, pool) >> 20)
+              << "MB), flushing idle regions of device " << entry.first;
+#endif
+    free_regions_locked(entry.first, pool);
+  }
+}
+
+void CUDADeviceAllocator::free_idle() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  for (auto& entry : pools_) {
+    merge_all_idle_locked(entry.second);
+    free_regions_locked(entry.first, entry.second);
+  }
+}
+
+CUDADeviceAllocator::DeviceStats CUDADeviceAllocator::stats(int device_id) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (device_id < 0) {
+    const cudaError_t state = cudaGetDevice(&device_id);
+    if (state != cudaSuccess) {
+      cudaGetLastError();
+      return DeviceStats{};
+    }
+  }
+  DeviceStats stats;
+  const auto it = pools_.find(device_id);
+  if (it == pools_.end()) {
+    return stats;
+  }
+  const DevicePool& pool = it->second;
+  stats.reserved_bytes = pool.reserved_bytes;
+  stats.idle_bytes = pool.idle_bytes;
+  stats.busy_bytes = pool.reserved_bytes - pool.idle_bytes;
+  stats.blocks = pool.blocks.size();
+  stats.regions = pool.regions.size();
+  return stats;
+}
+
+void CUDADeviceAllocator::check_ledger_locked() const {
+#ifndef NDEBUG
+  for (const auto& entry : pools_) {
+    size_t idle = 0;
+    size_t reserved = 0;
+    for (const Block& block : entry.second.blocks) {
+      if (!block.busy) {
+        idle += block.byte_size;
+      }
+    }
+    for (const auto& region : entry.second.regions) {
+      reserved += region.second;
+    }
+    CHECK_EQ(idle, entry.second.idle_bytes)
+        << "idle ledger desync on device " << entry.first;
+    CHECK_EQ(reserved, entry.second.reserved_bytes)
+        << "reserved ledger desync on device " << entry.first;
+  }
+#endif
+}
 
 }  // namespace base
