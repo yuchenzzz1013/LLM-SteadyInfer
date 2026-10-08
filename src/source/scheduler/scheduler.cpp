@@ -215,10 +215,19 @@ const PrefixCacheStats& Scheduler::prefix_cache_stats() const {
   return prefix_cache_ ? prefix_cache_->stats() : kNoCache;
 }
 
-int Scheduler::add_request(const std::vector<int>& prompt_tokens) {
+void Scheduler::clear_step_stats() {
+  batch_reconstruct_times_ms_.clear();
+  decode_rows_per_step_.clear();
+}
+
+int Scheduler::add_request(const std::vector<int>& prompt_tokens, TimePoint arrival_time) {
   Sequence seq;
   seq.id = next_seq_id_++;
-  seq.arrival_time = std::chrono::steady_clock::now();
+  // Arrival stamp: the caller may pass the moment the request was *scheduled*
+  // to arrive (online benchmarks submit in batches at step boundaries, so
+  // stamping here would quantize every arrival to a step boundary and shrink
+  // the measured TTFT/queue-wait). Default = now, the true submission time.
+  seq.arrival_time = arrival_time;
   seq.prompt_tokens = prompt_tokens;
   seq.num_prompt_tokens = static_cast<int>(prompt_tokens.size());
   seq.state = SeqState::WAITING;
@@ -777,6 +786,13 @@ void Scheduler::force_finish_all(const char* reason) {
 void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
   if (rows.empty()) return;
 
+  // Start of the per-step host work measured into batch_reconstruct_times_ms_:
+  // row ordering + staging into the pinned host buffers + block-table copy +
+  // the mixed step's row-map H2D. (Timing used to start after this loop, right
+  // before the model call, so the metric reported ~0 and said nothing about
+  // the actual reconstruction cost.)
+  const auto recon_start = std::chrono::steady_clock::now();
+
   const int batch = static_cast<int>(rows.size());
   // Row order contract with the model (see Model::forward_batch): decode rows
   // first, then the prefill rows grouped per sequence. build_batch_rows already
@@ -872,6 +888,16 @@ void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
           << " prefill_seqs=" << num_prefill_seqs;
 #endif
 
+  // Record the step's host staging cost and its decode rows (one record per
+  // step that decodes; mixed prefill+decode steps included — they advance
+  // every decode row by one token just like a pure-decode step).
+  if (num_decode_rows > 0) {
+    double recon_ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - recon_start).count();
+    batch_reconstruct_times_ms_.push_back(recon_ms);
+    decode_rows_per_step_.push_back(num_decode_rows);
+  }
+
   if (!any_prefill) {
     // Pure-decode step: the CUDA-graph path (decode_step) with its
     // per-batch-size graph pool.
@@ -884,7 +910,6 @@ void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
     }();
     static int hostlog_count = 0;
     auto h_launch = std::chrono::steady_clock::now();
-    auto recon_start = std::chrono::steady_clock::now();
 
     // View into the preallocated logits buffer (no per-step allocation);
     // dtype mirrors the buffer so post_processing_batch picks the BF16 or
@@ -896,13 +921,6 @@ void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
     tensor::Tensor logits_view(logits_dtype, batch, model_->vocab_size(), false,
                                nullptr, logits_ptr);
     logits_view.set_device_type(model_->device_type());
-
-    // Record batch reconstruction time (tensor setup overhead)
-    {
-      auto recon_end = std::chrono::steady_clock::now();
-      double recon_ms = std::chrono::duration<double, std::milli>(recon_end - recon_start).count();
-      batch_reconstruct_times_ms_.push_back(recon_ms);
-    }
 
     auto status = model_->decode_step(input_ids, positions, block_table,
                                       kv_manager_->key_cache(),

@@ -2,6 +2,7 @@
 #include <base/alloc.h>
 #include <glog/logging.h>
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -168,7 +169,11 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
       // scratch — including the pinned host staging its H2D copy nodes read
       // from — and a replay may still be queued on the stream. Drain before
       // the buffers are released. Rare path (only past 16 live batch sizes).
+      const auto evict_start = std::chrono::steady_clock::now();
       sync_stream();
+      graph_stats_.evict_sync_ms += std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - evict_start).count();
+      graph_stats_.evictions++;
       decode_graph_pool_.erase(evict_batch);
     }
   }
@@ -244,6 +249,9 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
 
   if (entry->exec == nullptr && !entry->capture_failed) {
     // 3. First call for this batch size: capture the decode kernels.
+    // Timed into graph_stats_ (capture + instantiate only — the graph launch
+    // at the end of this block is the step's real decode work, not overhead).
+    const auto capture_start = std::chrono::steady_clock::now();
     cudaError_t cap_err = cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal);
     if (cap_err != cudaSuccess) {
       entry->capture_failed = true;
@@ -285,6 +293,9 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
                            entry->logits_view, true, batch, nullptr, 0,
                            entry->scratch.get());
     }
+    graph_stats_.captures++;
+    graph_stats_.capture_ms += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - capture_start).count();
     // Snapshot the Scheduler-owned buffers baked into the graph; replay is
     // validated against these on every subsequent decode step.
     entry->captured_key_ptr = key_cache.get_buffer()->ptr();

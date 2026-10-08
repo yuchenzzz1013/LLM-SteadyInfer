@@ -13,6 +13,19 @@
 //                                GPU SM 利用率 / 显存利用率
 //   - TTFT / TPOT / ITL / e2e    延迟分布(avg / p50 / p99)
 //
+// 口径(与 online_serving_benchmark 一致):
+//   - 计时窗口从提交第一条请求前开始:wall_time 含提交开销,所有请求的
+//     arrival_time 都落在窗口内。
+//   - TTFT/E2E 从请求 *到达(= 本基准的提交时刻)* 算起,含排队/接纳等待,
+//     queue_wait_avg_ms 单列出等待被接纳的时间。这与 online 的"到达算起"同口径,
+//     两个基准的 TTFT 可以直接比较。
+//   - 请求账目闭合:submitted == completed + rejected + dropped;dropped 是
+//     已进入调度器、但一个 token 都没生成就结束的请求(KV 扩张失败或前向失败)。
+//   - 预热(prefill + decode)的记录不进统计:预热后清空 scheduler 的逐步统计,
+//     并清零 CUDA graph 捕获计数,csv 里的 graph_captures/graph_capture_ms 只统计
+//     正式窗口内新捕获的 decode graph(捕获是按 batch size 惰性发生的,窗口内
+//     新 batch size 会触发捕获,这部分开销单列以便从吞吐里扣除评估)。
+//
 // 用法:
 //   ./build/benchmark/offline_batch_benchmark --dataset ShareGPT_prompts.jsonl
 //       --model-dir Qwen3-4B --tokenizer Qwen3-4B/tokenizer.json
@@ -175,7 +188,12 @@ static void print_usage(const char* prog) {
 
 struct RunMetrics {
   int run_id = 0;
-  int num_requests = 0, completed = 0, rejected = 0;
+  int num_requests = 0, submitted = 0, completed = 0, rejected = 0, dropped = 0;
+  // 压测配置(写进 CSV,保证一行结果自带复现所需的口径参数)
+  int max_batch = 0, max_gen = 0, block_size = 0;
+  // 正式窗口内的 CUDA graph 捕获开销(预热后清零)
+  long long graph_captures = 0, graph_evictions = 0;
+  double graph_capture_ms = 0;
   // Prefix-cache counters for this run (all zero when it is disabled).
   bool enable_prefix_cache = false;
   scheduler::PrefixCacheStats prefix;
@@ -187,11 +205,12 @@ struct RunMetrics {
   double total_tps = 0;    // 每秒总 Token 数(prefill + decode)
   double qps = 0;
 
-  // 延迟
+  // 延迟(TTFT/E2E 从到达 = 提交时刻算起,含接纳等待,与 online 同口径)
   double ttft_avg_ms = 0, ttft_p50_ms = 0, ttft_p99_ms = 0;
   double tpot_avg_ms = 0, tpot_p50_ms = 0, tpot_p99_ms = 0;
   double itl_avg_ms = 0, itl_p99_ms = 0;
   double e2e_avg_ms = 0, e2e_p99_ms = 0;
+  double queue_wait_avg_ms = 0, queue_wait_p99_ms = 0;  // 到达 -> 被接纳
 
   // KV cache
   double kv_cache_util_global = 0;   // 时间加权:已用 token 槽 / 已分配容量
@@ -204,6 +223,7 @@ struct RunMetrics {
 
   // 吞吐效率
   double avg_batch_size = 0;         // 平均运行中序列数
+  long long decode_steps = 0;        // 正式窗口内的 decode 步数(含混合步)
   double avg_decode_batch = 0;       // decode 步骤平均 batch
   double throughput_efficiency = 0;  // 实际输出 TPS / 理论峰值 TPS
   double theoretical_peak_tps = 0;   // max_batch 常满时的理论输出 TPS
@@ -223,6 +243,8 @@ static RunMetrics run_once(const std::shared_ptr<model::Model>& model,
   RunMetrics m;
   m.run_id = run_id;
   m.peak_tflops = peak_tflops;
+  m.max_batch = max_batch;
+  m.max_gen = max_gen_len;
 
   // 根据实际 prompt 长度确定 KV slot 大小,避免按模型全长分配导致碎片率虚高
   int max_prompt_len = 0;
@@ -284,17 +306,29 @@ static RunMetrics run_once(const std::shared_ptr<model::Model>& model,
     }
     cudaDeviceSynchronize();
   }
-
-  for (const auto& t : prompt_tokens) {
-    if (sched.add_request(t) < 0) m.rejected++;
-  }
-  m.num_requests = static_cast<int>(prompt_tokens.size());
+  // 预热记录清零:逐步统计与 graph 捕获计数都只反映正式窗口(否则 warmup 的
+  // decode 步会混进 throughput_efficiency 的分母,捕获开销也看不出来)。
+  sched.clear_step_stats();
+  model->reset_graph_stats();
+  m.block_size = sched.get_block_size();
 
   GpuUtilSampler sampler;
   sampler.start();
 
-  // 主循环:每步采样一次 KV 占用快照(纯 host 端读取,开销可忽略)
+  // 计时窗口从提交第一条请求之前开始:所有请求的 arrival_time 都落在窗口内,
+  // wall_time 也把提交开销算进去(与 vLLM benchmark_throughput 一致)。
   auto start = Clock::now();
+
+  for (const auto& t : prompt_tokens) {
+    if (sched.add_request(t) < 0) {
+      m.rejected++;
+    } else {
+      m.submitted++;
+    }
+  }
+  m.num_requests = static_cast<int>(prompt_tokens.size());
+
+  // 主循环:每步采样一次 KV 占用快照(纯 host 端读取,开销可忽略)
   long long used_cap_sum = 0, alloc_cap_sum = 0;
   long long busy_slots_sum = 0, running_sum = 0;
   int kv_samples = 0, peak_busy = 0;
@@ -335,11 +369,21 @@ static RunMetrics run_once(const std::shared_ptr<model::Model>& model,
   m.wall_time_s = total_s;
 
   // ---- 逐请求统计 ----
+  // TTFT/E2E 从 arrival_time(本基准 = 提交时刻)算起,与 online 同口径:
+  // 含排队/接纳等待,可比。queue_wait = admit - arrival 把等待单独列出来。
   const auto& finished = sched.get_finished();
-  std::vector<double> ttfts, tpots, e2es, itls, per_seq_frag;
+  std::vector<double> ttfts, tpots, e2es, itls, qwaits, per_seq_frag;
   for (const auto& seq : finished) {
     if (warm_ids.count(seq.id)) continue;  // 跳过预热请求
-    if (seq.num_generated_tokens <= 0) continue;
+    if (seq.num_generated_tokens <= 0) {
+      // 进了调度器却一个 token 都没生成(KV 扩张失败 / 前向失败而强制结束):
+      // 计入 dropped,让 submitted == completed + rejected + dropped 成立,
+      // 不再像以前那样静默消失。
+      m.dropped++;
+      continue;
+    }
+    double arrival_ms =
+        std::chrono::duration<double, std::milli>(seq.arrival_time - start).count();
     double admit_ms =
         std::chrono::duration<double, std::milli>(seq.admit_time - start).count();
     double first_ms =
@@ -347,10 +391,11 @@ static RunMetrics run_once(const std::shared_ptr<model::Model>& model,
     double finish_ms =
         std::chrono::duration<double, std::milli>(seq.finish_time - start).count();
 
-    double ttft = first_ms - admit_ms;
-    double e2e = finish_ms - admit_ms;
+    double ttft = first_ms - arrival_ms;
+    double e2e = finish_ms - arrival_ms;
     ttfts.push_back(ttft);
     e2es.push_back(e2e);
+    qwaits.push_back(admit_ms - arrival_ms);
     if (seq.num_generated_tokens > 1) {
       tpots.push_back((e2e - ttft) / (seq.num_generated_tokens - 1));
     }
@@ -386,6 +431,8 @@ static RunMetrics run_once(const std::shared_ptr<model::Model>& model,
   m.itl_p99_ms = percentile(itls, 99);
   m.e2e_avg_ms = mean(e2es);
   m.e2e_p99_ms = percentile(e2es, 99);
+  m.queue_wait_avg_ms = mean(qwaits);
+  m.queue_wait_p99_ms = percentile(qwaits, 99);
 
   // ---- KV cache 碎片率 ----
   // 全局(时间加权):池子物理占用中真正存有 token 的比例。分母取
@@ -402,7 +449,8 @@ static RunMetrics run_once(const std::shared_ptr<model::Model>& model,
       kv_samples > 0 ? static_cast<double>(busy_slots_sum) / kv_samples : 0;
   m.peak_busy_kv_slots = peak_busy;
 
-  // ---- batch 重建开销(调度器在每次 decode step 记录的 host 端 tensor 组装耗时)----
+  // ---- batch 重建开销(调度器记录的每步 host 端 batch 组装 + H2D 暂存耗时)----
+  // 只统计正式窗口:预热后已 clear_step_stats()。
   const auto& recon = sched.get_batch_reconstruct_times_ms();
   if (!recon.empty()) {
     m.avg_batch_reconstruct_ms = mean(recon);
@@ -410,15 +458,20 @@ static RunMetrics run_once(const std::shared_ptr<model::Model>& model,
   }
 
   // ---- 吞吐效率 ----
-  // decode 步骤数 = recon 记录数(每条记录对应一次 decode step)。
-  // 每个 decode step 为 batch 内每条序列生成 1 个 token,因此
-  //   平均 decode batch = output_tokens / decode 步数
+  // decode 步数 = 含 decode 行的 step 数(混合 prefill+decode 的步也解码了
+  // 一个 token,必须计入,否则 avg_decode_batch 会被高估);每个这样的 step 为
+  // 每个 decode 行生成 1 个 token,因此
+  //   平均 decode batch = decode 行数 / decode 步数
   //   理论峰值 TPS     = max_batch * decode 步数 / 总时长(batch 常满)
   //   吞吐效率          = 实际输出 TPS / 理论峰值 TPS = 平均 decode batch 占用率
-  long long n_decode = static_cast<long long>(recon.size());
-  m.avg_decode_batch = n_decode > 0 ? static_cast<double>(m.output_tokens) / n_decode : 0;
+  const auto& decode_rows = sched.get_decode_rows_per_step();
+  m.decode_steps = static_cast<long long>(decode_rows.size());
+  long long decode_tokens = 0;
+  for (int32_t n : decode_rows) decode_tokens += n;
+  m.avg_decode_batch =
+      m.decode_steps > 0 ? static_cast<double>(decode_tokens) / m.decode_steps : 0;
   m.theoretical_peak_tps =
-      total_s > 0 ? max_batch * static_cast<double>(n_decode) / total_s : 0;
+      total_s > 0 ? max_batch * static_cast<double>(m.decode_steps) / total_s : 0;
   m.throughput_efficiency =
       m.theoretical_peak_tps > 0 ? m.output_tps / m.theoretical_peak_tps : 0;
   m.avg_batch_size =
@@ -439,6 +492,15 @@ static RunMetrics run_once(const std::shared_ptr<model::Model>& model,
   m.enable_prefix_cache = sched.prefix_cache_enabled();
   m.prefix = sched.prefix_cache_stats();
 
+  // ---- 正式窗口内的 CUDA graph 捕获开销 ----
+  // 捕获按 batch size 惰性发生:预热只覆盖 warmup batch,窗口里首次出现的
+  // batch size(以及池容量 16 上限触发的 LRU 重捕获)会在窗口内捕获,这部分
+  // 时间不是解码工作,单列出来供吞吐/延迟口径扣除。
+  const auto gs = model->graph_stats();
+  m.graph_captures = gs.captures;
+  m.graph_evictions = gs.evictions;
+  m.graph_capture_ms = gs.capture_ms + gs.evict_sync_ms;
+
   return m;
 }
 
@@ -451,36 +513,45 @@ static void write_csv(const std::string& path,
     LOG(ERROR) << "无法打开输出文件: " << path;
     return;
   }
-  f << "run_id,num_requests,completed,rejected,prompt_tokens,output_tokens,"
+  f << "run_id,max_batch,max_gen,block_size,num_requests,submitted,completed,"
+       "rejected,dropped,prompt_tokens,output_tokens,"
        "total_tokens,wall_time_s,output_tps,total_tps,qps,"
        "ttft_avg_ms,ttft_p50_ms,ttft_p99_ms,"
        "tpot_avg_ms,tpot_p50_ms,tpot_p99_ms,itl_avg_ms,itl_p99_ms,"
-       "e2e_avg_ms,e2e_p99_ms,"
+       "e2e_avg_ms,e2e_p99_ms,queue_wait_avg_ms,queue_wait_p99_ms,"
        "kv_cache_util_global,kv_cache_frag_global,kv_cache_frag_per_seq,"
        "avg_busy_kv_slots,peak_busy_kv_slots,"
        "avg_batch_reconstruct_ms,p99_batch_reconstruct_ms,"
-       "avg_batch_size,avg_decode_batch,throughput_efficiency,theoretical_peak_tps,"
+       "avg_batch_size,decode_steps,avg_decode_batch,throughput_efficiency,"
+       "theoretical_peak_tps,"
        "mfu,peak_tflops,gpu_sm_util_pct,gpu_mem_util_pct,gpu_mem_used_mb,"
+       "graph_captures,graph_evictions,graph_capture_ms,"
        "enable_prefix_cache,"
        "prefix_cache_lookups,prefix_cache_hits,prefix_cache_hit_rate,"
        "prefix_cache_matched_blocks,prefix_cache_inserts,prefix_cache_evictions\n";
   f << std::fixed << std::setprecision(6);
   for (const auto& r : results) {
-    f << r.run_id << "," << r.num_requests << "," << r.completed << ","
-      << r.rejected << "," << r.prompt_tokens << "," << r.output_tokens << ","
+    f << r.run_id << "," << r.max_batch << "," << r.max_gen << "," << r.block_size
+      << "," << r.num_requests << "," << r.submitted << "," << r.completed << ","
+      << r.rejected << "," << r.dropped << "," << r.prompt_tokens << ","
+      << r.output_tokens << ","
       << r.total_tokens << "," << r.wall_time_s << "," << r.output_tps << ","
       << r.total_tps << "," << r.qps << "," << r.ttft_avg_ms << ","
       << r.ttft_p50_ms << "," << r.ttft_p99_ms << "," << r.tpot_avg_ms << ","
       << r.tpot_p50_ms << "," << r.tpot_p99_ms << "," << r.itl_avg_ms << ","
       << r.itl_p99_ms << "," << r.e2e_avg_ms << "," << r.e2e_p99_ms << ","
+      << r.queue_wait_avg_ms << "," << r.queue_wait_p99_ms << ","
       << r.kv_cache_util_global << "," << r.kv_cache_frag_global << ","
       << r.kv_cache_frag_per_seq << "," << r.avg_busy_kv_slots << ","
       << r.peak_busy_kv_slots << "," << r.avg_batch_reconstruct_ms << ","
       << r.p99_batch_reconstruct_ms << "," << r.avg_batch_size << ","
-      << r.avg_decode_batch << "," << r.throughput_efficiency << ","
+      << r.decode_steps << "," << r.avg_decode_batch << ","
+      << r.throughput_efficiency << ","
       << r.theoretical_peak_tps << "," << r.mfu << "," << r.peak_tflops << ","
       << r.gpu_sm_util_pct << "," << r.gpu_mem_util_pct << ","
-      << r.gpu_mem_used_mb << "," << (r.enable_prefix_cache ? 1 : 0) << ","
+      << r.gpu_mem_used_mb << "," << r.graph_captures << ","
+      << r.graph_evictions << "," << r.graph_capture_ms << ","
+      << (r.enable_prefix_cache ? 1 : 0) << ","
       << r.prefix.lookups << ","
       << r.prefix.hits << "," << r.prefix.hit_rate() << ","
       << r.prefix.matched_blocks << "," << r.prefix.inserts << ","
@@ -496,8 +567,10 @@ static void print_report(const RunMetrics& r) {
   std::cout << "\n==================== Run " << r.run_id
             << " 离线批推理结果 ====================\n";
   std::cout << std::fixed << std::setprecision(2);
-  std::cout << "请求: " << r.num_requests << " 条, 完成 " << r.completed
-            << " 条, 拒绝 " << r.rejected << " 条\n";
+  std::cout << "请求: 提交 " << r.num_requests << " 条, 完成 " << r.completed
+            << " 条, 拒绝 " << r.rejected << " 条, 丢弃 " << r.dropped << " 条"
+            << "  (max_batch=" << r.max_batch << " max_gen=" << r.max_gen
+            << " block_size=" << r.block_size << ")\n";
   std::cout << "Token: prompt=" << r.prompt_tokens
             << " 输出=" << r.output_tokens
             << " 总计=" << r.total_tokens
@@ -511,7 +584,8 @@ static void print_report(const RunMetrics& r) {
   std::cout << "  throughput_efficiency (吞吐效率): " << std::setprecision(2)
             << pct(r.throughput_efficiency) << "%"
             << "  (decode 平均 batch=" << r.avg_decode_batch
-            << ", 运行平均 batch=" << r.avg_batch_size << ")\n";
+            << ", 运行平均 batch=" << r.avg_batch_size
+            << ", decode 步数=" << r.decode_steps << ")\n";
   std::cout << "  theoretical_peak_tps         : " << r.theoretical_peak_tps
             << " tok/s (batch 常满)\n\n";
 
@@ -537,7 +611,7 @@ static void print_report(const RunMetrics& r) {
   std::cout << "  GPU 显存利用率 (NVML 采样均值): " << r.gpu_mem_util_pct
             << "%  (已用 " << r.gpu_mem_used_mb << " MB)\n\n";
 
-  std::cout << "--- 延迟 ---\n";
+  std::cout << "--- 延迟 (从请求到达 = 提交时刻算起,含接纳等待) ---\n";
   std::cout << std::setprecision(2);
   std::cout << "  TTFT: avg=" << r.ttft_avg_ms << " ms  p50=" << r.ttft_p50_ms
             << " ms  p99=" << r.ttft_p99_ms << " ms\n";
@@ -546,7 +620,9 @@ static void print_report(const RunMetrics& r) {
   std::cout << "  ITL : avg=" << r.itl_avg_ms << " ms  p99=" << r.itl_p99_ms
             << " ms\n";
   std::cout << "  E2E : avg=" << r.e2e_avg_ms << " ms  p99=" << r.e2e_p99_ms
-            << " ms\n\n";
+            << " ms\n";
+  std::cout << "  等待接纳 (queue wait): avg=" << r.queue_wait_avg_ms
+            << " ms  p99=" << r.queue_wait_p99_ms << " ms\n\n";
 
   std::cout << "--- prefix cache (" << (r.enable_prefix_cache ? "开启" : "关闭") << ") ---\n";
   std::cout << std::setprecision(2);
@@ -555,6 +631,26 @@ static void print_report(const RunMetrics& r) {
             << "  matched_blocks=" << r.prefix.matched_blocks << "\n";
   std::cout << "  inserts=" << r.prefix.inserts << "  evictions=" << r.prefix.evictions
             << "  evict_shortfalls=" << r.prefix.evict_shortfalls << "\n";
+  std::cout << "--- CUDA graph (正式窗口内,预热后清零) ---\n";
+  std::cout << std::setprecision(3);
+  std::cout << "  新捕获 " << r.graph_captures << " 个 (LRU 驱逐 "
+            << r.graph_evictions << " 个), 捕获+驱逐同步耗时 "
+            << r.graph_capture_ms << " ms";
+  if (r.wall_time_s > 0) {
+    std::cout << " (占 wall " << std::setprecision(2)
+              << (r.graph_capture_ms / (r.wall_time_s * 1000.0) * 100.0) << "%)";
+  }
+  std::cout << "\n";
+  // 请求账目必须闭合:提交 = 完成 + 拒绝 + 丢弃。
+  const int accounted = r.completed + r.rejected + r.dropped;
+  if (accounted != r.num_requests) {
+    std::cout << "  [警告] 请求账目不平: 提交 " << r.num_requests << " != 完成 "
+              << r.completed << " + 拒绝 " << r.rejected << " + 丢弃 " << r.dropped
+              << " = " << accounted << "\n";
+  } else if (r.dropped > 0) {
+    std::cout << "  [警告] 有 " << r.dropped
+              << " 条请求零 token 结束(KV 扩张失败或前向失败),已计入 dropped\n";
+  }
   std::cout << "====================================================\n";
 }
 

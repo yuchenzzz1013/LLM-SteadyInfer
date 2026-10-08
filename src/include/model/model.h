@@ -105,6 +105,20 @@ struct CudaGraphDecodeEntry {
   }
 };
 
+// CUDA-graph capture accounting for the decode path. Capture is lazy (per
+// batch size, on first use), so a workload that visits many batch sizes pays
+// captures *inside* its steady state: a benchmark must be able to tell how
+// much of its measured window went into capture rather than into decoding.
+// captures/evictions are counts, capture_ms is the host time spent in
+// cudaStreamBeginCapture..cudaGraphInstantiate (the eviction path's stream
+// drain is counted separately in evict_sync_ms).
+struct GraphStats {
+  long long captures = 0;
+  long long evictions = 0;
+  double capture_ms = 0;
+  double evict_sync_ms = 0;
+};
+
 // Resolved KV-cache geometry, shared by forward_batch / decode_step so the
 // two never disagree on layout interpretation.
 struct KVCacheDims {
@@ -319,6 +333,13 @@ class Model {
                                    tensor::Tensor& value_cache,
                                    tensor::Tensor& logits);
 
+  // Cumulative CUDA-graph capture accounting of the decode path (see
+  // GraphStats). Counters are never reset implicitly: a driver that measures a
+  // window calls reset_graph_stats() after warm-up, then reads them at the end
+  // of the window.
+  GraphStats graph_stats() const { return graph_stats_; }
+  void reset_graph_stats() { graph_stats_ = GraphStats{}; }
+
   base::ModelType model_type() const;
 
   base::DeviceType device_type() const { return device_type_; }
@@ -470,6 +491,7 @@ class Model {
   // decode_step). Mutable so const forward paths can manage it.
   mutable std::map<int32_t, std::unique_ptr<CudaGraphDecodeEntry>> decode_graph_pool_;
   mutable int64_t decode_graph_clock_ = 0;  // LRU stamp for pool eviction
+  mutable GraphStats graph_stats_;          // see graph_stats()
   bool use_cuda_graphs_ = true;
 };
 }  // namespace model

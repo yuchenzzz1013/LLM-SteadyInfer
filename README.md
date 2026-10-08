@@ -125,6 +125,24 @@ Offline / Online 两个基准**默认关闭前缀缓存**（`--prefix-cache 1` �
 命中率极低，开着缓存只会把已完成请求的 prompt 块钉在池里并计入哈希开销（虚高的
 `kv_cache_frag_global` 就是这么来的）；缓存的净收益看 `prefix_caching_benchmark` 的 ON/OFF A/B。
 
+Offline / Online 两个基准共用同一套口径（两个 CSV 的对应列可直接比较）：
+
+* **计时窗口**从提交第一条请求之前开始：`wall_time_s` 含提交开销，所有请求的
+  `arrival_time` 都落在窗口内。
+* **TTFT / E2E 从请求到达算起**（offline = 提交时刻，online = 到达过程算出的
+  计划到达时刻），含排队/接纳等待；`queue_wait_*` 单独列出等待被接纳的时间。
+* **请求账目闭合**：`submitted == completed + rejected + dropped`；`dropped` 是
+  进了调度器但一个 token 都没生成就结束的请求（KV 扩张失败 / 前向失败）。
+* **预热（prefill + decode）不进统计**：预热后清空 scheduler 的逐步统计并清零
+  CUDA graph 捕获计数，CSV 里的 `graph_captures / graph_capture_ms` 只统计正式
+  窗口内新捕获的 decode graph（捕获按 batch size 惰性发生，窗口内首次出现的
+  batch size 会触发捕获——这部分开销单列，便于从吞吐里扣除评估）。
+* **`avg_decode_batch / throughput_efficiency`** 用"含 decode 行的 step 数
+  × 每步 decode 行数"统计（混合 prefill+decode 的步也计入），不再用纯 decode
+  步数，也不再混入预热步。
+* online 的 `avg_queue_len` 是**时间加权**（队列长度对时间积分 ÷ 窗口时长），
+  不是按主循环迭代取平均；`goodput_pct` 以 `submitted` 为分母。
+
 ### Offline Batch
 * Output Token Throughput
 * Total Token Throughput

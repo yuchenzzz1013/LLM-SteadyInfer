@@ -10,6 +10,16 @@
 //   - goodput                     满足 TTFT/TPOT SLA 的完成请求速率
 //   - kv_cache_fragmentation / batch reconstruct / MFU / NVML(与 offline 同口径)
 //
+// 口径(与 offline_batch_benchmark 一致):
+//   - 请求的 arrival_time 用"计划到达时刻"(到达过程算出的时间点),不是
+//     add_request 的实际调用时刻——主循环按 step 步进,后者会被量化到 step
+//     边界,把 TTFT/queue_wait 系统性算小。
+//   - avg_queue_len 是时间加权(queue_len 对时间积分 / 窗口时长),不是按
+//     循环迭代取平均(空闲时循环以 ~200us 空转,按迭代平均会把队列长度稀释)。
+//   - 请求账目闭合:submitted == completed + rejected + dropped。
+//   - goodput_pct 以 submitted 为分母(只统计完成且达标的请求),mean 队列
+//     长度、graph 捕获开销等诊断量的定义见各字段注释。
+//
 // 用法:
 //   ./build/benchmark/online_serving_benchmark --model-type qwen3 --model-dir Qwen3-4B
 //       --tokenizer Qwen3-4B/tokenizer.json --dataset ShareGPT_prompts.jsonl
@@ -213,7 +223,13 @@ static void print_usage(const char* prog) {
 
 struct ServingMetrics {
   int run_id = 0;
-  int num_requests = 0, submitted = 0, completed = 0, rejected = 0;
+  int num_requests = 0, submitted = 0, completed = 0, rejected = 0, dropped = 0;
+  // 本轮实际生效的调度配置(autobatch 会自动放大 max_batch,写进 CSV 才能复现)
+  int max_batch = 0, max_gen = 0, block_size = 0;
+  bool auto_batch = false;  // max_batch 是否由空闲显存自动决定
+  // 正式窗口内的 CUDA graph 捕获开销(预热后清零,见 offline 同名字段)
+  long long graph_captures = 0, graph_evictions = 0;
+  double graph_capture_ms = 0;
   long long prompt_tokens = 0, output_tokens = 0, total_tokens = 0;
   double wall_time_s = 0;
   double request_rate = 0, burstiness = 1.0, duration_s = 0;
@@ -236,7 +252,7 @@ struct ServingMetrics {
   // Goodput(SLA)
   double goodput_rps = 0;  // 满足 TTFT/TPOT SLA 的完成请求速率
   int goodput_count = 0;
-  double goodput_pct = 0;  // goodput_count / completed
+  double goodput_pct = 0;  // goodput_count / submitted(未完成/被拒/丢弃都不算达标)
 
   // KV cache
   double kv_cache_util_global = 0;   // 时间加权:已用 token 槽 / 已分配容量
@@ -327,11 +343,17 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
       max_batch = requested_batch;
     }
   }
+  // 本轮实际生效的调度配置(autobatch 的结果),写进 CSV 保证可复现。
+  m.max_batch = max_batch;
+  m.max_gen = args.max_gen;
+  m.auto_batch = !args.max_batch_explicit;
+
   // 前缀缓存默认关闭(--prefix-cache 1 打开):请求独立时命中率极低,开着只会
   // 把已完成请求的 prompt 块钉在池里、并把哈希开销计入延迟。缓存收益本身由
   // prefix_caching_benchmark 的 A/B 回答。
   Scheduler sched(model, max_batch, max_total_seq_len, args.max_gen, block_size,
                   /*enable_prefix_cache=*/args.prefix_cache != 0);
+  m.block_size = sched.get_block_size();
 
   // ---- 预热:与正式压测共用同一 Scheduler(同 offline,统计中跳过) ----
   // 每轮提交 warmup_requests(默认 = max_batch)个相同 prompt,请求同步完成
@@ -363,6 +385,9 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
     }
     cudaDeviceSynchronize();
   }
+  // 预热记录清零(与 offline 同口径):逐步统计与 graph 捕获计数只反映正式窗口。
+  sched.clear_step_stats();
+  model->reset_graph_stats();
 
   // ---- 到达过程 ----
   // vLLM 语义:request_rate = inf 时全部请求在 t=0 提交(退化为 offline);
@@ -380,23 +405,27 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
     return d(rng);
   };
 
+  // 计时窗口从第一条请求提交之前开始(与 offline 一致):wall_time 含提交开销,
+  // 所有 arrival_time 都落在窗口内。rate = inf 时全部请求的计划到达时刻 = 窗口起点。
+  GpuUtilSampler sampler;
+  sampler.start();
+  auto start = Clock::now();
+
   if (unlimited) {
     for (const auto& t : prompt_tokens) {
-      if (sched.add_request(t) < 0) m.rejected++;
+      if (sched.add_request(t, start) < 0) m.rejected++;
       else m.submitted++;
     }
   }
 
-  GpuUtilSampler sampler;
-  sampler.start();
-
-  // 主循环:到达判断与调度步进交错;每步采样 KV 占用与排队长度快照
-  auto start = Clock::now();
+  // 主循环:到达判断与调度步进交错;每步采样 KV 占用,排队长度按时间加权积分
   double next_arrival_s = unlimited ? 0.0 : next_interval();
   bool arrival_open = true;
   long long used_cap_sum = 0, alloc_cap_sum = 0;
-  long long busy_slots_sum = 0, running_sum = 0, queue_len_sum = 0;
-  int kv_samples = 0, queue_samples = 0, peak_busy = 0;
+  long long busy_slots_sum = 0, running_sum = 0;
+  double queue_area_s = 0;  // ∫ 队列长度 dt,除以窗口时长 = 时间加权平均队长
+  auto last_queue_sample = start;
+  int kv_samples = 0, peak_busy = 0;
 
   // 在线模式下请求按到达过程陆续提交,两次到达之间 scheduler 可能完全排空;
   // 因此退出条件必须同时考虑"还有未提交的请求",不能只看 all_finished。
@@ -405,13 +434,19 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
           m.submitted + m.rejected < static_cast<int>(prompt_tokens.size()))) {
     double now_s = std::chrono::duration<double>(Clock::now() - start).count();
 
-    // 到达:提交窗口内,到点即提交下一条请求
+    // 到达:提交窗口内,到点即提交下一条请求。到达时间戳用计划时刻
+    // (next_arrival_s),不是此刻——主循环按 step 步进,用此刻会把每个到达
+    // 量化到 step 边界,TTFT/queue_wait 系统性偏小。
     if (!unlimited && arrival_open) {
       if (args.duration > 0 && now_s >= args.duration) arrival_open = false;
       while (arrival_open &&
              m.submitted + m.rejected < static_cast<int>(prompt_tokens.size()) &&
              now_s >= next_arrival_s) {
-        if (sched.add_request(prompt_tokens[m.submitted + m.rejected]) < 0) {
+        auto scheduled_arrival =
+            start + std::chrono::microseconds(
+                        static_cast<long long>(next_arrival_s * 1e6));
+        if (sched.add_request(prompt_tokens[m.submitted + m.rejected],
+                              scheduled_arrival) < 0) {
           m.rejected++;
         } else {
           m.submitted++;
@@ -449,8 +484,15 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
       peak_busy = std::max(peak_busy, busy);
       kv_samples++;
     }
-    queue_len_sum += sched.num_waiting();
-    queue_samples++;
+    // 排队长度:按时间加权积分(不是按循环迭代取平均)。空闲时本循环以
+    // ~200us 空转、解码步约 20ms,按迭代平均会让空转的 0 把均值稀释掉。
+    // 采样点在 step() 之前,故该值代表"上一次采样至今"这段时间的队长。
+    {
+      auto now_tp = Clock::now();
+      queue_area_s += static_cast<double>(sched.num_waiting()) *
+                      std::chrono::duration<double>(now_tp - last_queue_sample).count();
+      last_queue_sample = now_tp;
+    }
 
     sched.step();
   }
@@ -467,7 +509,12 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
   std::vector<double> ttfts, tpots, e2es, itls, qwaits, per_seq_frag;
   for (const auto& seq : finished) {
     if (warm_ids.count(seq.id)) continue;  // 跳过预热请求
-    if (seq.num_generated_tokens <= 0) continue;
+    if (seq.num_generated_tokens <= 0) {
+      // 进了调度器却一个 token 都没生成(KV 扩张失败 / 前向失败强制结束):
+      // 计入 dropped,保证 submitted == completed + rejected + dropped。
+      m.dropped++;
+      continue;
+    }
     double arrival_ms =
         std::chrono::duration<double, std::milli>(seq.arrival_time - start).count();
     double admit_ms =
@@ -511,8 +558,10 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
   m.output_tps = total_s > 0 ? m.output_tokens / total_s : 0;
   m.total_tps = total_s > 0 ? m.total_tokens / total_s : 0;
   m.goodput_rps = total_s > 0 ? m.goodput_count / total_s : 0;
-  m.goodput_pct = m.completed > 0
-                      ? static_cast<double>(m.goodput_count) / m.completed : 0;
+  // 分母用 submitted:未完成 / 被拒 / 丢弃的请求都不算达标,只看完成请求会
+  // 把过载丢请求的代价藏起来。
+  m.goodput_pct = m.submitted > 0
+                      ? static_cast<double>(m.goodput_count) / m.submitted : 0;
 
   // ---- 延迟 ----
   m.ttft_avg_ms = mean(ttfts);
@@ -530,8 +579,7 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
   m.queue_wait_avg_ms = mean(qwaits);
   m.queue_wait_p50_ms = percentile(qwaits, 50);
   m.queue_wait_p99_ms = percentile(qwaits, 99);
-  m.avg_queue_len =
-      queue_samples > 0 ? static_cast<double>(queue_len_sum) / queue_samples : 0;
+  m.avg_queue_len = total_s > 0 ? queue_area_s / total_s : 0;
 
   // ---- KV cache 碎片率(与 offline 同口径) ----
   m.kv_cache_util_global =
@@ -561,6 +609,13 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
   m.enable_prefix_cache = sched.prefix_cache_enabled();
   m.prefix = sched.prefix_cache_stats();
 
+  // 正式窗口内的 CUDA graph 捕获开销(预热后已清零;在线负载 batch size 变化
+  // 频繁,窗口内新 batch size 会触发惰性捕获,单列出来供口径修正)。
+  const auto gs = model->graph_stats();
+  m.graph_captures = gs.captures;
+  m.graph_evictions = gs.evictions;
+  m.graph_capture_ms = gs.capture_ms + gs.evict_sync_ms;
+
   return m;
 }
 
@@ -573,8 +628,9 @@ static void write_csv(const std::string& path,
     LOG(ERROR) << "无法打开输出文件: " << path;
     return;
   }
-  f << "run_id,request_rate,burstiness,duration_s,num_requests,submitted,"
-       "completed,rejected,prompt_tokens,output_tokens,total_tokens,wall_time_s,"
+  f << "run_id,request_rate,burstiness,duration_s,max_batch,auto_batch,max_gen,"
+       "block_size,num_requests,submitted,"
+       "completed,rejected,dropped,prompt_tokens,output_tokens,total_tokens,wall_time_s,"
        "completed_rps,output_tps,total_tps,"
        "ttft_avg_ms,ttft_p50_ms,ttft_p99_ms,"
        "tpot_avg_ms,tpot_p50_ms,tpot_p99_ms,itl_avg_ms,itl_p99_ms,"
@@ -585,14 +641,18 @@ static void write_csv(const std::string& path,
        "avg_busy_kv_slots,peak_busy_kv_slots,"
        "avg_batch_size,avg_batch_reconstruct_ms,p99_batch_reconstruct_ms,"
        "mfu,peak_tflops,gpu_sm_util_pct,gpu_mem_util_pct,gpu_mem_used_mb,"
+       "graph_captures,graph_evictions,graph_capture_ms,"
        "enable_prefix_cache,"
        "prefix_cache_lookups,prefix_cache_hits,prefix_cache_hit_rate,"
        "prefix_cache_matched_blocks,prefix_cache_inserts,prefix_cache_evictions\n";
   f << std::fixed << std::setprecision(6);
   for (const auto& r : results) {
     f << r.run_id << "," << r.request_rate << "," << r.burstiness << ","
-      << r.duration_s << "," << r.num_requests << "," << r.submitted << ","
-      << r.completed << "," << r.rejected << "," << r.prompt_tokens << ","
+      << r.duration_s << "," << r.max_batch << "," << (r.auto_batch ? 1 : 0) << ","
+      << r.max_gen << "," << r.block_size << ","
+      << r.num_requests << "," << r.submitted << ","
+      << r.completed << "," << r.rejected << "," << r.dropped << ","
+      << r.prompt_tokens << ","
       << r.output_tokens << "," << r.total_tokens << "," << r.wall_time_s << ","
       << r.completed_rps << "," << r.output_tps << "," << r.total_tps << ","
       << r.ttft_avg_ms << "," << r.ttft_p50_ms << "," << r.ttft_p99_ms << ","
@@ -607,6 +667,8 @@ static void write_csv(const std::string& path,
       << r.avg_batch_reconstruct_ms << "," << r.p99_batch_reconstruct_ms << ","
       << r.mfu << "," << r.peak_tflops << "," << r.gpu_sm_util_pct << ","
       << r.gpu_mem_util_pct << "," << r.gpu_mem_used_mb << ","
+      << r.graph_captures << "," << r.graph_evictions << ","
+      << r.graph_capture_ms << ","
       << (r.enable_prefix_cache ? 1 : 0) << ","
       << r.prefix.lookups << "," << r.prefix.hits << ","
       << r.prefix.hit_rate() << "," << r.prefix.matched_blocks << ","
@@ -624,6 +686,10 @@ static void print_report(const ServingMetrics& r, const Args& args) {
   std::cout << std::fixed << std::setprecision(2);
   std::cout << "Successful requests:                    " << r.completed << "\n";
   std::cout << "Rejected requests:                      " << r.rejected << "\n";
+  std::cout << "Dropped requests (0 tokens):            " << r.dropped << "\n";
+  std::cout << "Scheduler config:                       max_batch=" << r.max_batch
+            << (r.auto_batch ? " (auto)" : " (explicit)")
+            << " max_gen=" << r.max_gen << " block_size=" << r.block_size << "\n";
   std::cout << "Benchmark duration (s):                 " << r.wall_time_s << "\n";
   std::cout << "Total input tokens:                     " << r.prompt_tokens << "\n";
   std::cout << "Total generated tokens:                 " << r.output_tokens << "\n";
@@ -632,7 +698,7 @@ static void print_report(const ServingMetrics& r, const Args& args) {
   std::cout << "Total Token throughput (tok/s):         " << r.total_tps << "\n";
   if (args.ttft_sla_ms > 0 || args.tpot_sla_ms > 0) {
     std::cout << "Goodput (req/s):                        " << r.goodput_rps
-              << "  (" << r.goodput_count << "/" << r.completed << " = "
+              << "  (" << r.goodput_count << "/" << r.submitted << " submitted = "
               << pct(r.goodput_pct) << "% within SLA:";
     if (args.ttft_sla_ms > 0) std::cout << " TTFT<=" << args.ttft_sla_ms << "ms";
     if (args.tpot_sla_ms > 0) std::cout << " TPOT<=" << args.tpot_sla_ms << "ms";
@@ -664,7 +730,7 @@ static void print_report(const ServingMetrics& r, const Args& args) {
   std::cout << "Mean Queue Wait (ms):                   " << r.queue_wait_avg_ms << "\n";
   std::cout << "Median Queue Wait (ms):                 " << r.queue_wait_p50_ms << "\n";
   std::cout << "P99 Queue Wait (ms):                    " << r.queue_wait_p99_ms << "\n";
-  std::cout << "Mean Queue Length:                      " << r.avg_queue_len << "\n";
+  std::cout << "Mean Queue Length (time-weighted):      " << r.avg_queue_len << "\n";
 
   std::cout << "-----------------------System-----------------------\n";
   std::cout << "KV cache fragmentation (global):        " << pct(r.kv_cache_frag_global)
@@ -688,6 +754,25 @@ static void print_report(const ServingMetrics& r, const Args& args) {
             << " (" << r.prefix.hit_rate() * 100.0 << "%)  matched_blocks="
             << r.prefix.matched_blocks << "  inserts=" << r.prefix.inserts
             << "  evictions=" << r.prefix.evictions << "\n";
+  std::cout << std::setprecision(3);
+  std::cout << "CUDA graph captures (in window):        " << r.graph_captures
+            << "  (+" << r.graph_evictions << " LRU evictions, "
+            << r.graph_capture_ms << " ms";
+  if (r.wall_time_s > 0) {
+    std::cout << " = " << std::setprecision(2)
+              << (r.graph_capture_ms / (r.wall_time_s * 1000.0) * 100.0) << "% of wall";
+  }
+  std::cout << ")\n";
+  // 请求账目必须闭合:提交 = 完成 + 拒绝 + 丢弃。
+  const int accounted = r.completed + r.rejected + r.dropped;
+  if (accounted != r.submitted) {
+    std::cout << "[警告] 请求账目不平: 提交 " << r.submitted << " != 完成 "
+              << r.completed << " + 拒绝 " << r.rejected << " + 丢弃 " << r.dropped
+              << " = " << accounted << "\n";
+  } else if (r.dropped > 0) {
+    std::cout << "[警告] 有 " << r.dropped
+              << " 条请求零 token 结束(KV 扩张失败或前向失败),已计入 dropped\n";
+  }
   std::cout << "====================================================\n";
 }
 

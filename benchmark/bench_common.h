@@ -224,14 +224,19 @@ inline double peak_fp32_tflops() {
   return cores * 2.0 * clock_ghz / 1000.0;  // TFLOPS
 }
 
-// 每 SM 每周期 BF16 Tensor Core 稠密 FLOPs(查表,按 NVIDIA 官方峰值折算):
-// Ampere 1024(A100: 108 SM x 1.41GHz x 1024 ≈ 156 TFLOPS dense),Hopper 4096
-// (H100 SXM: 132 SM x 1.83GHz x 4096 ≈ 990 TFLOPS dense);无 BF16 TC 返回 0。
+// 每 SM 每周期 BF16 Tensor Core 稠密 FLOPs(查表,按 NVIDIA 官方表格折算;
+// 均为带 FP32 累加的 dense 值,不含结构化稀疏的 2 倍):
+//   A100(cc 8.0) 2048:108 SM x 1.41GHz x 2048 ≈ 312 TFLOPS dense;
+//   消费级 Ampere(8.6)/Ada(8.9) 512:RTX 4090 约 128 SM x 2.52GHz x 512 ≈ 165;
+//   Hopper(9.0)及之后 4096:H100 SXM 132 SM x 1.83GHz x 4096 ≈ 990 TFLOPS dense。
+// 数据中心 Ampere 的 Tensor Core 吞吐是消费级的 4 倍,二者不能共用一个常数;
+// 前代(Volta/Turing)无 BF16 Tensor Core,返回 0。
 inline double bf16_flops_per_sm(int major, int minor) {
   int cc = major * 10 + minor;
-  if (cc >= 90) return 4096;  // Hopper(90)及之后按 4096 起步
-  if (cc >= 80) return 1024;  // Ampere(80/86)
-  return 0;                   // 前代无 BF16 Tensor Core
+  if (cc >= 90) return 4096;              // Hopper(90)及之后按 4096 起步
+  if (cc == 80) return 2048;              // A100 / A30(数据中心 Ampere)
+  if (cc == 86 || cc == 89) return 512;   // 消费级 Ampere / Ada
+  return 0;                               // 前代无 BF16 Tensor Core
 }
 
 // 理论峰值 BF16 TFLOPS(仅 BF16 模型 MFU 用;架构不支持时返回 0)

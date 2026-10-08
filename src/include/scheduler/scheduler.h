@@ -39,16 +39,33 @@ class Scheduler {
   // Verifies the block pool invariant (no refcount leak stranded blocks).
   ~Scheduler();
 
-  int add_request(const std::vector<int>& prompt_tokens);
+  // arrival_time: when the request reached the system. Defaults to the call
+  // instant; an online driver that generates arrivals on a schedule should
+  // pass the scheduled instant so TTFT / queue-wait are not quantized to the
+  // scheduler's step boundaries.
+  int add_request(const std::vector<int>& prompt_tokens,
+                  TimePoint arrival_time = std::chrono::steady_clock::now());
   void step();                          // Single scheduling iteration
   bool all_finished() const;
   const std::vector<Sequence>& get_finished() const { return finished_sequences_; }
   const std::vector<Sequence>& get_running() const { return running_sequences_; }
 
-  // Batch reconstruction timing (per-decode-step overhead)
+  // Batch reconstruction timing: host-side per-step overhead (row staging into
+  // the pinned host buffers + block-table copy), one record per step that has
+  // decode rows — mixed prefill+decode steps included, since their decode rows
+  // advance the batch just like a pure-decode step does.
   const std::vector<double>& get_batch_reconstruct_times_ms() const {
     return batch_reconstruct_times_ms_;
   }
+  // Decode rows of the same steps, index-aligned with
+  // get_batch_reconstruct_times_ms(). Sum = tokens decoded in those steps;
+  // size = number of decode steps (decode_rows[i] is that step's batch size).
+  const std::vector<int32_t>& get_decode_rows_per_step() const {
+    return decode_rows_per_step_;
+  }
+  // Drop both per-step series. Drivers call this after warm-up so the measured
+  // window's statistics do not mix in warm-up steps.
+  void clear_step_stats();
 
   // KV cache stats
   int get_busy_kv_slots() const;
@@ -165,7 +182,9 @@ class Scheduler {
   // batch is in flight: reserved to the admission cap (see the constructor).
   std::vector<Sequence> running_sequences_;
   std::vector<Sequence> finished_sequences_;
-  std::vector<double> batch_reconstruct_times_ms_;  // per decode-step overhead
+  // Per-step host-staging overhead and the decode rows of that step.
+  std::vector<double> batch_reconstruct_times_ms_;
+  std::vector<int32_t> decode_rows_per_step_;
   int max_batch_size_;
   int max_seq_len_;
   int max_gen_len_;
