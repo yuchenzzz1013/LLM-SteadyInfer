@@ -6,6 +6,10 @@ namespace kernel {
 typedef void (*AddKernel)(const tensor::Tensor& input1, const tensor::Tensor& input2,
                           const tensor::Tensor& output, void* stream);
 
+// Broadcast bias add: output[rows, cols] += bias[cols], in place on output.
+typedef void (*AddBiasKernel)(const tensor::Tensor& output, const tensor::Tensor& bias,
+                              int32_t rows, int32_t cols, void* stream);
+
 typedef void (*MatmulKernel)(const tensor::Tensor& input, const tensor::Tensor& weight,
                              const tensor::Tensor& output, float scale, const CudaConfig* config);
 
@@ -45,6 +49,8 @@ typedef void (*ScaleSumKernel)(const tensor::Tensor& value, const tensor::Tensor
                                void* stream);
 
 AddKernel get_add_kernel(base::DeviceType device_type);
+
+AddBiasKernel get_add_bias_kernel(base::DeviceType device_type);
 
 EmbeddingKernel get_emb_kernel(base::DeviceType device_type);
 

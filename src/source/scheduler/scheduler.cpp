@@ -35,9 +35,13 @@ int Scheduler::default_block_size() {
 // Max token-rows a single forward_batch step may carry (decode rows +
 // prefill chunk rows, each row = one token). max_batch_size_ only bounds the
 // decode side; prefill rows are decoupled from it (see build_batch_rows).
-// At max_batch >= 256 the KV pool already fills ~40 GB and the logits buffer
-// must stay at max_batch rows, so no decoupling there. The logits buffer and
-// this cap must stay in sync (both sized via row_cap_for).
+// At max_batch >= 256 the KV pool already fills ~40 GB and no further
+// decoupling is useful, so the cap collapses to max_batch there. Sized row_cap
+// is used by the host staging buffers and the step row cap; the logits buffer
+// is deliberately NOT sized by it — the LM head only ever runs on the leading
+// decode rows (<= max_batch, see Model::forward_batch), so sizing logits by
+// the step cap wasted (512 - max_batch) x vocab x 2 bytes (146 MB for Qwen3-4B
+// at max_batch 32).
 int Scheduler::row_cap_for(int max_batch_size) {
   return max_batch_size >= 256 ? max_batch_size : 512;
 }
@@ -47,11 +51,13 @@ Scheduler::Scheduler(std::shared_ptr<model::Model> model,
                      int max_seq_len,
                      int max_gen_len,
                      int block_size,
-                     bool enable_prefix_cache)
+                     bool enable_prefix_cache,
+                     size_t finished_history_limit)
     : model_(model),
       max_batch_size_(max_batch_size),
       max_seq_len_(max_seq_len),
-      max_gen_len_(max_gen_len > 0 ? max_gen_len : max_seq_len) {
+      max_gen_len_(max_gen_len > 0 ? max_gen_len : max_seq_len),
+      finished_history_limit_(finished_history_limit) {
   int kv_dim = model_->kv_dim();
   int num_layers = model_->layer_num();
   if (kv_dim <= 0 || num_layers <= 0) {
@@ -148,10 +154,11 @@ Scheduler::Scheduler(std::shared_ptr<model::Model> model,
                << " invalid — model file/tokenizer mismatch";
   }
   const base::DataType logits_dtype = model_->compute_dtype();
-  // Logits rows cover the largest possible mixed step (decode + prefill
-  // rows), not just max_batch decode rows — prefill-only forward_batch calls
-  // never use the buffer, but mixed steps compute the LM head over every row.
-  logits_ = tensor::Tensor(logits_dtype, row_cap_for(max_batch_size), vocab_size, true, alloc);
+  // One row per decode row: the LM head runs only on the leading decode rows
+  // of a step (a prefill chunk's logits would be thrown away), and decode rows
+  // are bounded by max_batch — the KV pool admits at most that many running
+  // sequences. See the CHECKs where the logits views are built.
+  logits_ = tensor::Tensor(logits_dtype, max_batch_size_, vocab_size, true, alloc);
 
   // Pinned per-step batch staging (see the members). CUDA only: cudaHostAlloc
   // needs a CUDA context, and a CPU run has no device copy to speed up.
@@ -777,10 +784,37 @@ void Scheduler::force_finish_all(const char* reason) {
       seq.state = SeqState::FINISHED;
       seq.finish_time = now;
       kv_manager_->deallocate(seq.kv_slot_id);
-      finished_sequences_.push_back(seq);
+      retire_finished(std::move(seq));
     }
   }
   running_sequences_.clear();
+}
+
+void Scheduler::retire_finished(Sequence&& seq) {
+  finished_sequences_.push_back(std::move(seq));
+  ++finished_total_;
+  if (finished_history_limit_ == 0 ||
+      finished_sequences_.size() <= finished_history_limit_) {
+    return;
+  }
+  // Drop down to 3/4 of the limit in one erase: evicting one record per
+  // retirement would shift the whole vector every time (O(limit) per request
+  // at steady state); a batch amortizes that to ~O(1) per record. The retained
+  // window therefore oscillates between the limit and 3/4 of it.
+  const size_t keep = finished_history_limit_ - finished_history_limit_ / 4;
+  const size_t drop = finished_sequences_.size() - keep;
+  finished_sequences_.erase(
+      finished_sequences_.begin(),
+      finished_sequences_.begin() + static_cast<std::ptrdiff_t>(drop));
+  finished_evicted_ += static_cast<long long>(drop);
+  if (!finished_evict_warned_) {
+    finished_evict_warned_ = true;
+    LOG(WARNING) << "[SCHED] finished-sequence history limit reached ("
+                 << finished_history_limit_
+                 << "): dropping oldest records. Per-request statistics of a "
+                    "long run only cover the retained window; raise the "
+                    "Scheduler's finished_history_limit to keep them all.";
+  }
 }
 
 void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
@@ -829,9 +863,25 @@ void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
     row_start[num_prefill_seqs] = batch;  // sentinel
   }
 
-  // Per-step H2D sources over the persistent pinned staging (see the members):
-  // reshape only touches the copy's shape metadata, the storage is reused.
+  // Live block-table width of this step: a row's kernels only ever index the
+  // entries its own token positions touch ([0, position / block_size]), so the
+  // staging copy and the model's H2D can be narrowed from the pool's capacity
+  // width (table_stride = ceil(max_seq_len / block_size): 256 columns at
+  // max_seq_len 4096 / block 16) to the widest row of this batch — a
+  // 100-token decode steps 7 columns instead of 256. The staged columns past
+  // the live prefix go stale on the host buffer and the device table keeps the
+  // capacity pitch, so kernel addressing and geometry (split counts, smem)
+  // are unchanged; the entries are simply never read (see the paged kernels'
+  // read bounds). 0 = "upload everything" (no paging / no narrowing).
   const int32_t table_stride = kv_manager_->max_blocks_per_seq();
+  int32_t table_cols = 0;
+  if (kv_manager_->is_paged()) {
+    for (const BatchRow* r : ordered) {
+      const int32_t cols = r->position / block_size_ + 1;
+      table_cols = std::max(table_cols, std::min(cols, table_stride));
+    }
+    CHECK_GT(table_cols, 0);
+  }
   CHECK_LE(batch, host_input_ids_.get_dim(0));
   tensor::Tensor input_ids = host_input_ids_;
   tensor::Tensor positions = host_positions_;
@@ -852,7 +902,8 @@ void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
     positions.index<int32_t>(i) = r.position;
 #ifdef USE_PAGED_ATTENTION
     kv_manager_->block_allocator()->copy_block_table_row(
-        r.seq->kv_slot_id, block_table.ptr<int32_t>() + static_cast<int64_t>(i) * table_stride);
+        r.seq->kv_slot_id, block_table.ptr<int32_t>() + static_cast<int64_t>(i) * table_stride,
+        table_cols);
 #else
     block_table.index<int32_t>(i) = r.seq->kv_slot_id;
 #endif
@@ -918,6 +969,9 @@ void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
     void* logits_ptr = logits_dtype == base::DataType::kDataTypeBF16
                            ? static_cast<void*>(logits_.ptr<uint16_t>())
                            : static_cast<void*>(logits_.ptr<float>());
+    CHECK_LE(batch, logits_.get_dim(0))
+        << "decode step has " << batch << " rows but the logits buffer holds "
+        << logits_.get_dim(0) << " (max_batch)";
     tensor::Tensor logits_view(logits_dtype, batch, model_->vocab_size(), false,
                                nullptr, logits_ptr);
     logits_view.set_device_type(model_->device_type());
@@ -925,7 +979,7 @@ void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
     auto status = model_->decode_step(input_ids, positions, block_table,
                                       kv_manager_->key_cache(),
                                       kv_manager_->value_cache(),
-                                      logits_view);
+                                      logits_view, table_cols);
     auto h_launched = std::chrono::steady_clock::now();
     if (!status) {
       force_finish_all("batch decode failed");
@@ -984,10 +1038,22 @@ void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
                                         kv_manager_->key_cache(),
                                         kv_manager_->value_cache(),
                                         logits_, need_logits, num_decode_rows,
-                                        seq_row_start_ptr, num_prefill_seqs);
+                                        seq_row_start_ptr, num_prefill_seqs, nullptr, table_cols);
     if (!status) {
       force_finish_all("batch prefill failed");
       return;
+    }
+    if (!need_logits) {
+      // Pure-prefill step: the LM head is skipped, so nothing pulls the
+      // stream back to the host below — yet this step's H2D uploads read the
+      // scheduler's pinned staging buffers and only complete when the device
+      // reaches them. Returning with those copies still queued would let the
+      // next step rewrite the staging under them (torn block table/positions,
+      // garbage indices downstream). A sampling step drains the stream through
+      // the sampler's host-visible event wait; a prefilling step must drain
+      // here. The host-side batch build of the next step is tiny, so nothing
+      // meaningful overlaps with this wait.
+      model_->sync_stream();
     }
 
     if (need_logits) {
@@ -1000,6 +1066,9 @@ void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
       void* logits_ptr = logits_dtype == base::DataType::kDataTypeBF16
                              ? static_cast<void*>(logits_.ptr<uint16_t>())
                              : static_cast<void*>(logits_.ptr<float>());
+      CHECK_LE(num_decode_rows, logits_.get_dim(0))
+          << "mixed step decodes " << num_decode_rows << " rows but the logits buffer holds "
+          << logits_.get_dim(0) << " (max_batch)";
       tensor::Tensor logits_view(logits_dtype, num_decode_rows, model_->vocab_size(), false,
                                  nullptr, logits_ptr);
       logits_view.set_device_type(model_->device_type());
@@ -1034,7 +1103,7 @@ void Scheduler::update_sequences() {
       it->state = SeqState::FINISHED;
       it->finish_time = now;
       kv_manager_->deallocate(it->kv_slot_id);
-      finished_sequences_.push_back(*it);
+      retire_finished(std::move(*it));
       it = running_sequences_.erase(it);
       continue;
     }
@@ -1061,7 +1130,7 @@ void Scheduler::update_sequences() {
       it->state = SeqState::FINISHED;
       it->finish_time = now;
       kv_manager_->deallocate(it->kv_slot_id);
-      finished_sequences_.push_back(*it);
+      retire_finished(std::move(*it));
       it = running_sequences_.erase(it);
       continue;
     }
@@ -1073,7 +1142,7 @@ void Scheduler::update_sequences() {
         it->state = SeqState::FINISHED;
         it->finish_time = now;
         kv_manager_->deallocate(it->kv_slot_id);
-        finished_sequences_.push_back(*it);
+        retire_finished(std::move(*it));
         it = running_sequences_.erase(it);
         continue;
       }

@@ -891,7 +891,8 @@ base::Status Qwen3Model::forward_batch(
     int32_t num_decode_rows,
     const tensor::Tensor* seq_row_start,
     int32_t num_prefill_seqs,
-    BatchScratch* scratch) const {
+    BatchScratch* scratch,
+    int32_t table_cols) const {
   if (input_ids.is_empty()) {
     return base::error::InvalidArgument("The input_ids tensor is empty.");
   }
@@ -1020,9 +1021,10 @@ base::Status Qwen3Model::forward_batch(
     if (scratch) {
       cudaMemcpyAsync(scratch->positions_cu.ptr<int32_t>(), positions.ptr<int32_t>(),
                       batch * sizeof(int32_t), cudaMemcpyHostToDevice, cuda_config_->stream);
-      cudaMemcpyAsync(scratch->block_table_cu.ptr<int32_t>(), block_table.ptr<int32_t>(),
-                      static_cast<size_t>(batch) * table_stride * sizeof(int32_t),
-                      cudaMemcpyHostToDevice, cuda_config_->stream);
+      // The block table is not uploaded here: decode_step already uploaded it
+      // into scratch->block_table_cu, on the stream and outside any capture, at
+      // the live width (table_cols) — a width that grows per step and so cannot
+      // be baked into the captured graph.
       positions_cu = scratch->positions_cu;
       block_table_cu = scratch->block_table_cu;
     } else {
@@ -1032,10 +1034,9 @@ base::Status Qwen3Model::forward_batch(
       cudaMemcpyAsync(const_cast<int32_t*>(positions_cu.ptr<int32_t>()),
                       positions.ptr<int32_t>(), batch * sizeof(int32_t), cudaMemcpyHostToDevice,
                       cuda_config_->stream);
-      cudaMemcpyAsync(const_cast<int32_t*>(block_table_cu.ptr<int32_t>()),
-                      block_table.ptr<int32_t>(),
-                      static_cast<size_t>(batch) * table_stride * sizeof(int32_t),
-                      cudaMemcpyHostToDevice, cuda_config_->stream);
+      upload_block_table_cu(cuda_config_->stream,
+                            const_cast<int32_t*>(block_table_cu.ptr<int32_t>()),
+                            block_table.ptr<int32_t>(), batch, table_stride, table_cols);
     }
   }
 

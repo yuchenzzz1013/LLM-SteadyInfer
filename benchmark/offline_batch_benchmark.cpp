@@ -266,9 +266,14 @@ static RunMetrics run_once(const std::shared_ptr<model::Model>& model,
   // 问题,命中率极低,开着只会带来哈希开销,并把已完成请求的 prompt 块钉在
   // 池里(几乎全部计入 kv_cache_frag_global)。缓存收益由
   // prefix_caching_benchmark 的 A/B 回答。
+  // finished_history_limit=0:本基准在运行结束后遍历 get_finished() 出逐请求
+  // 统计,并靠 submitted == completed + rejected + dropped 闭合 —— 历史上限
+  // 若淘汰记录会让这些数字静默变少。离线压测是有限请求的短进程,请求记录本身
+  // 就是全部统计,直接关掉淘汰(0 = 不淘汰;长驻服务才需要上限)。
   Scheduler sched(model, max_batch, max_total_seq_len, max_gen_len,
                   Scheduler::resolve_block_size(avg_prompt_len),
-                  /*enable_prefix_cache=*/enable_prefix_cache);
+                  /*enable_prefix_cache=*/enable_prefix_cache,
+                  /*finished_history_limit=*/0);
 
   // ---- 预热:与正式压测共用同一 Scheduler ----
   // decode CUDA graph 在首次 decode 时捕获并烘焙当时 KV/logits 的设备指针;

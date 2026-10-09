@@ -297,8 +297,10 @@ static RoundMetrics run_round(const std::shared_ptr<model::Model>& model,
   int max_total_seq_len =
       std::min(max_prompt_len + max_gen_len, static_cast<int>(model->seq_len()));
 
+  // finished_history_limit=0:同 offline —— 逐请求统计与 token 校验
+  // (--check-tokens)遍历 get_finished(),请求记录不能被历史上限淘汰。
   Scheduler sched(model, args.max_batch, max_total_seq_len, max_gen_len, block_size,
-                  enable_prefix_cache);
+                  enable_prefix_cache, /*finished_history_limit=*/0);
 
   // Prefix cache 只在 paged 模式(CUDA + USE_PAGED_ATTENTION)下真正建立;宿主
   // 不支持时宁可报错退出,也不要用两轮 "命中率全 0" 的数据误导结论。

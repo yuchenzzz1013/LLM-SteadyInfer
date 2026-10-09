@@ -72,7 +72,8 @@ class LLamaModel : public Model {
       int32_t num_decode_rows = 0,
       const tensor::Tensor* seq_row_start = nullptr,
       int32_t num_prefill_seqs = 0,
-      BatchScratch* scratch = nullptr) const override;
+      BatchScratch* scratch = nullptr,
+      int32_t table_cols = 0) const override;
 
   op::EmbeddingOutput embedding(const std::vector<int>& tokens) const override;
 

@@ -28,6 +28,17 @@ AddKernel get_add_kernel(base::DeviceType device_type) {
   }
 }
 
+AddBiasKernel get_add_bias_kernel(base::DeviceType device_type) {
+  if (device_type == base::DeviceType::kDeviceCPU) {
+    return add_bias_kernel_cpu;
+  } else if (device_type == base::DeviceType::kDeviceCUDA) {
+    return add_bias_kernel_cu;
+  } else {
+    LOG(FATAL) << "Unknown device type for get a add bias kernel.";
+    return nullptr;
+  }
+}
+
 EmbeddingKernel get_emb_kernel(base::DeviceType device_type) {
   if (device_type == base::DeviceType::kDeviceCPU) {
     return emb_kernel_normal;

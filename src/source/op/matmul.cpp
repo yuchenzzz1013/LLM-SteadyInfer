@@ -123,18 +123,14 @@ base::Status MatmulLayer::forward() {
   }
 
   if (has_bias_) {
+    // One broadcast add for the whole [batch, K] output. The per-row loop this
+    // replaces cost `batch` launches per biased projection per layer (Qwen2's
+    // fused QKV: 36 x batch launches per step at batch 32); the broadcast
+    // kernel reads the same [K] bias vector for every row, so the results are
+    // identical element by element.
     const auto& bias = get_bias(0);
     void* stream = cuda_config_ ? cuda_config_->stream : nullptr;
-    if (batch > 1) {
-      for (int b = 0; b < batch; ++b) {
-        tensor::Tensor output_view(dtype, K, false, nullptr,
-                                   output.ptr<uint8_t>(static_cast<int64_t>(b) * K * elem_size));
-        output_view.set_device_type(device_type_);
-        kernel::get_add_kernel(device_type_)(output_view, bias, output_view, stream);
-      }
-    } else {
-      kernel::get_add_kernel(device_type_)(output_flat, bias, output_flat, stream);
-    }
+    kernel::get_add_bias_kernel(device_type_)(output_flat, bias, batch, K, stream);
   }
 
   return base::error::Success();

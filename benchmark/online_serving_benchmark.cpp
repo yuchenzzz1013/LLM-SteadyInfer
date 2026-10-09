@@ -351,8 +351,12 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
   // 前缀缓存默认关闭(--prefix-cache 1 打开):请求独立时命中率极低,开着只会
   // 把已完成请求的 prompt 块钉在池里、并把哈希开销计入延迟。缓存收益本身由
   // prefix_caching_benchmark 的 A/B 回答。
+  // finished_history_limit=0:同 offline —— 逐请求 TTFT/TPOT/E2E 与
+  // submitted == completed + rejected + dropped 都靠运行结束时的
+  // get_finished() 复核(在线压测的条数上界 = 数据集条数 + 预热条数,可控)。
   Scheduler sched(model, max_batch, max_total_seq_len, args.max_gen, block_size,
-                  /*enable_prefix_cache=*/args.prefix_cache != 0);
+                  /*enable_prefix_cache=*/args.prefix_cache != 0,
+                  /*finished_history_limit=*/0);
   m.block_size = sched.get_block_size();
 
   // ---- 预热:与正式压测共用同一 Scheduler(同 offline,统计中跳过) ----

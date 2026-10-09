@@ -39,6 +39,12 @@ __global__ void row_rmsnorm_bf16(const __nv_bfloat16* in, const __nv_bfloat16* w
 }
 
 // Multi-row form (dim1 = last dim): one block per row of `size` elements.
+// The square-sum and the write-back read 8 bf16 (one uint4) per thread step
+// when the pointers are 16-byte aligned and size % 8 == 0; the 2560-wide
+// hidden norms are bandwidth-bound per row and the scalar form issued 8x the
+// load/store instructions for the same traffic. Unaligned views and odd sizes
+// keep the scalar loop. Row sums still accumulate in fp32; only the order of
+// the per-thread partial sums differs from the scalar form.
 __global__ void row_rmsnorm_bf16_dim(const __nv_bfloat16* in, const __nv_bfloat16* wei,
                                      __nv_bfloat16* out, int dim_size, int size, float eps) {
   const int bid = blockIdx.x;
@@ -48,14 +54,31 @@ __global__ void row_rmsnorm_bf16_dim(const __nv_bfloat16* in, const __nv_bfloat1
   }
   const __nv_bfloat16* block_in = in + static_cast<int64_t>(bid) * size;
   __nv_bfloat16* block_out = out + static_cast<int64_t>(bid) * size;
+  const bool vec = (size % 8 == 0) && ((reinterpret_cast<uintptr_t>(block_in) & 0xF) == 0) &&
+                   ((reinterpret_cast<uintptr_t>(wei) & 0xF) == 0) &&
+                   ((reinterpret_cast<uintptr_t>(block_out) & 0xF) == 0);
 
   float sum = 0.0f;
-  for (int i = tid; i < size; i += blockDim.x) {
-    const float x = __bfloat162float(block_in[i]);
-    sum += x * x;
+  if (vec) {
+    const int nvec = size >> 3;
+    for (int v = tid; v < nvec; v += blockDim.x) {
+      const uint4 raw = reinterpret_cast<const uint4*>(block_in)[v];
+      const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&raw);
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const float x = __bfloat162float(h[j].x);
+        const float y = __bfloat162float(h[j].y);
+        sum += x * x + y * y;
+      }
+    }
+  } else {
+    for (int i = tid; i < size; i += blockDim.x) {
+      const float x = __bfloat162float(block_in[i]);
+      sum += x * x;
+    }
   }
 
-  using BlockReduce = cub::BlockReduce<float, 128>;
+  using BlockReduce = cub::BlockReduce<float, 256>;
   __shared__ typename BlockReduce::TempStorage temp;
   __shared__ float shared_val;
   sum = BlockReduce(temp).Sum(sum);
@@ -66,6 +89,23 @@ __global__ void row_rmsnorm_bf16_dim(const __nv_bfloat16* in, const __nv_bfloat1
   sum = shared_val;
   const float scale = rsqrtf(sum / static_cast<float>(size) + eps);
 
+  if (vec) {
+    const int nvec = size >> 3;
+    for (int v = tid; v < nvec; v += blockDim.x) {
+      const uint4 raw = reinterpret_cast<const uint4*>(block_in)[v];
+      const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&raw);
+      const uint4 wraw = reinterpret_cast<const uint4*>(wei)[v];
+      const __nv_bfloat162* wh = reinterpret_cast<const __nv_bfloat162*>(&wraw);
+      __nv_bfloat162 o[4];
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        o[j] = __floats2bfloat162_rn(scale * __bfloat162float(h[j].x) * __bfloat162float(wh[j].x),
+                                     scale * __bfloat162float(h[j].y) * __bfloat162float(wh[j].y));
+      }
+      reinterpret_cast<uint4*>(block_out)[v] = *reinterpret_cast<const uint4*>(o);
+    }
+    return;
+  }
   for (int i = tid; i < size; i += blockDim.x) {
     const float x = __bfloat162float(block_in[i]);
     const float w = __bfloat162float(wei[i]);
@@ -180,7 +220,9 @@ void rmsnorm_kernel_cu_dim(const tensor::Tensor& input, const tensor::Tensor& we
     }
     return;
   }
-  constexpr int threads_num = 128;
+  // 256 threads: one uint4 per thread covers 2048 of the 2560-element rows in
+  // a single step (the kernel's block reduce is templated on this block size).
+  constexpr int threads_num = 256;
   if (stream) {
     cudaStream_t stream_ = static_cast<cudaStream_t>(stream);
     row_rmsnorm_bf16_dim<<<dim_size, threads_num, 0, stream_>>>(in_ptr, wei_ptr, out_ptr,

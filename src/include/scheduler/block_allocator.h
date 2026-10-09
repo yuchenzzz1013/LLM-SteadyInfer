@@ -81,8 +81,14 @@ class BlockAllocator {
   // Rows currently owned by a sequence (allocate_blocks .. free_all).
   int num_busy_rows() const;
 
-  // Copy a row's block table into dst (max_blocks_per_seq entries).
-  void copy_block_table_row(int row, int32_t* dst) const;
+  // Copy a row's block table into dst as a flat run of `n_cols` entries
+  // starting at its first entry. n_cols <= 0 copies the full capacity width
+  // (max_blocks_per_seq entries, clamped above); a positive value copies only
+  // that prefix — all a row can reference, since the paged kernels bound every
+  // block-table index by the row's own token positions and the entries past
+  // ceil(position / block_size) are unread. The scheduler uses the narrow form
+  // to keep the per-step staging + H2D off the pool's capacity width.
+  void copy_block_table_row(int row, int32_t* dst, int32_t n_cols = 0) const;
   const int32_t* block_table_row(int row) const;
 
   int free_block_count() const;

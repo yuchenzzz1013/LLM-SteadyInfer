@@ -29,12 +29,20 @@ class Scheduler {
   // so hashing and pinned KV blocks are pure overhead there; multi-turn chat,
   // where every turn re-sends the whole history, turns it on explicitly.
   // LLAMA_ENABLE_PREFIX_CACHE=1 forces it on for A/B runs.
+  // finished_history_limit: how many retired sequences stay queryable through
+  //   get_finished(). A serving process runs for days and would otherwise
+  //   accumulate every completed request (prompt / generated tokens,
+  //   timestamps) forever; beyond the limit the oldest records are dropped in
+  //   batches (see retire_finished). 0 keeps everything (only for short
+  //   deterministic runs). Benchmarks pass their request count so their
+  //   per-request statistics always cover the whole run.
   Scheduler(std::shared_ptr<model::Model> model,
             int max_batch_size,
             int max_seq_len,
             int max_gen_len = 0,
             int block_size = 0,
-            bool enable_prefix_cache = false);
+            bool enable_prefix_cache = false,
+            size_t finished_history_limit = kDefaultFinishedHistory);
 
   // Verifies the block pool invariant (no refcount leak stranded blocks).
   ~Scheduler();
@@ -48,6 +56,15 @@ class Scheduler {
   void step();                          // Single scheduling iteration
   bool all_finished() const;
   const std::vector<Sequence>& get_finished() const { return finished_sequences_; }
+  // Sequences retired since construction, including any dropped by the
+  // history limit. finished_total() - get_finished().size() == finished_evicted().
+  size_t finished_total() const { return finished_total_; }
+  // Records dropped because the retained history hit finished_history_limit
+  // (always 0 when the limit is 0). A driver whose per-request statistics must
+  // cover every request should raise the limit at construction and treat a
+  // non-zero value here as "stats are truncated".
+  long long finished_evicted() const { return finished_evicted_; }
+  static constexpr size_t kDefaultFinishedHistory = 4096;
   const std::vector<Sequence>& get_running() const { return running_sequences_; }
 
   // Batch reconstruction timing: host-side per-step overhead (row staging into
@@ -145,6 +162,9 @@ class Scheduler {
   void record_committed_prefill();
   // Unrecoverable forward failure: retire every running sequence.
   void force_finish_all(const char* reason);
+  // Move a retired sequence into finished_sequences_, enforcing the history
+  // limit (drops the oldest records in batches).
+  void retire_finished(Sequence&& seq);
 
   std::shared_ptr<model::Model> model_;
   std::unique_ptr<KVManager> kv_manager_;
@@ -182,6 +202,10 @@ class Scheduler {
   // batch is in flight: reserved to the admission cap (see the constructor).
   std::vector<Sequence> running_sequences_;
   std::vector<Sequence> finished_sequences_;
+  size_t finished_history_limit_ = kDefaultFinishedHistory;
+  size_t finished_total_ = 0;       // retired sequences, evicted ones included
+  long long finished_evicted_ = 0;  // records dropped by the history limit
+  bool finished_evict_warned_ = false;
   // Per-step host-staging overhead and the decode rows of that step.
   std::vector<double> batch_reconstruct_times_ms_;
   std::vector<int32_t> decode_rows_per_step_;

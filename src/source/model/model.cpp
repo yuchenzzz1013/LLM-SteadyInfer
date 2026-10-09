@@ -62,10 +62,10 @@ void BatchScratch::ensure(int32_t batch, int32_t hidden_dim, int32_t dim, int32_
   // Fused gate/up FFN output [batch, 2*ffn_dim], same reasoning.
   w13_out = tensor::Tensor(dtype, batch, 2 * ffn_dim, true, alloc);
 
-  // Host staging for the captured H2D upload nodes (tokens / positions /
-  // block table). Page-locked on CUDA so each graph replay's uploads are real
-  // DMAs; with pageable staging the driver stages through a bounce buffer and
-  // blocks the replaying thread for the duration of every copy.
+  // Host staging for the captured H2D upload nodes (tokens / positions).
+  // Page-locked on CUDA so each graph replay's uploads are real DMAs; with
+  // pageable staging the driver stages through a bounce buffer and blocks the
+  // replaying thread for the duration of every copy.
   auto alloc_host = (device == base::DeviceType::kDeviceCUDA)
                         ? std::shared_ptr<base::DeviceAllocator>(
                               base::PinnedCPUDeviceAllocatorFactory::get_instance())
@@ -73,8 +73,6 @@ void BatchScratch::ensure(int32_t batch, int32_t hidden_dim, int32_t dim, int32_
                               base::CPUDeviceAllocatorFactory::get_instance());
   input_ids = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc_host);
   positions = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc_host);
-  block_table = tensor::Tensor(base::DataType::kDataTypeInt32, batch, block_table_stride,
-                               true, alloc_host);
   input_token_num = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true,
                                    base::CPUDeviceAllocatorFactory::get_instance());
 
@@ -107,13 +105,14 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
                                 const tensor::Tensor& block_table,
                                 tensor::Tensor& key_cache,
                                 tensor::Tensor& value_cache,
-                                tensor::Tensor& logits) {
+                                tensor::Tensor& logits,
+                                int32_t table_cols) {
   const bool use_graph = device_type_ == base::DeviceType::kDeviceCUDA && use_cuda_graphs_;
   if (!use_graph) {
     // Pure decode: every row is a decode row (num_decode_rows == batch), no prefill
     // row map is needed.
     return forward_batch(input_ids, positions, block_table, key_cache, value_cache, logits,
-                         true, input_ids.get_dim(0), nullptr, 0);
+                         true, input_ids.get_dim(0), nullptr, 0, nullptr, table_cols);
   }
 
   const int32_t batch = input_ids.get_dim(0);
@@ -191,15 +190,22 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
                          dims.block_size, device_type_, dtype, alloc);
 
   // 2. Stage the new inputs at stable host addresses. forward_batch uploads
-  // them to the device staging buffers, so the H2D copies become captured
-  // "upload nodes" and each graph replay re-reads the fresh host data.
+  // tokens/positions to the device staging buffers, so those H2D copies become
+  // captured "upload nodes" and each graph replay re-reads the fresh host data.
   tensor::Tensor& stage_ids = entry->scratch->input_ids;
   tensor::Tensor& stage_pos = entry->scratch->positions;
-  tensor::Tensor& stage_bt = entry->scratch->block_table;
   std::memcpy(stage_ids.ptr<int32_t>(), input_ids.ptr<int32_t>(), batch * sizeof(int32_t));
   std::memcpy(stage_pos.ptr<int32_t>(), positions.ptr<int32_t>(), batch * sizeof(int32_t));
-  std::memcpy(stage_bt.ptr<int32_t>(), block_table.ptr<int32_t>(),
-              static_cast<size_t>(batch) * table_stride * sizeof(int32_t));
+
+  // Block table: uploaded here, on the stream, BEFORE any capture or replay —
+  // not staged into the graph. Its live width is ceil(max_position /
+  // block_size) + 1 columns and therefore grows from step to step, while a
+  // captured copy would bake in the width of the capture step. The pitch
+  // stays the capacity width, so the device tensor's geometry (and every
+  // stride/split decision the kernels derive from it) is unchanged; only the
+  // bytes moved shrink to the columns this step can reference.
+  upload_block_table_cu(cuda_config_->stream, entry->scratch->block_table_cu.ptr<int32_t>(),
+                        block_table.ptr<int32_t>(), batch, table_stride, table_cols);
 
   // Logits carry the scheduler buffer's element type (BF16 for a CUDA BF16
   // model): build the view with the same dtype, aligned with logits.data_type()
@@ -217,9 +223,9 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
       return e && e[0] == '1';
     }();
     if (no_graph) {
-      return forward_batch(stage_ids, stage_pos, stage_bt, key_cache, value_cache,
+      return forward_batch(stage_ids, stage_pos, block_table, key_cache, value_cache,
                            entry->logits_view, true, batch, nullptr, 0,
-                           entry->scratch.get());
+                           entry->scratch.get(), table_cols);
     }
   }
 
@@ -257,14 +263,14 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
       entry->capture_failed = true;
       LOG(WARNING) << "[GRAPH] cudaStreamBeginCapture failed (" << cudaGetErrorString(cap_err)
                    << "); falling back to direct decode for batch=" << batch;
-      return forward_batch(stage_ids, stage_pos, stage_bt, key_cache, value_cache,
+      return forward_batch(stage_ids, stage_pos, block_table, key_cache, value_cache,
                            entry->logits_view, true, batch, nullptr, 0,
-                           entry->scratch.get());
+                           entry->scratch.get(), table_cols);
     }
 
-    auto status = forward_batch(stage_ids, stage_pos, stage_bt, key_cache, value_cache,
+    auto status = forward_batch(stage_ids, stage_pos, block_table, key_cache, value_cache,
                                 entry->logits_view, true, batch, nullptr, 0,
-                           entry->scratch.get());
+                           entry->scratch.get(), table_cols);
     cudaGraph_t graph = nullptr;
     cap_err = cudaStreamEndCapture(stream, &graph);
     if (cap_err != cudaSuccess || !status || graph == nullptr) {
@@ -278,9 +284,9 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
       cudaGetLastError();
       LOG(WARNING) << "[GRAPH] Capture failed for batch=" << batch
                    << "; falling back to direct decode.";
-      return forward_batch(stage_ids, stage_pos, stage_bt, key_cache, value_cache,
+      return forward_batch(stage_ids, stage_pos, block_table, key_cache, value_cache,
                            entry->logits_view, true, batch, nullptr, 0,
-                           entry->scratch.get());
+                           entry->scratch.get(), table_cols);
     }
 
     cap_err = cudaGraphInstantiate(&entry->exec, graph, 0);
@@ -289,9 +295,9 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
       entry->capture_failed = true;
       LOG(WARNING) << "[GRAPH] cudaGraphInstantiate failed (" << cudaGetErrorString(cap_err)
                    << "); falling back to direct decode for batch=" << batch;
-      return forward_batch(stage_ids, stage_pos, stage_bt, key_cache, value_cache,
+      return forward_batch(stage_ids, stage_pos, block_table, key_cache, value_cache,
                            entry->logits_view, true, batch, nullptr, 0,
-                           entry->scratch.get());
+                           entry->scratch.get(), table_cols);
     }
     graph_stats_.captures++;
     graph_stats_.capture_ms += std::chrono::duration<double, std::milli>(
@@ -331,9 +337,9 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
   }
 
   // capture_failed forever: direct batched forward with the stable scratch.
-  return forward_batch(stage_ids, stage_pos, stage_bt, key_cache, value_cache,
-                       entry->logits_view, true, batch, nullptr, 0,
-                           entry->scratch.get());
+  return forward_batch(stage_ids, stage_pos, block_table, key_cache, value_cache,
+                       entry->logits_view, true, batch, nullptr, 0, entry->scratch.get(),
+                       table_cols);
 }
 
 base::ModelType Model::model_type() const { return model_type_; }

@@ -219,9 +219,10 @@ const int32_t* BlockAllocator::block_table_row(int row) const {
   return block_tables_.data() + static_cast<size_t>(row) * max_blocks_per_seq_;
 }
 
-void BlockAllocator::copy_block_table_row(int row, int32_t* dst) const {
+void BlockAllocator::copy_block_table_row(int row, int32_t* dst, int32_t n_cols) const {
+  const int32_t n = (n_cols <= 0 || n_cols > max_blocks_per_seq_) ? max_blocks_per_seq_ : n_cols;
   const int32_t* src = block_table_row(row);
-  for (int i = 0; i < max_blocks_per_seq_; ++i) {
+  for (int32_t i = 0; i < n; ++i) {
     dst[i] = src[i];
   }
 }

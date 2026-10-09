@@ -61,8 +61,11 @@ struct BatchScratch {
   tensor::Tensor tokens_cu, positions_cu, block_table_cu;
 
   // Host staging at stable addresses (CUDA graph path writes new values here
-  // before each launch; the H2D uploads happen outside the captured graph).
-  tensor::Tensor input_ids, positions, block_table, input_token_num;
+  // before each launch; the token / position H2D uploads are captured graph
+  // nodes). The block table is NOT staged here: its live width changes every
+  // step (see decode_step), so it is uploaded outside the capture straight
+  // into block_table_cu.
+  tensor::Tensor input_ids, positions, input_token_num;
 
   // Allocate (or keep, when sizes already match) every buffer above.
   // dtype selects the activation element type: kDataTypeBF16 on CUDA models
@@ -245,6 +248,31 @@ inline void split_fused_qkv_output(tensor::Tensor& qkv_out, int32_t batch, int32
   }
 }
 
+// H2D upload of a paged block table into its [batch, table_stride] device copy,
+// narrowed to the `table_cols` leading columns per row that can hold live
+// entries (see Model::forward_batch). The row pitch stays the capacity width
+// (table_stride * sizeof(int32_t)) on both sides, so the transfer is one 2D
+// copy of batch x table_cols x 4 bytes instead of batch x table_stride x 4
+// bytes: at max_seq_len 4096 / block_size 16 that is 4-80 bytes per row early
+// in a sequence, against 1 KB of capacity. The columns past table_cols are
+// never read — every paged kernel bounds its block-table index by the row's
+// own token positions — and the device tensor keeps the capacity width, so the
+// kernels' stride / geometry decisions (split counts, smem sizing) do not
+// change with the live width. table_cols <= 0 or >= table_stride uploads the
+// full width.
+inline void upload_block_table_cu(cudaStream_t stream, int32_t* dst, const int32_t* src,
+                                  int32_t batch, int32_t table_stride, int32_t table_cols) {
+  CHECK_GT(table_stride, 0);
+  const size_t pitch = static_cast<size_t>(table_stride) * sizeof(int32_t);
+  const int32_t cols = (table_cols > 0 && table_cols < table_stride) ? table_cols : table_stride;
+  if (cols == table_stride) {
+    cudaMemcpyAsync(dst, src, static_cast<size_t>(batch) * pitch, cudaMemcpyHostToDevice, stream);
+  } else {
+    cudaMemcpy2DAsync(dst, pitch, src, pitch, static_cast<size_t>(cols) * sizeof(int32_t),
+                      static_cast<size_t>(batch), cudaMemcpyHostToDevice, stream);
+  }
+}
+
 // Zero-copy row slice of a [rows, width] tensor: the leading `rows` rows of
 // `src`, viewed at the same dtype/device/shape width. The rows of a batch
 // tensor are contiguous, so the slice needs no data movement and keeps the
@@ -307,6 +335,14 @@ class Model {
   // prefill row range of sequence s is [seq_row_start[s], seq_row_start[s+1]).
   // It is consumed by the paged-CUDA prefill attention kernel; the CPU and
   // continuous-CUDA attention paths treat every row independently and ignore it.
+  //
+  // table_cols: live leading columns of each block-table row (0 = all
+  // table_stride columns). block_table itself always keeps the capacity width
+  // — the geometry (table_stride / max_seq_len) is resolved from the tensor,
+  // never from this parameter — and table_cols only trims the H2D upload to
+  // the columns the step's positions can reference (see upload_block_table_cu).
+  // In scratch mode the block table is NOT uploaded here: decode_step owns
+  // that upload (outside the capture, at the live width).
   virtual base::Status forward_batch(
       const tensor::Tensor& input_ids,
       const tensor::Tensor& positions,
@@ -318,7 +354,8 @@ class Model {
       int32_t num_decode_rows = 0,
       const tensor::Tensor* seq_row_start = nullptr,
       int32_t num_prefill_seqs = 0,
-      BatchScratch* scratch = nullptr) const = 0;
+      BatchScratch* scratch = nullptr,
+      int32_t table_cols = 0) const = 0;
 
   // Decode step with a CUDA-Graph pool: the first call for a given batch size
   // captures the decode kernels into a graph; subsequent calls only stage the
@@ -326,12 +363,19 @@ class Model {
   // overhead from ~50us to ~5us. Falls back to forward_batch when graphs are
   // unsupported/disabled. Prefill keeps using forward_batch directly (its
   // chunk sizes vary per step).
+  //
+  // table_cols: live block-table columns to upload (see forward_batch).
+  // The upload runs here on the stream, before any capture or replay — the
+  // live width grows with the row positions, so a captured copy would freeze
+  // the first step's width forever. Token/position uploads stay captured
+  // (their size is fixed by the batch).
   virtual base::Status decode_step(const tensor::Tensor& input_ids,
                                    const tensor::Tensor& positions,
                                    const tensor::Tensor& block_table,
                                    tensor::Tensor& key_cache,
                                    tensor::Tensor& value_cache,
-                                   tensor::Tensor& logits);
+                                   tensor::Tensor& logits,
+                                   int32_t table_cols = 0);
 
   // Cumulative CUDA-graph capture accounting of the decode path (see
   // GraphStats). Counters are never reset implicitly: a driver that measures a
