@@ -6,14 +6,16 @@
 
 namespace kernel {
 
-// Geometry the paged warp-per-head decode kernel can serve: it owns exactly 4
-// head dims per lane (head_size == 128) and its 4-position arithmetic group
-// must stay inside one page (block_size >= 4). Every other geometry (including
-// the continuous layout, which reports block_size == 0) stays on the
-// split-partials fallback inside paged_attention_cu_batch, so callers must size
-// score_batch for it whenever this returns false.
+// Geometry the paged decode kernel (paged_attn_split_kernel_bf16) can serve:
+// each lane owns 4 contiguous head dims and reads them as one 8-byte load, so
+// head_size must be a multiple of 8; head_size <= 256 is covered in 128-dim
+// chunks; the 4-position arithmetic group must not straddle a page (block_size
+// a power of two, >= 4); and the cache needs a real block table. A geometry
+// this rejects cannot run paged attention at all, so callers must size
+// score_batch for the fp32 (acc | m | l) partials whenever it holds.
 inline bool paged_decode_geometry_ok(int32_t head_size, int32_t table_stride, int32_t block_size) {
-  return head_size == 128 && table_stride > 0 && block_size >= 4;
+  return head_size >= 8 && head_size <= 256 && (head_size & 7) == 0 && table_stride > 0 &&
+         block_size >= 4 && (block_size & (block_size - 1)) == 0;
 }
 
 // Paged KV cache layout (vLLM-style):
@@ -43,14 +45,13 @@ void paged_kv_scatter_cu(const tensor::Tensor& src, tensor::Tensor& dst_cache,
 //   positions    [batch] CUDA int32
 //   block_table  [batch, table_stride] CUDA int32 (-1 = unused entry)
 //   query_batch  [batch, dim] (dim = head_num * head_size)
-//   score_batch  scratch: batch * head_num * flash_decoding_num_splits(
-//                table_stride * block_size) split slots, each (head_size + 2)
-//                bf16 elements for the (o | m | l) fallback layout or
-//                (head_size + 4) fp32 floats for the split-KV decode layout
-//                (2x the bf16 element count) — see
-//                flash_decoding_partials_elements, which sizes both. A buffer
-//                too small for the fp32 layout silently keeps the step on the
-//                warp2 decode kernel.
+//   score_batch  scratch: batch * head_num * paged_decode_num_splits(
+//                table_stride * block_size, head_num, kv_head_num) split
+//                slots, each (head_size + 4) fp32 floats of (acc | m | l).
+//                flash_decoding_partials_elements() (mha_kernel.cuh) returns
+//                the element count in the model dtype — one fp32 row is two
+//                bf16 elements. A buffer that is too small fails the call
+//                instead of silently computing garbage.
 //   mha_out      [batch, dim]
 //   key/value_cache [num_layers, num_blocks, block_size, kv_dim]
 void paged_attention_cu_batch(int32_t head_num, int32_t layer_idx, int32_t num_blocks,
@@ -66,8 +67,8 @@ void paged_attention_cu_batch(int32_t head_num, int32_t layer_idx, int32_t num_b
 // rows and whose remaining rows are prefill rows, grouped per sequence
 // (seq_row_start[s] .. seq_row_start[s+1) = rows of prefill sequence s). The
 // two row ranges run on the implementation that fits their load:
-//   * decode rows   -> paged_attention_cu_batch (warp-per-head, one KV read
-//                      per row);
+//   * decode rows   -> paged_attention_cu_batch (split-KV, one K/V read per
+//                      row and kv head, shared by its whole q-head group);
 //   * prefill rows  -> paged_prefill_attention_cu_batch (one KV read per
 //                      (sequence, q-block) shared by all its rows and GQA
 //                      heads).
@@ -76,8 +77,9 @@ void paged_attention_cu_batch(int32_t head_num, int32_t layer_idx, int32_t num_b
 // order as the caller's batch.
 // seq_row_start == nullptr (or num_prefill_seqs == 0) means "no prefill rows":
 // the whole batch is decode rows.
-// Requires head_size == 128; other head sizes stay on the fallback path
-// (paged_attention_cu_batch handles every row).
+// Only the head_size == 128 geometry is split by row type (prefill_geometry_ok);
+// other head sizes keep the whole batch on paged_attention_cu_batch, which
+// handles every row.
 void paged_attention_dispatch(int32_t head_num, int32_t layer_idx, int32_t num_blocks,
                               int32_t block_size, int32_t kv_dim, int32_t kv_head_num,
                               int32_t head_size, int32_t num_decode_rows,

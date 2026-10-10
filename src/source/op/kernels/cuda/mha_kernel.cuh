@@ -20,14 +20,27 @@ inline int flash_decoding_num_splits(int32_t max_seq_len) {
   return std::max(1, std::min(MAX_SPLITS, splits));
 }
 
+// Split count of the paged split-KV decode kernel. One warp per (row, kv head,
+// split) walks that split for the whole q-head group of its kv head, so the
+// capacity-derived flash_decoding_num_splits() is multiplied by the group size
+// and the warp count comes out at batch * head_num *
+// flash_decoding_num_splits(max_seq_len) — the parallelism of a per-q-head
+// split, with each K/V row loaded once per warp. Callers of
+// paged_attention_cu_batch must size score_batch for this many splits: the
+// partials of one (row, head) pair are strided by exactly this count.
+inline int paged_decode_num_splits(int32_t max_seq_len, int32_t head_num, int32_t kv_head_num) {
+  const int32_t group = (head_num + kv_head_num - 1) / kv_head_num;
+  return flash_decoding_num_splits(max_seq_len) * (group > 0 ? group : 1);
+}
+
 // Element count of the partials buffer (score_batch) one attention call needs,
 // in the model dtype. Two layouts share that buffer:
 //   * bf16 rows of (head_size + 2) elements, (o | m | l) — the continuous
-//     layout and the paged fallback for geometries paged_decode_geometry_ok
-//     rejects;
+//     layout (mha_kernel_cu_batch);
 //   * fp32 rows of (head_size + 4) floats, (acc | m | l), written by the
-//     split-KV paged decode kernel (paged_attn_warp2_split_kernel_bf16). One
-//     fp32 row is 2 * (head_size + 4) bf16 elements.
+//     paged split-KV decode kernel (paged_attn_split_kernel_bf16), whose
+//     `num_splits` is paged_decode_num_splits(). One fp32 row is 2 *
+//     (head_size + 4) bf16 elements.
 // `fp32_split` picks the fp32 split-KV sizing; a caller that does not know
 // which path a step will take may size for it, since the larger footprint
 // still satisfies the bf16 one.

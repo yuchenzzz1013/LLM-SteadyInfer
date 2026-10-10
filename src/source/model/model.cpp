@@ -27,9 +27,9 @@ Model::Model(base::TokenizerType tokenizer_type, base::ModelType model_type, std
 }
 
 void BatchScratch::ensure(int32_t batch, int32_t hidden_dim, int32_t dim, int32_t kv_dim,
-                          int32_t ffn_dim, int32_t head_num, int32_t head_size,
-                          int32_t max_seq_len, int32_t block_table_stride, int32_t block_size,
-                          base::DeviceType device, base::DataType dtype,
+                          int32_t ffn_dim, int32_t head_num, int32_t kv_head_num,
+                          int32_t head_size, int32_t max_seq_len, int32_t block_table_stride,
+                          int32_t block_size, base::DeviceType device, base::DataType dtype,
                           const std::shared_ptr<base::DeviceAllocator>& alloc) {
   const int32_t num_splits =
       device == base::DeviceType::kDeviceCUDA ? kernel::flash_decoding_num_splits(max_seq_len) : 0;
@@ -77,20 +77,22 @@ void BatchScratch::ensure(int32_t batch, int32_t hidden_dim, int32_t dim, int32_
                                    base::CPUDeviceAllocatorFactory::get_instance());
 
   if (device == base::DeviceType::kDeviceCUDA) {
-    // Sized for the fp32 split-KV partials (2x the bf16 (o | m | l) footprint)
-    // whenever a split path can reach this buffer — the paged decode kernel
-    // reinterprets it as (acc | m | l) fp32 rows. Sizing for the larger layout
-    // also covers the plain bf16 split-partials fallback and the continuous
-    // layout; the decode batches here are small, so the surplus is KBs.
-    // Use the kernels' own geometry predicate (not a local copy of it) so the
-    // two can never disagree: paged_attention_cu_batch runs the fp32 split-KV
-    // kernel exactly when paged_decode_geometry_ok holds, and a pool with
-    // block_size < 4 (which the predicate rejects) would otherwise make this
-    // over-allocate 2x — harmless, but the kind of divergence that hides bugs.
+    // Sized for whichever partials layout the step can reach. The paged decode
+    // kernel writes fp32 (acc | m | l) rows — 2x the bf16 (o | m | l)
+    // footprint — for batch * head_num * paged_decode_num_splits(...) split
+    // slots; a continuous-layout step writes the smaller bf16 rows at
+    // flash_decoding_num_splits(...) instead. Neither row mix nor layout is
+    // known here, so size for the larger one: it satisfies both, and the
+    // decode batches here are small enough that the surplus is KBs.
+    // Use the kernels' own predicates (not local copies of them) so the two
+    // can never disagree.
     const bool fp32_split =
-        num_splits > 1 && kernel::paged_decode_geometry_ok(head_size, block_table_stride, block_size);
+        kernel::paged_decode_geometry_ok(head_size, block_table_stride, block_size);
+    const int32_t partial_splits =
+        fp32_split ? kernel::paged_decode_num_splits(max_seq_len, head_num, kv_head_num)
+                   : num_splits;
     partial_batch = tensor::Tensor(
-        dtype, kernel::flash_decoding_partials_elements(batch, head_num, num_splits, head_size,
+        dtype, kernel::flash_decoding_partials_elements(batch, head_num, partial_splits, head_size,
                                                         fp32_split),
         true, alloc);
     tokens_cu = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc);
@@ -185,8 +187,8 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
   const int32_t m_attn_dim = config_->dim_;
   const int32_t m_ffn_dim = is_qwen3 ? config_->immediate_dim_ : config_->hidden_dim_;
   const base::DataType dtype = compute_dtype();
-  entry->scratch->ensure(batch, m_hidden_dim, m_attn_dim, kv_dim, m_ffn_dim,
-                         config_->head_num_, config_->head_size_, max_seq_len, table_stride,
+  entry->scratch->ensure(batch, m_hidden_dim, m_attn_dim, kv_dim, m_ffn_dim, config_->head_num_,
+                         config_->kv_head_num_, config_->head_size_, max_seq_len, table_stride,
                          dims.block_size, device_type_, dtype, alloc);
 
   // 2. Stage the new inputs at stable host addresses. forward_batch uploads

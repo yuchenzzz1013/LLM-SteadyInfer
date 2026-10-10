@@ -819,8 +819,8 @@ base::Status LLamaModel::forward_batch(
       ffn_norm_out, w1_out, w3_out, w2_out, partial_batch, qkv_out, w13_out;
   if (scratch) {
     scratch->ensure(batch, hidden_dim, config_->dim_, kv_dim, config_->hidden_dim_,
-                    config_->head_num_, config_->head_size_, max_seq_len, table_stride,
-                    cache_dims.block_size, device_type_, compute_dtype(), alloc);
+                    config_->head_num_, config_->kv_head_num_, config_->head_size_, max_seq_len,
+                    table_stride, cache_dims.block_size, device_type_, compute_dtype(), alloc);
     hidden = scratch->hidden;
     rms_out = scratch->rms_out;
     q_batch = scratch->q_batch;
@@ -857,17 +857,20 @@ base::Status LLamaModel::forward_batch(
       w13_out = tensor::Tensor(dtype, batch, 2 * config_->immediate_dim_, true, alloc);
     }
     // Attention partials (score_batch). Two producers write here: the paged
-    // split-KV decode path, which serves exactly the warp2 geometry
-    // (paged_decode_geometry_ok) and writes fp32 (acc | m | l) rows — 2x the
-    // bf16 element count per split slot — and the bf16 (o | m | l) fallback
-    // that covers the continuous layout and every other geometry. The row mix
-    // of a step is not known when this buffer is allocated, so a paged step
-    // sizes for whichever of the two its geometry can reach (the buffers are
+    // split-KV decode path, which serves exactly the paged_decode_geometry_ok
+    // geometries and writes fp32 (acc | m | l) rows — 2x the bf16 element count
+    // per split slot, for batch * head_num * paged_decode_num_splits(...) of
+    // them — and the bf16 (o | m | l) path that covers the continuous layout.
+    // The row mix of a step is not known when this buffer is allocated, so size
+    // for whichever of the two this model's geometry can reach (the buffer is
     // reused from the pool on every later layer/step).
     const bool split_kv = cache_dims.paged && kernel::paged_decode_geometry_ok(
                                                   config_->head_size_, table_stride, block_size);
     if (device_type_ == base::DeviceType::kDeviceCUDA) {
-      const int32_t num_splits = kernel::flash_decoding_num_splits(max_seq_len);
+      const int32_t num_splits =
+          split_kv ? kernel::paged_decode_num_splits(max_seq_len, config_->head_num_,
+                                                     config_->kv_head_num_)
+                   : kernel::flash_decoding_num_splits(max_seq_len);
       partial_batch = tensor::Tensor(
           dtype, kernel::flash_decoding_partials_elements(batch, config_->head_num_, num_splits,
                                                           config_->head_size_, split_kv),

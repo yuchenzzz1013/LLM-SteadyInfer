@@ -52,8 +52,12 @@ struct BatchScratch {
   // fused-w13 path writes it, but it is allocated with the rest so the decode
   // graph never has to re-capture on a buffer change.
   tensor::Tensor w13_out;
-  // Flash-Decoding partials (CUDA only):
-  //   [batch * head_num * num_splits * (head_size + 2)]
+  // Flash-Decoding partials (CUDA only), sized for whichever layout a step can
+  // reach (see ensure): the continuous kernel writes bf16 (o | m | l) rows of
+  //   [batch * head_num * flash_decoding_num_splits(max_seq_len) * (head_size + 2)]
+  // and the paged split-KV decode kernel writes fp32 (acc | m | l) rows of
+  //   [2 * batch * head_num * paged_decode_num_splits(...) * (head_size + 4)]
+  // elements of the model dtype.
   tensor::Tensor partial_batch;
   // Device copies of the per-token inputs (CUDA graph path reads these).
   // block_table_cu is [batch, block_table_stride]: slot ids (continuous
@@ -71,9 +75,9 @@ struct BatchScratch {
   // dtype selects the activation element type: kDataTypeBF16 on CUDA models
   // (compute_dtype()), kDataTypeFp32 on CPU models.
   void ensure(int32_t batch, int32_t hidden_dim, int32_t dim, int32_t kv_dim, int32_t ffn_dim,
-              int32_t head_num, int32_t head_size, int32_t max_seq_len, int32_t block_table_stride,
-              int32_t block_size, base::DeviceType device, base::DataType dtype,
-              const std::shared_ptr<base::DeviceAllocator>& alloc);
+              int32_t head_num, int32_t kv_head_num, int32_t head_size, int32_t max_seq_len,
+              int32_t block_table_stride, int32_t block_size, base::DeviceType device,
+              base::DataType dtype, const std::shared_ptr<base::DeviceAllocator>& alloc);
 };
 
 // One entry of the decode CUDA-Graph pool (indexed by batch size).

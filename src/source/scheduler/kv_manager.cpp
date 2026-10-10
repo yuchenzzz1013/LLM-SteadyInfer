@@ -24,9 +24,9 @@ KVManager::KVManager(int num_layers, int max_batch, int max_seq_len, int kv_dim,
     // Validate the block size here, where the value and its origin (Scheduler
     // argument or LLAMA_BLOCK_SIZE) are still attributable: the kernels assume
     // a power-of-two page that fits a warp's 4-position group
-    // (paged_decode_geometry_ok requires block_size >= 4) and
-    // paged_attention_cu_batch requires 256 % block_size == 0. Anything else
-    // would silently fall back to a slow path or mis-address the pool.
+    // (paged_decode_geometry_ok requires block_size >= 4) and the pool caps a
+    // page at 256 tokens. Anything else would be rejected by the kernels'
+    // geometry CHECK or mis-address the pool.
     CHECK(block_size >= 4 && (block_size & (block_size - 1)) == 0 && 256 % block_size == 0)
         << "Invalid paged KV block_size=" << block_size
         << " (must be a power of two >= 4 dividing 256: 8, 16, 32, ...); "
