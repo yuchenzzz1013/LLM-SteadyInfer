@@ -20,10 +20,12 @@ struct Qwen2Layers {
   std::vector<std::shared_ptr<op::Layer>> wo_layers_;
 
   // Fused QKV projection (M3): one GEMM with the stacked weight
-  // [dim + 2*kv_dim, hidden_dim] instead of three. fused_qkv_enabled_ is
+  // [dim + 2*kv_dim, dim] instead of three. fused_qkv_enabled_ is
   // false when LLAMA_DISABLE_FUSED_QKV=1 or the model is quantized.
   // The *_src_ tensors keep the fused weight/bias buffers alive
-  // (set_weight/set_bias store non-owning external views into them).
+  // (set_weight/set_bias store non-owning external views into them); on CUDA
+  // the wq/wk/wv layers view slices of the same buffers, so the projections
+  // have a single device residence.
   bool fused_qkv_enabled_ = false;
   std::vector<std::shared_ptr<op::Layer>> fused_qkv_layers_;
   std::vector<tensor::Tensor> fused_qkv_weight_src_;
@@ -35,10 +37,12 @@ struct Qwen2Layers {
   std::vector<std::shared_ptr<op::Layer>> w3_layers_;
 
   // Fused gate/up projection: one GEMM with the stacked weight
-  // [2 * immediate_dim, hidden_dim] instead of w1 and w3 separately, paired
-  // with kernel::swiglu_kernel_cu_fused (which reads gate and up from the two
-  // halves of each output row). The _src_ tensors keep the stacked buffers
-  // alive (set_weight stores a non-owning view).
+  // [2 * hidden_dim_ (FFN width), dim_ (FFN input)] instead of w1 and w3
+  // separately, paired with kernel::swiglu_kernel_cu_fused (which reads gate
+  // and up from the two halves of each output row). The _src_ tensors keep
+  // the stacked buffers alive (set_weight stores a non-owning view); on CUDA
+  // w1/w3 view the two halves of the same buffer, so the pair has a single
+  // device residence.
   bool fused_w13_enabled_ = false;
   std::vector<std::shared_ptr<op::Layer>> fused_w13_layers_;
   std::vector<tensor::Tensor> fused_w13_weight_src_;
@@ -91,12 +95,17 @@ class Qwen2Model : public Model {
 
   void create_param_quant_layers() override;
 
-  // Build the fused QKV MatmulLayers from the (already device-resident)
-  // wq/wk/wv weights. Must run after Qwen2Layers::to_cuda in init_mem.
+  // Build the fused QKV MatmulLayers from the host weight map (see
+  // weight_map_) and, on CUDA, re-point wq/wk/wv at slices of the stacked
+  // buffers so the projections have a single device residence. Must run
+  // BEFORE Qwen2Layers::to_cuda in init_mem: the stacked buffers are built
+  // from the host weights, and the re-pointed layers make to_cuda() a no-op
+  // for them (a layer weight already tagged CUDA is not copied again).
   void build_fused_qkv_layers();
 
-  // Stack w1/w3 into one [2 * immediate_dim, hidden_dim] MatmulLayer (gate
-  // rows first, then up). Must run after Qwen2Layers::to_cuda in init_mem.
+  // Stack w1/w3 into one [2 * ffn, dim_] MatmulLayer (gate rows first, then
+  // up) and re-point w1/w3 at its two halves. Must run BEFORE
+  // Qwen2Layers::to_cuda in init_mem, for the reason above.
   void build_fused_w13_layers();
 
   void attention_mha(int32_t layer_idx, const tensor::Tensor& pos_tensor) const;

@@ -405,13 +405,19 @@ void Qwen3Model::build_fused_qkv_layers() {
   const int32_t fused_dim = dim + 2 * kv_dim;
   const int32_t num_layers = config_->layer_num_;
   // The stacked weight buffer adopts the model compute dtype (BF16 on CUDA,
-  // FP32 on CPU runs); the sources are on the target device already
-  // (to_cuda ran before build_fused_qkv_layers). Every source block is
-  // K-major ([K, M] row-major) so each is one contiguous byte memcpy.
+  // FP32 on CPU runs) and is filled from the host weight map — the load-time
+  // source of truth, still on the host because this builder runs before
+  // to_cuda(). Every source block is K-major ([K, M] row-major) so each is one
+  // contiguous byte memcpy. The stacked buffer then becomes the single device
+  // residence of the three projections: on CUDA the legacy wq/wk/wv layers
+  // are re-pointed at slices of it, so to_cuda() copies nothing for them.
   const base::DataType dtype = compute_dtype();
   const size_t elem = base::DataTypeSize(dtype);
   const size_t w_block_q = static_cast<size_t>(dim) * hidden_dim * elem;
   const size_t w_block_kv = static_cast<size_t>(kv_dim) * hidden_dim * elem;
+  const auto block_name = [](int32_t i, const char* suffix) {
+    return "model.layers." + std::to_string(i) + "." + suffix;
+  };
 
   std::shared_ptr<base::DeviceAllocator> alloc;
   if (device_type_ == base::DeviceType::kDeviceCUDA) {
@@ -424,28 +430,24 @@ void Qwen3Model::build_fused_qkv_layers() {
   qwen_layers_->fused_qkv_weight_src_.clear();
   qwen_layers_->fused_qkv_bias_src_.clear();
   for (int32_t i = 0; i < num_layers; ++i) {
-    const tensor::Tensor& wq_w =
-        std::dynamic_pointer_cast<op::MatmulLayer>(qwen_layers_->wq_layers_.at(i))->get_weight(0);
-    const tensor::Tensor& wk_w =
-        std::dynamic_pointer_cast<op::MatmulLayer>(qwen_layers_->wk_layers_.at(i))->get_weight(0);
-    const tensor::Tensor& wv_w =
-        std::dynamic_pointer_cast<op::MatmulLayer>(qwen_layers_->wv_layers_.at(i))->get_weight(0);
+    const void* wq_w = get_weight_data(block_name(i, "self_attn.q_proj.weight"));
+    const void* wk_w = get_weight_data(block_name(i, "self_attn.k_proj.weight"));
+    const void* wv_w = get_weight_data(block_name(i, "self_attn.v_proj.weight"));
 
     // Stacked weight [q | k | v]: K-major blocks, one contiguous memcpy each.
     tensor::Tensor fused_w(dtype, fused_dim, hidden_dim, true, alloc);
     if (device_type_ == base::DeviceType::kDeviceCUDA) {
       cudaStream_t stream = cuda_config_->stream;
-      cudaMemcpyAsync(fused_w.ptr<uint8_t>(), wq_w.ptr<uint8_t>(), w_block_q,
-                      cudaMemcpyDeviceToDevice, stream);
-      cudaMemcpyAsync(fused_w.ptr<uint8_t>(w_block_q), wk_w.ptr<uint8_t>(), w_block_kv,
-                      cudaMemcpyDeviceToDevice, stream);
-      cudaMemcpyAsync(fused_w.ptr<uint8_t>(w_block_q + w_block_kv), wv_w.ptr<uint8_t>(),
-                      w_block_kv, cudaMemcpyDeviceToDevice, stream);
+      cudaMemcpyAsync(fused_w.ptr<uint8_t>(), wq_w, w_block_q, cudaMemcpyHostToDevice, stream);
+      cudaMemcpyAsync(fused_w.ptr<uint8_t>(w_block_q), wk_w, w_block_kv,
+                      cudaMemcpyHostToDevice, stream);
+      cudaMemcpyAsync(fused_w.ptr<uint8_t>(w_block_q + w_block_kv), wv_w, w_block_kv,
+                      cudaMemcpyHostToDevice, stream);
       cudaStreamSynchronize(stream);  // init-time only: weights must be ready pre-forward
     } else {
-      std::memcpy(fused_w.ptr<uint8_t>(), wq_w.ptr<uint8_t>(), w_block_q);
-      std::memcpy(fused_w.ptr<uint8_t>(w_block_q), wk_w.ptr<uint8_t>(), w_block_kv);
-      std::memcpy(fused_w.ptr<uint8_t>(w_block_q + w_block_kv), wv_w.ptr<uint8_t>(), w_block_kv);
+      std::memcpy(fused_w.ptr<uint8_t>(), wq_w, w_block_q);
+      std::memcpy(fused_w.ptr<uint8_t>(w_block_q), wk_w, w_block_kv);
+      std::memcpy(fused_w.ptr<uint8_t>(w_block_q + w_block_kv), wv_w, w_block_kv);
     }
 
     // Qwen3 has no QKV bias (unlike Qwen2).
@@ -454,6 +456,20 @@ void Qwen3Model::build_fused_qkv_layers() {
     CHECK(fused->set_weight(0, fused_w));
     if (device_type_ == base::DeviceType::kDeviceCUDA) {
       fused->set_cuda_config(cuda_config_);
+      // Single device residence: the legacy projections view slices of the
+      // stacked buffer instead of owning device copies of their own; they
+      // read the same bytes, so the legacy forward()/predict() path works
+      // unchanged.
+      auto wq_layer = std::dynamic_pointer_cast<op::MatmulLayer>(qwen_layers_->wq_layers_.at(i));
+      auto wk_layer = std::dynamic_pointer_cast<op::MatmulLayer>(qwen_layers_->wk_layers_.at(i));
+      auto wv_layer = std::dynamic_pointer_cast<op::MatmulLayer>(qwen_layers_->wv_layers_.at(i));
+      CHECK(wq_layer->set_weight(0, {dim, hidden_dim}, fused_w.ptr<uint8_t>(), device_type_,
+                                 dtype));
+      CHECK(wk_layer->set_weight(0, {kv_dim, hidden_dim}, fused_w.ptr<uint8_t>(w_block_q),
+                                 device_type_, dtype));
+      CHECK(wv_layer->set_weight(0, {kv_dim, hidden_dim},
+                                 fused_w.ptr<uint8_t>(w_block_q + w_block_kv), device_type_,
+                                 dtype));
     }
     qwen_layers_->fused_qkv_layers_.push_back(fused);
     // Keep-alive holder: set_weight stores a non-owning view into this buffer.
@@ -466,9 +482,10 @@ void Qwen3Model::build_fused_w13_layers() {
   if (is_quant_model_) {
     return;
   }
-  // CUDA only: the stacked weight is filled with device-to-device copies and
+  // CUDA only: the stacked weight replaces the two device copies of w1/w3 and
   // the paired SwiGLU kernel is a CUDA kernel. The CPU fallback keeps its two
-  // GEMMs + get_swiglu_kernel path.
+  // GEMMs + get_swiglu_kernel path (there the w1/w3 "copies" are just views
+  // into the host weight map, so there is nothing to consolidate).
   if (device_type_ != base::DeviceType::kDeviceCUDA) {
     return;
   }
@@ -479,6 +496,9 @@ void Qwen3Model::build_fused_w13_layers() {
   const base::DataType dtype = compute_dtype();
   const size_t elem = base::DataTypeSize(dtype);
   const size_t w_block = static_cast<size_t>(ffn_dim) * hidden_dim * elem;
+  const auto block_name = [](int32_t i, const char* suffix) {
+    return "model.layers." + std::to_string(i) + "." + suffix;
+  };
 
   auto alloc = base::CUDADeviceAllocatorFactory::get_instance();
   cudaStream_t stream = cuda_config_->stream;
@@ -486,32 +506,38 @@ void Qwen3Model::build_fused_w13_layers() {
   qwen_layers_->fused_w13_layers_.clear();
   qwen_layers_->fused_w13_weight_src_.clear();
   for (int32_t i = 0; i < num_layers; ++i) {
-    const tensor::Tensor& w1_w =
-        std::dynamic_pointer_cast<op::MatmulLayer>(qwen_layers_->w1_layers_.at(i))->get_weight(0);
-    const tensor::Tensor& w3_w =
-        std::dynamic_pointer_cast<op::MatmulLayer>(qwen_layers_->w3_layers_.at(i))->get_weight(0);
+    const void* w1_w = get_weight_data(block_name(i, "mlp.gate_proj.weight"));
+    const void* w3_w = get_weight_data(block_name(i, "mlp.up_proj.weight"));
 
     // Both operands are K-major ([K, M] row-major), so the stacked weight is
-    // two contiguous block copies — no repacking kernel needed.
+    // two contiguous block copies out of the host weight map — no repacking
+    // kernel needed.
     tensor::Tensor fused_w(dtype, 2 * ffn_dim, hidden_dim, true, alloc);
-    cudaMemcpyAsync(fused_w.ptr<uint8_t>(), w1_w.ptr<uint8_t>(), w_block,
-                    cudaMemcpyDeviceToDevice, stream);
-    cudaMemcpyAsync(fused_w.ptr<uint8_t>(w_block), w3_w.ptr<uint8_t>(), w_block,
-                    cudaMemcpyDeviceToDevice, stream);
+    cudaMemcpyAsync(fused_w.ptr<uint8_t>(), w1_w, w_block, cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(fused_w.ptr<uint8_t>(w_block), w3_w, w_block, cudaMemcpyHostToDevice, stream);
     cudaStreamSynchronize(stream);  // init-time only: weights must be ready pre-forward
 
     auto fused = std::make_shared<op::MatmulLayer>(device_type_, 2 * ffn_dim, hidden_dim, false,
                                                    false);
     CHECK(fused->set_weight(0, fused_w));
     fused->set_cuda_config(cuda_config_);
+    // Single device residence: w1/w3 view slices of the stacked buffer, so
+    // to_cuda() (which runs after this builder) copies nothing for them and
+    // the legacy feed_forward() path reads the same bytes as before.
+    auto w1_layer = std::dynamic_pointer_cast<op::MatmulLayer>(qwen_layers_->w1_layers_.at(i));
+    auto w3_layer = std::dynamic_pointer_cast<op::MatmulLayer>(qwen_layers_->w3_layers_.at(i));
+    CHECK(w1_layer->set_weight(0, {ffn_dim, hidden_dim}, fused_w.ptr<uint8_t>(), device_type_,
+                               dtype));
+    CHECK(w3_layer->set_weight(0, {ffn_dim, hidden_dim}, fused_w.ptr<uint8_t>(w_block),
+                               device_type_, dtype));
     qwen_layers_->fused_w13_layers_.push_back(fused);
     // Keep-alive holder: set_weight stores a non-owning view into this buffer.
     qwen_layers_->fused_w13_weight_src_.push_back(fused_w);
   }
   qwen_layers_->fused_w13_enabled_ = true;
   LOG(INFO) << "[QWEN3] fused gate/up projection: " << num_layers << " layers, "
-            << (2.0 * w_block * num_layers) / (1024.0 * 1024.0) << " MB stacked weights (+"
-            << (w_block * num_layers) / (1024.0 * 1024.0) << " MB over w1 || w3)";
+            << (2.0 * w_block * num_layers) / (1024.0 * 1024.0)
+            << " MB stacked weights (the separate w1/w3 device copies are gone)";
 }
 
 void Qwen3Model::init_mem() {
@@ -522,18 +548,22 @@ void Qwen3Model::init_mem() {
     alloc = base::CUDADeviceAllocatorFactory::get_instance();
   }
 
-  if (device_type_ == base::DeviceType::kDeviceCUDA) {
-    CHECK_NE(cuda_config_, nullptr);
-    qwen_layers_->to_cuda(cuda_config_);
-  }
-
-  // Fused QKV (M3): the wq/wk/wv weights are on the target device now.
-  // Gated on the paged-attention build so the A/B baseline (macro OFF)
-  // reproduces the original three-GEMM path exactly.
+  // Fused weights first, then the device migration: the builders stack the
+  // projections straight from the host weight map and re-point the legacy
+  // layers at slices of the stacked buffers, so to_cuda() below only copies
+  // what has no fused owner. Building after to_cuda() would leave a second
+  // device copy of every q/k/v/gate/up weight resident (group 7). Gated on
+  // the paged-attention build so the A/B baseline (macro OFF) reproduces the
+  // original three-GEMM path exactly.
 #ifdef USE_PAGED_ATTENTION
   build_fused_qkv_layers();
   build_fused_w13_layers();
 #endif
+
+  if (device_type_ == base::DeviceType::kDeviceCUDA) {
+    CHECK_NE(cuda_config_, nullptr);
+    qwen_layers_->to_cuda(cuda_config_);
+  }
 
   std::shared_ptr<base::DeviceAllocator> alloc_cpu =
       base::CPUDeviceAllocatorFactory::get_instance();
