@@ -148,7 +148,17 @@ int KVManager::busy_slot_count() const {
 
 int KVManager::free_slot_count() const {
 #ifdef USE_PAGED_ATTENTION
-  return block_allocator_->free_block_count() / max_blocks_per_seq_;
+  // Rows, not blocks. One sequence owns one block-table row for its whole
+  // lifetime, so the pool accepts exactly (num_rows - busy_rows) more
+  // sequences — that is what "free slots" means in the continuous layout this
+  // mirrors, and what an admission check needs. The old free_blocks /
+  // max_blocks_per_seq counted full-window sequences' worth of blocks instead:
+  // it read 0 with rows still free (blocks held by running rows or pinned by
+  // the prefix cache), and > 0 with every row taken by sequences that had used
+  // little of their capacity. Block pressure is a different question, and one
+  // the allocator answers per allocation (append_blocks reclaims before it
+  // fails), not from a precomputed count.
+  return block_allocator_->num_rows() - block_allocator_->num_busy_rows();
 #else
   int count = 0;
   for (bool busy : slot_busy_) {

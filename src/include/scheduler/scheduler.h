@@ -118,10 +118,17 @@ class Scheduler {
   static int resolve_block_size(long long avg_prompt_len);
 
   // Max token-rows in one forward_batch step (decode rows + prefill chunk
-  // rows). Decoupled from max_batch_size_ except at max_batch >= 256, where
-  // the logits buffer must stay at max_batch rows to fit KV memory. Must be
-  // called with the scheduler's max_batch_size_.
+  // rows). Decoupled from max_batch_size_: decode rows are bounded by
+  // max_batch_size_, prefill rows by kPrefillRowReserve, so a batch saturated
+  // with decodes can never leave the prefill side without rows. Must be called
+  // with the scheduler's max_batch_size_.
   static int row_cap_for(int max_batch_size);
+  // Prefill rows a step may carry beyond its decode rows — also the chunk
+  // budget of the prefill loop (build_batch_rows). Wide enough that a short
+  // prompt reaches its first token in one step, and bounded by measurement
+  // (see build_batch_rows): chunks above this size delayed the first token of
+  // every prompt inside them without moving throughput.
+  static constexpr int kPrefillRowReserve = 512;
 
  private:
   // One flattened batch row: a decode token or one chunked-prefill token.
@@ -215,10 +222,6 @@ class Scheduler {
   int next_seq_id_ = 0;
   int block_size_ = kDefaultBlockSize;  // paged KV pool block size
 
-  // Adaptive chunked-prefill token budget (see build_batch_rows). Dampened
-  // one level per step to avoid oscillation when decode pressure hovers
-  // around a threshold.
-  int prefill_token_budget_ = 1024;
 };
 
 }  // namespace scheduler

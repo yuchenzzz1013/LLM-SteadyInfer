@@ -23,12 +23,16 @@ class KVManager {
             std::shared_ptr<base::DeviceAllocator> alloc,
             base::DeviceType device, int block_size = 16);
 
-  // Slot/row API. Identical semantics in both modes: allocate() reserves a
-  // sequence's whole KV capacity — one block-table row (paged) == one slot
-  // (continuous), so M1 keeps the legacy full-capacity admission exactly.
+  // Slot/row API. Identical semantics in both modes: a "slot" is one
+  // block-table row (paged) == one slot (continuous). allocate() reserves a
+  // sequence's whole KV capacity — the continuous layout's only option, and
+  // what its legacy admission still uses; the paged scheduler path allocates
+  // the row (allocate_blocks(0)) and grows its blocks lazily instead.
   int allocate();       // Returns slot/row id, -1 if capacity exhausted
   void deallocate(int slot_or_row);
   bool has_free_slot() const;
+  // Slots/rows a sequence could still be admitted into (paged: rows no
+  // sequence owns — see the impl for why counting free *blocks* was wrong).
   int free_slot_count() const;
   int busy_slot_count() const;
   int max_seq_len() const { return max_seq_len_; }

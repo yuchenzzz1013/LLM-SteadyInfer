@@ -33,17 +33,20 @@ int Scheduler::default_block_size() {
 }
 
 // Max token-rows a single forward_batch step may carry (decode rows +
-// prefill chunk rows, each row = one token). max_batch_size_ only bounds the
-// decode side; prefill rows are decoupled from it (see build_batch_rows).
-// At max_batch >= 256 the KV pool already fills ~40 GB and no further
-// decoupling is useful, so the cap collapses to max_batch there. Sized row_cap
-// is used by the host staging buffers and the step row cap; the logits buffer
-// is deliberately NOT sized by it — the LM head only ever runs on the leading
-// decode rows (<= max_batch, see Model::forward_batch), so sizing logits by
-// the step cap wasted (512 - max_batch) x vocab x 2 bytes (146 MB for Qwen3-4B
-// at max_batch 32).
+// prefill chunk rows, each row = one token). max_batch_size_ bounds only the
+// DECODE side (the rows that consume logits), so the step's row budget must
+// not collapse to it: a batch saturated with decodes would then use every row
+// of the step and the prefill side would get (max_batch - decode_rows) rows —
+// one token per step once the batch fills up, so a newly admitted request's
+// TTFT grew with the generation length of the sequences ahead of it. The cap
+// is decode rows + the prefill row reserve, and neither side can starve the
+// other (at any max_batch: the reserve is on top of the decode rows, never a
+// shared cap that a full decode batch can consume). Sized row_cap is used by
+// the host staging buffers and the step row cap; the logits buffer is
+// deliberately NOT sized by it — the LM head only ever runs on the leading
+// decode rows (<= max_batch, see Model::forward_batch).
 int Scheduler::row_cap_for(int max_batch_size) {
-  return max_batch_size >= 256 ? max_batch_size : 512;
+  return max_batch_size + kPrefillRowReserve;
 }
 
 Scheduler::Scheduler(std::shared_ptr<model::Model> model,
@@ -356,34 +359,34 @@ void Scheduler::try_admit_sequences() {
       continue;
     }
 
-    // WAITING: reserve the prompt's blocks now; generation grows lazily
-    // (ensure_blocks_for) so the pool serves more concurrent sequences.
-    const int prompt_blocks = (seq.num_prompt_tokens + block_size_ - 1) / block_size_;
-
-    // Prefix cache: whole-block prompt prefixes are shared read-only — only
-    // the non-shared remainder needs fresh blocks and prefill.
+    // WAITING: claim the sequence's block-table row, mount any cached shared
+    // prefix, and let the prefill loop grow the private blocks chunk by chunk
+    // (ensure_blocks_for). Nothing reserves the whole prompt here any more:
+    // only the blocks whose KV is about to be written are taken, so a long
+    // prompt stops holding its full KV footprint from the moment it is
+    // admitted — and a preemption later on (or the LRU reclaim of cached
+    // blocks) has that much less reserved-but-unwritten capacity to fight
+    // over. The per-sequence block cap guarantees the prompt still fits: the
+    // growth is bounded by ceil(prompt / block_size) <= the table width.
     //
-    // Order matters: match, claim a row, MOUNT the match, then allocate the
-    // private remainder. Mounting first references the matched blocks, and a
-    // referenced block is never evicted (allocation reclaim runs LRU eviction
-    // on the cache, which requires refcount 0), so the private allocation
-    // cannot pull a matched block out of the cache and hand it back as a
-    // private block of this same row — which would alias the prefix's KV with
-    // the private region's writes. The old order (allocate, then mount) had
-    // exactly that hole under pool pressure: the reclaim evicted the just
-    // matched, still unreferenced blocks, the LIFO free list returned one as
-    // the first private block, and the mount then placed it in the table a
-    // second time.
+    // Order matters: claim a row, then MOUNT the matched prefix. Mounting
+    // references the matched blocks, and a referenced block is never evicted
+    // (allocation reclaim runs LRU eviction on the cache, which requires
+    // refcount 0), so no later private allocation can pull a matched block
+    // out of the cache and hand it back as a private block of this same row —
+    // which would alias the prefix's KV with the private region's writes. The
+    // private allocation now happens a step later (chunk growth), still after
+    // the mount.
     BlockAllocator* const allocator = kv_manager_->block_allocator();
     PrefixMatch match;
     int row = -1;
     bool admitted_ok = false;
     for (int attempt = 0; attempt < 3 && !admitted_ok; ++attempt) {
-      if (prefix_cache_) {
-        prefix_cache_->lookup(seq.prompt_tokens, *allocator, &match);
-      }
-      // A fresh row with an empty table first: n == 0 never reclaims, so the
-      // match stays valid until it is mounted below.
+      // The row first (n == 0 can never reclaim, so it cannot disturb a
+      // match), and only then the prefix-cache lookup: a request that has to
+      // wait for a row skips hashing its prompt entirely. The lookup walks
+      // the chained block hashes of the prompt, and it used to run once per
+      // waiting step, only to discover again that no row was free.
       row = allocator->allocate_blocks(0);
       if (row < 0) {
         // Every row is taken by a running or preempted sequence. Preemption
@@ -391,29 +394,18 @@ void Scheduler::try_admit_sequences() {
         // so it cannot help here: keep the request waiting in FCFS order.
         break;
       }
+      if (prefix_cache_) {
+        prefix_cache_->lookup(seq.prompt_tokens, *allocator, &match);
+      }
       if (!match.empty() && !allocator->reserve_shared_prefix(row, match.blocks)) {
-        // Unreachable while the mount precedes every allocation: nothing can
-        // release a matched block in between. If it does fire, the match is
-        // simply re-run on the next attempt.
+        // Unreachable while no allocation that can reclaim runs between the
+        // lookup and the mount. If it does fire, the match is simply re-run
+        // on the next attempt.
         LOG(WARNING) << "[SCHED] seq id=" << seq.id
                      << ": matched prefix blocks changed under us; retrying admission";
         allocator->free_all(row);
         row = -1;
         continue;
-      }
-      const int private_blocks = prompt_blocks - match.size();
-      if (private_blocks > 0 && allocator->append_blocks(row, private_blocks) < 0) {
-        // Pool exhausted even after the allocator reclaimed cached blocks
-        // (only ones no sequence references, so nothing is lost that a
-        // re-prefill cannot rebuild — and never a block mounted above).
-        // Roll back, then preempt tail blocks of other RUNNING sequences. If
-        // that does not free enough, the request keeps waiting.
-        allocator->free_all(row);
-        row = -1;
-        if (attempt == 0 && try_preempt_for(private_blocks, seq.id)) {
-          continue;  // re-run the admission with the newly freed blocks
-        }
-        break;
       }
       admitted_ok = true;
     }
@@ -424,7 +416,7 @@ void Scheduler::try_admit_sequences() {
     Sequence admitted = std::move(seq);
     waiting_queue_.pop_front();
     admitted.kv_slot_id = row;
-    admitted.num_blocks_allocated = prompt_blocks;
+    admitted.num_blocks_allocated = matched;  // mounted shared blocks only
     admitted.state = SeqState::RUNNING;
     admitted.admit_time = now;
     if (matched > 0) {
@@ -440,14 +432,15 @@ void Scheduler::try_admit_sequences() {
     }
     if (prefix_cache_) {
       // Count the outcome, not the queries: this request may have run lookup()
-      // on every attempt above (and re-ran it across the waiting steps), but
-      // only the blocks mounted here actually saved prefill work. Also the LRU
-      // is only touched here — a probe that never mounted leaves no trace.
+      // on every attempt above (and on the waiting steps before a row was
+      // free), but only the blocks mounted here actually saved prefill work.
+      // The LRU is only touched here — a probe that never mounted leaves no
+      // trace.
       prefix_cache_->commit_mounted(match);
     }
 #ifndef NDEBUG
     VLOG(1) << "[SCHED] admitted seq id=" << admitted.id
-            << " prompt_blocks=" << prompt_blocks
+            << " prompt_tokens=" << admitted.num_prompt_tokens
             << " shared_prefix=" << matched << " row=" << row;
 #endif
     running_sequences_.push_back(std::move(admitted));
@@ -470,6 +463,10 @@ void Scheduler::try_admit_sequences() {
 #endif
 }
 
+// A sequence preempted this many times is tried last while other candidates
+// remain (see try_preempt_for's victim passes).
+constexpr int kPreemptDeferThreshold = 2;
+
 bool Scheduler::try_preempt_for(int need_blocks, int skip_seq_id) {
 #ifdef USE_PAGED_ATTENTION
   BlockAllocator* allocator = kv_manager_->block_allocator();
@@ -484,31 +481,69 @@ bool Scheduler::try_preempt_for(int need_blocks, int skip_seq_id) {
   // sized by capacity the pool actually gets back, not by table entries
   // dropped: blocks shared with another row (refcount > 1) or pinned by the
   // prefix cache stay allocated when this row lets go of them.
+  //
+  // Two phases, cheapest cut first:
+  //   phase 0 — cuts that stay inside the generated region keep the victim's
+  //     whole prefill KV: recovery is a re-decode of the dropped tokens
+  //     (truncate_sequence keeps is_prefill_complete), no re-prefill at all.
+  //   phase 1 — cuts into the prefill region: the victim's generated tokens
+  //     are discarded and the prompt re-prefilled from the cut. Only when
+  //     phase 0 cannot free enough.
+  // Within a phase, sequences already preempted kPreemptDeferThreshold times
+  // are tried last: every cut costs a victim its progress, so the pain is
+  // spread over distinct sequences instead of repeatedly hitting whichever
+  // one the newest-first walk reaches first.
   std::vector<std::pair<Sequence*, int>> victims;  // (seq, blocks to keep)
-  for (auto it = running_sequences_.rbegin(); it != running_sequences_.rend(); ++it) {
-    if (needed <= 0) break;
-    if (it->id == skip_seq_id || it->state != SeqState::RUNNING) continue;
-    // The forward pass is about to read the block table of every sequence that
-    // already has a row in this step's batch — its KV has to stay where it is.
-    if (std::find(batch_row_seqs_.begin(), batch_row_seqs_.end(), &*it) !=
-        batch_row_seqs_.end()) {
-      continue;
+  const auto prompt_blocks_of = [&](const Sequence& s) {
+    return (s.num_prompt_tokens + block_size_ - 1) / block_size_;
+  };
+  const auto already_victim = [&](const Sequence* s) {
+    for (const auto& v : victims) {
+      if (v.first == s) return true;
     }
-    const int max_take = std::min(it->num_blocks_allocated - 1,
-                                  allocator->reclaimable_blocks_from(it->kv_slot_id, 1));
-    if (max_take <= 0) continue;
-    const int take = std::min(max_take, needed);
-    int keep = it->num_blocks_allocated - take;
-    int gain = allocator->reclaimable_blocks_from(it->kv_slot_id, keep);
-    if (gain <= 0) {
-      // The tail is shared / cache-pinned all the way down to this cut; only a
-      // deeper one reaches the blocks this row owns alone.
-      keep = 1;
-      gain = allocator->reclaimable_blocks_from(it->kv_slot_id, keep);
+    return false;
+  };
+  for (int phase = 0; phase < 2 && needed > 0; ++phase) {
+    for (int pass = 0; pass < 2 && needed > 0; ++pass) {
+      for (auto it = running_sequences_.rbegin();
+           it != running_sequences_.rend() && needed > 0; ++it) {
+        if (it->id == skip_seq_id || it->state != SeqState::RUNNING) continue;
+        // The forward pass is about to read the block table of every sequence
+        // that already has a row in this step's batch — its KV has to stay
+        // where it is.
+        if (std::find(batch_row_seqs_.begin(), batch_row_seqs_.end(), &*it) !=
+            batch_row_seqs_.end()) {
+          continue;
+        }
+        if (already_victim(&*it)) continue;
+        const bool repeat = it->preempt_count >= kPreemptDeferThreshold;
+        if ((pass == 1) != repeat) continue;
+        // Phase 0 keeps the prefill KV of a decoding victim (its whole prompt,
+        // which it must still be able to reference after the cut); phase 1
+        // drops down to the one block that has to survive for the row and its
+        // table to stay valid.
+        int keep_floor = 1;
+        if (phase == 0 && it->is_prefill_complete) {
+          keep_floor = std::min(prompt_blocks_of(*it), it->num_blocks_allocated);
+        }
+        const int max_take = std::min(it->num_blocks_allocated - keep_floor,
+                                      allocator->reclaimable_blocks_from(it->kv_slot_id,
+                                                                         keep_floor));
+        if (max_take <= 0) continue;
+        const int take = std::min(max_take, needed);
+        int keep = it->num_blocks_allocated - take;
+        int gain = allocator->reclaimable_blocks_from(it->kv_slot_id, keep);
+        if (gain <= 0) {
+          // The tail is shared / cache-pinned all the way down to this cut;
+          // only a deeper one reaches the blocks this row owns alone.
+          keep = keep_floor;
+          gain = allocator->reclaimable_blocks_from(it->kv_slot_id, keep);
+        }
+        if (gain <= 0) continue;
+        needed -= gain;
+        victims.emplace_back(&(*it), keep);
+      }
     }
-    if (gain <= 0) continue;
-    needed -= gain;
-    victims.emplace_back(&(*it), keep);
   }
   if (needed > 0) return false;
 
@@ -547,6 +582,9 @@ void Scheduler::flush_preempted() {
 
 void Scheduler::truncate_sequence(Sequence& seq, int keep_blocks) {
 #ifdef USE_PAGED_ATTENTION
+  // Count the victimization: try_preempt_for uses it to avoid cutting the same
+  // sequence again and again while others could yield instead.
+  ++seq.preempt_count;
   const int trunc_pos = keep_blocks * block_size_;
   kv_manager_->block_allocator()->free_blocks_from(seq.kv_slot_id, keep_blocks);
   seq.num_blocks_allocated = keep_blocks;
@@ -565,7 +603,10 @@ void Scheduler::truncate_sequence(Sequence& seq, int keep_blocks) {
     // Evicted into the prompt region: re-prefill from the truncation point.
     // Every generated token (position >= num_prompt_tokens > trunc_pos) loses
     // its KV and is discarded; greedy sampling makes the recompute
-    // deterministic, so the regenerated tail matches bit-for-bit.
+    // deterministic, so the regenerated tail matches bit-for-bit. This is the
+    // expensive cut (the victim loses its whole prefill), which is why
+    // try_preempt_for only reaches for it in its second phase, after the
+    // generated tails of every candidate are exhausted.
     seq.next_prefill_chunk_start = trunc_pos;
     seq.is_prefill_complete = false;
     seq.generated_tokens.clear();
@@ -651,48 +692,33 @@ std::vector<Scheduler::BatchRow> Scheduler::build_batch_rows() {
   }
 
   // 2. Chunked-prefill rows, mixed into the same step so decode never waits
-  // for a full prefill pass. The chunk budget adapts to decode backlog
-  // pressure (same thresholds as the old prefill-only steps):
-  //   - decode backlog high (>= 50% of max_batch)  -> shrink to 512 (protect TPOT);
-  //   - decode backlog low (< 25% of max_batch)    -> grow to 4096 (shorten TTFT);
-  //   - in between                                  -> 1024.
-  // The budget moves at most one level per step (dampening) so bursts do not
-  // oscillate the chunk size. The remaining batch capacity (logits buffer is
-  // [max_batch, vocab]) caps the chunk as well.
-  bool has_prefill_pending = false;
-  for (const auto& seq : running_sequences_) {
+  // for a full prefill pass. The chunk budget bounds the prefill rows of this
+  // step — the row cap reserves exactly that much room for them ON TOP of the
+  // decode rows (see row_cap_for) — so the budget trades prefill progress (the
+  // TTFT of everything prefilling) against step time (the inter-token latency
+  // of everything already decoding).
+  //
+  // The budget is the fixed kPrefillRowReserve, and the measurement behind
+  // that number is the latency feedback: the rows appended in one step only
+  // return their first token when that step ends, so a chunk is also the
+  // first-token latency of every prompt inside it. While requests still queue
+  // for a row, a bigger chunk does not move that queue — it only delays the
+  // first token of the prompts that got in; and with nothing queued it still
+  // delays the first token of the next arrivals. Measured on the real
+  // prefix-caching benchmark, 4096-row chunks raised TTFT avg 27-37% (159 ms
+  // vs 118 ms, p50 110 vs 82) over 512-row chunks at identical throughput and
+  // wall time, and the same held for a backlogged wave and for idle windows.
+  // 512 is also wide enough that a short prompt reaches its first token in a
+  // single step.
+  constexpr int prefill_token_budget = kPrefillRowReserve;
+  std::vector<int> pending_prefills;
+  for (size_t i = 0; i < running_sequences_.size(); ++i) {
+    const Sequence& seq = running_sequences_[i];
     if (seq.state == SeqState::RUNNING && !seq.is_finished && !seq.is_prefill_complete) {
-      has_prefill_pending = true;
-      break;
+      pending_prefills.push_back(static_cast<int>(i));
     }
   }
-  if (has_prefill_pending) {
-    {
-      int decode_backlog = 0;
-      for (const auto& seq : running_sequences_) {
-        if (!seq.is_finished && seq.is_prefill_complete) {
-          ++decode_backlog;
-        }
-      }
-      const float pressure =
-          max_batch_size_ > 0 ? static_cast<float>(decode_backlog) / max_batch_size_ : 0.f;
-      int target = 1024;
-      if (pressure >= 0.5f) {
-        target = 512;
-      } else if (pressure < 0.25f) {
-        target = 4096;
-      }
-      if (target > prefill_token_budget_) {
-        prefill_token_budget_ = std::min(target, prefill_token_budget_ * 2);
-      } else if (target < prefill_token_budget_) {
-        prefill_token_budget_ = std::max(target, prefill_token_budget_ / 2);
-      }
-      prefill_token_budget_ = std::max(512, std::min(4096, prefill_token_budget_));
-#ifndef NDEBUG
-      VLOG(1) << "[SCHED] prefill budget=" << prefill_token_budget_
-              << " decode_backlog=" << decode_backlog << " pressure=" << pressure;
-#endif
-    }
+  if (!pending_prefills.empty()) {
 
     // Rows are tokens here, and every row pays a fixed per-layer cost
     // (~5-9 ms per step at small batch: ~17 kernel launches x 36 layers with
@@ -701,40 +727,47 @@ std::vector<Scheduler::BatchRow> Scheduler::build_batch_rows() {
     // with a max_batch=1 config a 140-token prompt took 140 steps and its
     // TTFT looked like decode speed (measured 1224 ms). max_batch_size_ only
     // bounds the number of DECODE rows (logits sampling alignment, decode
-    // CUDA graphs), so chunk rows may fill the whole step up to
-    // row_cap_for(max_batch_size_) — a short prompt then prefills in a
-    // single step even when the step also carries decode rows.
+    // CUDA graphs); the chunk budget bounds the prefill rows, and the step's
+    // row cap reserves that much room for them on top of the decode rows — a
+    // short prompt then prefills in a single step even when the step also
+    // carries decode rows, and a batch full of decoders still leaves the
+    // prefill side its rows.
     const int max_rows_this_step = row_cap_for(max_batch_size_);
     int prefill_taken = 0;
-    for (auto& seq : running_sequences_) {
-      if (seq.state != SeqState::RUNNING || seq.is_finished) continue;
-      if (seq.is_prefill_complete) continue;
-      if (prefill_taken >= prefill_token_budget_) break;
-      if (static_cast<int>(rows.size()) >= max_rows_this_step) break;
 
-      int remaining = seq.num_prompt_tokens - seq.next_prefill_chunk_start;
-      int take = std::min(remaining, prefill_token_budget_ - prefill_taken);
+    // Serve one pending prefill sequence: append as many of its remaining
+    // prompt tokens as the step's budget and row cap allow. Returns false when
+    // it made no progress.
+    auto serve_prefill = [&](Sequence& seq) -> bool {
+      if (seq.state != SeqState::RUNNING || seq.is_finished || seq.is_prefill_complete) {
+        return false;
+      }
+      if (prefill_taken >= prefill_token_budget) return false;
+      if (static_cast<int>(rows.size()) >= max_rows_this_step) return false;
+
+      const int remaining = seq.num_prompt_tokens - seq.next_prefill_chunk_start;
+      int take = std::min(remaining, prefill_token_budget - prefill_taken);
       take = std::min(take, max_rows_this_step - static_cast<int>(rows.size()));
-      if (take <= 0) break;
+      if (take <= 0) return false;
 
       // Lazy growth for the whole chunk up front (its highest position needs
       // the most blocks). On failure, shrink the chunk to what the current
       // blocks already cover so the sequence still makes progress.
       if (!ensure_blocks_for(&seq, seq.next_prefill_chunk_start + take - 1)) {
-        int covered = seq.num_blocks_allocated * block_size_;
+        const int covered = seq.num_blocks_allocated * block_size_;
         take = covered - seq.next_prefill_chunk_start;
         if (take <= 0) {
           LOG(ERROR) << "[SCHED] seq id=" << seq.id
                      << " cannot grow KV blocks for prefill; force-finishing";
           seq.is_finished = true;
           seq.state = SeqState::FINISHED;
-          continue;
+          return false;
         }
       }
 
       batch_row_seqs_.push_back(&seq);
       for (int i = 0; i < take; ++i) {
-        int p = seq.next_prefill_chunk_start + i;
+        const int p = seq.next_prefill_chunk_start + i;
         rows.push_back(BatchRow{&seq, false, static_cast<int32_t>(seq.prompt_tokens[p]),
                                 static_cast<int32_t>(p)});
       }
@@ -743,6 +776,33 @@ std::vector<Scheduler::BatchRow> Scheduler::build_batch_rows() {
       if (seq.next_prefill_chunk_start >= seq.num_prompt_tokens) {
         seq.is_prefill_complete = true;
       }
+      return true;
+    };
+
+    // Short-prompt-first chunking. Serving the pending prefills in running
+    // (FCFS) order let one long prompt at the front take the whole budget every
+    // step: every request admitted behind it — rows already allocated — sat
+    // with `is_prefill_complete == false` until that whole prefill ended.
+    // Measured on the real 4B model (15 x 48-token prompts behind one
+    // 7500-token prompt): every short request showed a TTFT equal to the
+    // head's entire prefill with all rows free. So: any pending prompt that
+    // fits inside one step's chunk (<= kPrefillRowReserve, one pass carries it
+    // to its first token) is served before the rest, in arrival order — the
+    // fix direction's "allow short requests to skip". Everything else keeps
+    // FCFS order among itself, so a long prompt is never dragged out further
+    // by a reordering it cannot profit from, and the leftover budget of a step
+    // whose short prompts finished still goes to the long prompt behind them.
+    std::vector<int> prefill_order = pending_prefills;
+    std::stable_sort(prefill_order.begin(), prefill_order.end(), [&](int a, int b) {
+      const Sequence& sa = running_sequences_[static_cast<size_t>(a)];
+      const Sequence& sb = running_sequences_[static_cast<size_t>(b)];
+      const int ra = sa.num_prompt_tokens - sa.next_prefill_chunk_start;
+      const int rb = sb.num_prompt_tokens - sb.next_prefill_chunk_start;
+      return ra <= kPrefillRowReserve && rb > kPrefillRowReserve;
+    });
+    for (int idx : prefill_order) {
+      serve_prefill(running_sequences_[static_cast<size_t>(idx)]);
+      if (prefill_taken >= prefill_token_budget) break;
     }
   }
 
@@ -1092,6 +1152,7 @@ void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
       }
     }
   }
+
 }
 
 void Scheduler::update_sequences() {

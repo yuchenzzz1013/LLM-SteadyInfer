@@ -31,6 +31,10 @@ struct Sequence {
   bool is_prefill_complete = false;
   int next_prefill_chunk_start = 0;  // chunked prefill progress (tokens prefilled)
   int max_gen_len = 2048;
+  // Times this sequence was preempted (recompute-style truncation). Every cut
+  // costs the victim progress, so try_preempt_for defers repeat victims and
+  // spreads the cost over distinct sequences instead of concentrating it.
+  int preempt_count = 0;
 
   // Prefix-cache progress: prefix_hash_chain[b] is the chained hash of prompt
   // block b, and the chain's length is how many leading prompt blocks have
