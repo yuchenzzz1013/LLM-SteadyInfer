@@ -882,12 +882,21 @@ base::Status Qwen2Model::forward_batch(
     const tensor::Tensor* seq_row_start,
     int32_t num_prefill_seqs,
     BatchScratch* scratch,
-    int32_t table_cols) const {
+    int32_t table_cols,
+    const tensor::Tensor* key_scale,
+    const tensor::Tensor* value_scale) const {
   if (input_ids.is_empty()) {
     return base::error::InvalidArgument("The input_ids tensor is empty.");
   }
 
   int32_t batch = input_ids.get_dim(0);
+  // int8 KV pools carry per-(token, kv head) dequantization scales (see
+  // KVManager::kv_quant); a bf16 pool passes none and the attention kernels
+  // take the full-precision read path with an empty scale tensor. Bound once
+  // here — the layer loop below would otherwise rebuild it per layer.
+  const tensor::Tensor k_no_scale;
+  const tensor::Tensor& k_scale = key_scale != nullptr ? *key_scale : k_no_scale;
+  const tensor::Tensor& v_scale = value_scale != nullptr ? *value_scale : k_no_scale;
   // Rows that need logits: the leading decode rows (see Model::forward_batch).
   // num_decode_rows == 0 means "the whole batch is decode rows" — the
   // decode_step / single-sequence callers that predate the split.
@@ -1100,18 +1109,20 @@ base::Status Qwen2Model::forward_batch(
       // Write this layer's K/V rows into each sequence's paged cache blocks
       // (layout [layers, num_blocks, block_size, kv_dim], addressed through
       // the block table).
-      kernel::paged_kv_scatter_cu(key_batch, key_cache, block_table_cu, positions_cu, kv_dim,
-                                  num_blocks, block_size, layer_idx, cuda_config_->stream);
-      kernel::paged_kv_scatter_cu(val_batch, value_cache, block_table_cu, positions_cu, kv_dim,
-                                  num_blocks, block_size, layer_idx, cuda_config_->stream);
+      kernel::paged_kv_scatter_cu(key_batch, key_cache, k_scale, block_table_cu, positions_cu,
+                                  kv_dim, config_->kv_head_num_, num_blocks, block_size, layer_idx,
+                                  cuda_config_->stream);
+      kernel::paged_kv_scatter_cu(val_batch, value_cache, v_scale, block_table_cu, positions_cu,
+                                  kv_dim, config_->kv_head_num_, num_blocks, block_size, layer_idx,
+                                  cuda_config_->stream);
 
       // f. MHA: Paged Flash Decoding — split-KV pass + reduce pass, one
       // launch pair per layer for the whole batch.
       kernel::paged_attention_dispatch(
           config_->head_num_, layer_idx, num_blocks, block_size, kv_dim, config_->kv_head_num_,
           config_->head_size_, num_decode_rows, seq_row_start, num_prefill_seqs, positions_cu,
-          block_table_cu, q_batch, partial_batch, mha_out_batch, key_cache, value_cache,
-          cuda_config_.get());
+          block_table_cu, q_batch, partial_batch, mha_out_batch, key_cache, value_cache, k_scale,
+          v_scale, cuda_config_.get());
 #else
       // Write this layer's K/V rows into each sequence's KV cache slot
       // (head-dim-contiguous layout: cache[layer][slot][d][pos]).

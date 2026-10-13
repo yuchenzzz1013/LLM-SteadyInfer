@@ -42,6 +42,15 @@ LLM-SteadyInfer 是一个基于 **C++ / CUDA C++** 实现的轻量级大语言�
   - 采用 Flash Decoding 风格 Split-KV 并行与 Online Softmax
   - 支持 Partial Attention Merge 优化长序列 Decode
 
+- **量化（KV Cache INT8）**
+  - K / V 可独立量化（掩码 `0=off / 1=K / 2=V / 3=K+V`）:对称 int8,FP32 scale、
+    粒度 per-(token, kv-head),随 KV 写入 scatter 进 scale 池
+  - 纯运行时开关（`LLAMA_KV_QUANT` / benchmark `--kv-quant` / Scheduler 构造参数）,
+    无需重新编译;仅支持 Paged CUDA 布局,不满足时直接报错拒绝,不会静默回退 BF16
+  - 实测（Qwen3-4B / ShareGPT / 32 并发 × 4096 上下文 / block size 16）:
+    KV 池 18.00 → 9.28 GB（1.94×）;四臂 PPL 的 |ΔPPL| ≤ 0.0074（0.05%）且不随
+    上下文累积,量化关闭时输出与 BF16 逐 bit 相同
+
 - **Continuous Batching Scheduler**
   - 状态机驱动请求调度
   - 支持 Prefill / Decode 混合执行
@@ -115,34 +124,6 @@ make -j$(nproc)
 
 ## Benchmark
 
-提供 Offline Batch、Online Serving 与 Prefix Caching 三类性能测试：
-`benchmark/offline_batch_benchmark.cpp`、`online_serving_benchmark.cpp`、
-`prefix_caching_benchmark.cpp`。
-
-Offline / Online 两个基准**默认关闭前缀缓存**（`--prefix-cache 1` 可打开，与 Scheduler 的
-默认一致），CSV 里的 `enable_prefix_cache` 列与报告里的开关状态均取自 Scheduler 的实际状态，
-`LLAMA_ENABLE_PREFIX_CACHE` 环境变量强制覆盖时也会如实反映。压测数据是彼此独立的请求，
-命中率极低，开着缓存只会把已完成请求的 prompt 块钉在池里并计入哈希开销（虚高的
-`kv_cache_frag_global` 就是这么来的）；缓存的净收益看 `prefix_caching_benchmark` 的 ON/OFF A/B。
-
-Offline / Online 两个基准共用同一套口径（两个 CSV 的对应列可直接比较）：
-
-* **计时窗口**从提交第一条请求之前开始：`wall_time_s` 含提交开销，所有请求的
-  `arrival_time` 都落在窗口内。
-* **TTFT / E2E 从请求到达算起**（offline = 提交时刻，online = 到达过程算出的
-  计划到达时刻），含排队/接纳等待；`queue_wait_*` 单独列出等待被接纳的时间。
-* **请求账目闭合**：`submitted == completed + rejected + dropped`；`dropped` 是
-  进了调度器但一个 token 都没生成就结束的请求（KV 扩张失败 / 前向失败）。
-* **预热（prefill + decode）不进统计**：预热后清空 scheduler 的逐步统计并清零
-  CUDA graph 捕获计数，CSV 里的 `graph_captures / graph_capture_ms` 只统计正式
-  窗口内新捕获的 decode graph（捕获按 batch size 惰性发生，窗口内首次出现的
-  batch size 会触发捕获——这部分开销单列，便于从吞吐里扣除评估）。
-* **`avg_decode_batch / throughput_efficiency`** 用"含 decode 行的 step 数
-  × 每步 decode 行数"统计（混合 prefill+decode 的步也计入），不再用纯 decode
-  步数，也不再混入预热步。
-* online 的 `avg_queue_len` 是**时间加权**（队列长度对时间积分 ÷ 窗口时长），
-  不是按主循环迭代取平均；`goodput_pct` 以 `submitted` 为分母。
-
 ### Offline Batch
 * Output Token Throughput
 * Total Token Throughput
@@ -165,20 +146,12 @@ Offline / Online 两个基准共用同一套口径（两个 CSV 的对应列可�
 * Output Token Throughput / Total Token Throughput / Completed RPS
 * `skipped_prefill_ratio`
 
-**正确性门禁**：ON/OFF 两轮的 prefill 形状不同（ON 只算尾巴），bf16 归约顺序随之变化，
-同一段 token 的 KV 会有约 1 个 ULP 的差别，经 argmax 会放大成 token 分歧——所以逐 token
-的 A/B 相等不是可用的判据。门禁因此分成两条：同配置重复必须逐 token 相同（确定性，硬
-门禁，不满足即返回 1）；A/B 不一致数只作诊断输出（`--repeat` 自动抬到 2 以给出漂移基线）。
-`--require-token-match 1` 可另开严格 A/B 相等。
-
 ---
 
 ## Demo
 
 ### 连续对话
 
-`demo/chat_demo.cpp` 是一个最小可跑的连续对话示例：ChatML 模板拼 prompt →
-`model->encode` → `Scheduler::add_request` → `step()` → 逐 token 流式打印。
 每轮携带全部历史（超出上下文预算时从最旧一轮整轮丢弃），并支持对话中热切换模型。
 
 ```bash

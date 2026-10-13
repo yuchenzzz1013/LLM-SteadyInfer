@@ -83,6 +83,10 @@ struct Args {
   // kv_cache_frag_global)。要看缓存的净收益用 prefix_caching_benchmark 的
   // A/B;需要按线上 serving 口径跑时用 --prefix-cache 1 打开。
   int prefix_cache = 0;
+
+  // KV Cache int8 量化掩码 (scheduler::KvQuant): 0=off, 1=K, 2=V, 3=K+V;
+  // -1 = 读 LLAMA_KV_QUANT 环境变量(与 Scheduler 的默认解析一致)。
+  int kv_quant = -1;
 };
 
 static Args parse_args(int argc, char** argv) {
@@ -133,6 +137,15 @@ static Args parse_args(int argc, char** argv) {
     a.warmup_iterations = to_int(get_arg(argc, argv, "--warmup-iterations"));
   if (has_arg(argc, argv, "--prefix-cache"))
     a.prefix_cache = to_int(get_arg(argc, argv, "--prefix-cache"));
+  if (has_arg(argc, argv, "--kv-quant"))
+    a.kv_quant = to_int(get_arg(argc, argv, "--kv-quant"));
+  // 掩码写错(比如按开关的思路写 7)不能在 KVManager 的 CHECK 里才炸:那时模型
+  // 都加载完了。这里直接拒绝,顺带把编码再讲一遍。
+  if (a.kv_quant < -1 || a.kv_quant > 3) {
+    LOG(FATAL) << "--kv-quant 必须是 0(off) / 1(K) / 2(V) / 3(K+V),或 -1(= 读 "
+                  "LLAMA_KV_QUANT);注意 1 是\"只量化 K\",不是开关。得到: "
+               << a.kv_quant;
+  }
 
   // 参数兜底:负值此前会在 vector 分配处抛 length_error 崩溃。
   if (a.num_requests < 0) a.num_requests = 0;
@@ -179,6 +192,10 @@ static void print_usage(const char* prog) {
       << "                         问题,命中率极低,开着只会把已完成请求的 prompt 块\n"
       << "                         钉在池里并计入哈希开销;要看净收益用\n"
       << "                         prefix_caching_benchmark 的 A/B\n"
+      << "  --kv-quant <0|1|2|3>   KV Cache int8 量化:0=off,1=K,2=V,3=K+V\n"
+      << "                         (默认 -1 = 读 LLAMA_KV_QUANT 环境变量)。注意 1 是\n"
+      << "                         \"只量化 K\",不是开关。仅 Paged CUDA 布局,容量约\n"
+      << "                         减半、精度见 README 的「量化」\n"
       << "  --output-csv <path>    结果 CSV 路径(默认 results/metrics.csv)\n";
 }
 
@@ -191,6 +208,7 @@ struct RunMetrics {
   int num_requests = 0, submitted = 0, completed = 0, rejected = 0, dropped = 0;
   // 压测配置(写进 CSV,保证一行结果自带复现所需的口径参数)
   int max_batch = 0, max_gen = 0, block_size = 0;
+  int kv_quant = 0;  // 生效的 int8 掩码(0=off, 1=K, 2=V, 3=K+V)
   // 正式窗口内的 CUDA graph 捕获开销(预热后清零)
   long long graph_captures = 0, graph_evictions = 0;
   double graph_capture_ms = 0;
@@ -237,7 +255,7 @@ static RunMetrics run_once(const std::shared_ptr<model::Model>& model,
                            const std::vector<std::vector<int>>& prompt_tokens,
                            int run_id, int max_batch, int max_gen_len,
                            int warmup_requests, int warmup_iterations,
-                           bool enable_prefix_cache, double flops_per_tok,
+                           bool enable_prefix_cache, int kv_quant, double flops_per_tok,
                            double peak_tflops) {
   using namespace scheduler;
   RunMetrics m;
@@ -270,10 +288,16 @@ static RunMetrics run_once(const std::shared_ptr<model::Model>& model,
   // 统计,并靠 submitted == completed + rejected + dropped 闭合 —— 历史上限
   // 若淘汰记录会让这些数字静默变少。离线压测是有限请求的短进程,请求记录本身
   // 就是全部统计,直接关掉淘汰(0 = 不淘汰;长驻服务才需要上限)。
+  // 生效的量化掩码:CLI 给了就用,否则读 LLAMA_KV_QUANT(Scheduler 的默认解析)。
+  // CSV 记录的是这个解析后的值,不是 -1 —— 否则 CSV 分不清"关着跑的"和
+  // "掩码写错/没生效"。
+  const int kv_quant_mask =
+      kv_quant >= 0 ? kv_quant : scheduler::kv_quant_from_env();
   Scheduler sched(model, max_batch, max_total_seq_len, max_gen_len,
                   Scheduler::resolve_block_size(avg_prompt_len),
                   /*enable_prefix_cache=*/enable_prefix_cache,
-                  /*finished_history_limit=*/0);
+                  /*finished_history_limit=*/0,
+                  /*kv_quant=*/kv_quant_mask);
 
   // ---- 预热:与正式压测共用同一 Scheduler ----
   // decode CUDA graph 在首次 decode 时捕获并烘焙当时 KV/logits 的设备指针;
@@ -316,6 +340,7 @@ static RunMetrics run_once(const std::shared_ptr<model::Model>& model,
   sched.clear_step_stats();
   model->reset_graph_stats();
   m.block_size = sched.get_block_size();
+  m.kv_quant = kv_quant_mask;
 
   GpuUtilSampler sampler;
   sampler.start();
@@ -518,7 +543,7 @@ static void write_csv(const std::string& path,
     LOG(ERROR) << "无法打开输出文件: " << path;
     return;
   }
-  f << "run_id,max_batch,max_gen,block_size,num_requests,submitted,completed,"
+  f << "run_id,max_batch,max_gen,block_size,kv_quant,num_requests,submitted,completed,"
        "rejected,dropped,prompt_tokens,output_tokens,"
        "total_tokens,wall_time_s,output_tps,total_tps,qps,"
        "ttft_avg_ms,ttft_p50_ms,ttft_p99_ms,"
@@ -537,7 +562,8 @@ static void write_csv(const std::string& path,
   f << std::fixed << std::setprecision(6);
   for (const auto& r : results) {
     f << r.run_id << "," << r.max_batch << "," << r.max_gen << "," << r.block_size
-      << "," << r.num_requests << "," << r.submitted << "," << r.completed << ","
+      << "," << r.kv_quant << "," << r.num_requests << "," << r.submitted << ","
+      << r.completed << ","
       << r.rejected << "," << r.dropped << "," << r.prompt_tokens << ","
       << r.output_tokens << ","
       << r.total_tokens << "," << r.wall_time_s << "," << r.output_tps << ","
@@ -575,7 +601,7 @@ static void print_report(const RunMetrics& r) {
   std::cout << "请求: 提交 " << r.num_requests << " 条, 完成 " << r.completed
             << " 条, 拒绝 " << r.rejected << " 条, 丢弃 " << r.dropped << " 条"
             << "  (max_batch=" << r.max_batch << " max_gen=" << r.max_gen
-            << " block_size=" << r.block_size << ")\n";
+            << " block_size=" << r.block_size << " kv_quant=" << r.kv_quant << ")\n";
   std::cout << "Token: prompt=" << r.prompt_tokens
             << " 输出=" << r.output_tokens
             << " 总计=" << r.total_tokens
@@ -783,7 +809,8 @@ int main(int argc, char* argv[]) {
   for (int i = 0; i < args.iterations; ++i) {
     results.push_back(run_once(model, prompt_tokens, i, args.max_batch,
                                args.max_gen, warm_requests, warm_iterations,
-                               args.prefix_cache != 0, flops_per_tok, peak_tflops));
+                               args.prefix_cache != 0, args.kv_quant, flops_per_tok,
+                               peak_tflops));
     print_report(results.back());
   }
 

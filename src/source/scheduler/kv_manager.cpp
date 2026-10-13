@@ -1,19 +1,60 @@
 #include "scheduler/kv_manager.h"
 
+#include <cctype>
+#include <cstdlib>
+#include <string>
+
 namespace scheduler {
 
+int kv_quant_from_env() {
+  const char* raw = std::getenv("LLAMA_KV_QUANT");
+  if (raw == nullptr || raw[0] == '\0') return kKvQuantNone;
+  // Case-insensitive: the value is typed by hand on a command line.
+  std::string v(raw);
+  for (char& c : v) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+  // A single digit is the MASK itself (0..3), identical to the Scheduler
+  // constructor argument and the benchmarks' --kv-quant, so the two entry
+  // points cannot be read against each other: "1" is K-only in both, and
+  // there is no spelling of the mask that means "both" when typed as a digit.
+  // (Words carry the intent for anyone who finds the mask opaque.)
+  if (v == "0" || v == "off" || v == "none" || v == "false") return kKvQuantNone;
+  if (v == "1") return kKvQuantK;
+  if (v == "2") return kKvQuantV;
+  if (v == "3") return kKvQuantBoth;
+  if (v == "k" || v == "key" || v == "keys") return kKvQuantK;
+  if (v == "v" || v == "value" || v == "values") return kKvQuantV;
+  if (v == "on" || v == "true" || v == "kv" || v == "both" || v == "all") {
+    return kKvQuantBoth;
+  }
+  LOG(FATAL) << "LLAMA_KV_QUANT: unrecognized value '" << raw
+             << "' (expected 0/off, 1/k, 2/v, 3/kv, or the words k, v, kv, both)";
+  return kKvQuantNone;
+}
+
 KVManager::KVManager(int num_layers, int max_batch, int max_seq_len, int kv_dim,
-                     std::shared_ptr<base::DeviceAllocator> alloc,
-                     base::DeviceType device, int block_size)
+                     int kv_head_num, std::shared_ptr<base::DeviceAllocator> alloc,
+                     base::DeviceType device, int block_size, int kv_quant)
     : num_layers_(num_layers),
       max_batch_(max_batch),
       max_seq_len_(max_seq_len),
-      kv_dim_(kv_dim) {
+      kv_dim_(kv_dim),
+      kv_head_num_(kv_head_num) {
 #ifdef USE_PAGED_ATTENTION
   paged_ = (device == base::DeviceType::kDeviceCUDA);
 #else
   paged_ = false;
 #endif
+
+  // int8 requires the paged layout (see the header). Reject rather than
+  // downgrade: a caller that asked for quantization and silently got bf16
+  // would measure no speedup, no PPL change, and no error.
+  CHECK(kv_quant == kKvQuantNone || paged_)
+      << "KV quantization (LLAMA_KV_QUANT) is only implemented for the paged CUDA layout "
+         "(USE_PAGED_ATTENTION + device=kDeviceCUDA); requested mask="
+      << kv_quant << ", paged=" << paged_;
+  CHECK(kv_quant >= kKvQuantNone && kv_quant <= kKvQuantBoth)
+      << "Invalid KV quantization mask " << kv_quant << " (expected 0..3)";
+  kv_quant_ = kv_quant;
 
   if (paged_) {
     // Paged layout: [num_layers, num_blocks, block_size, kv_dim]. One block
@@ -64,10 +105,28 @@ KVManager::KVManager(int num_layers, int max_batch, int max_seq_len, int kv_dim,
     // + pos_in_block * kv_dim + d
     // d-innermost within a page: the flash-decoding kernels walk consecutive
     // positions contiguously, crossing page boundaries through block_table.
-    key_cache_ = tensor::Tensor(kv_dtype, num_layers_, num_blocks_, block_size_, kv_dim_,
+    // Quantized, the same shape in int8 (half the bytes) — the addressing
+    // arithmetic is unchanged, only the element size and the load width are.
+    const base::DataType key_dtype =
+        key_is_quantized() ? base::DataType::kDataTypeInt8 : kv_dtype;
+    const base::DataType value_dtype =
+        value_is_quantized() ? base::DataType::kDataTypeInt8 : kv_dtype;
+    key_cache_ = tensor::Tensor(key_dtype, num_layers_, num_blocks_, block_size_, kv_dim_,
                                 true, alloc);
-    value_cache_ = tensor::Tensor(kv_dtype, num_layers_, num_blocks_, block_size_, kv_dim_,
+    value_cache_ = tensor::Tensor(value_dtype, num_layers_, num_blocks_, block_size_, kv_dim_,
                                   true, alloc);
+
+    // Scale pools, one fp32 per (layer, block, kv_head, pos_in_block). Only
+    // allocated for the quantized halves; the addressing (and why pos is the
+    // innermost dim) is documented on the members in the header.
+    if (key_is_quantized()) {
+      key_scale_cache_ = tensor::Tensor(base::DataType::kDataTypeFp32, num_layers_, num_blocks_,
+                                        kv_head_num_, block_size_, true, alloc);
+    }
+    if (value_is_quantized()) {
+      value_scale_cache_ = tensor::Tensor(base::DataType::kDataTypeFp32, num_layers_,
+                                          num_blocks_, kv_head_num_, block_size_, true, alloc);
+    }
   } else {
     // Head-dim-contiguous layout: cache[layer][slot][d][pos], position
     // innermost so decode MHA reads coalesce across consecutive positions.
@@ -83,7 +142,10 @@ KVManager::KVManager(int num_layers, int max_batch, int max_seq_len, int kv_dim,
   // later as a CUDA illegal address (or a null-pointer memcpy on CPU), with
   // nothing pointing at the pool size or the knobs that control it. Fail at
   // construction instead, with the numbers needed to size it down.
-  if (key_cache_.is_empty() || value_cache_.is_empty()) {
+  const bool scales_ok =
+      (key_is_quantized() ? !key_scale_cache_.is_empty() : true) &&
+      (value_is_quantized() ? !value_scale_cache_.is_empty() : true);
+  if (key_cache_.is_empty() || value_cache_.is_empty() || !scales_ok) {
     const double pool_gb =
         static_cast<double>(pool_bytes()) / (1024.0 * 1024.0 * 1024.0);
     LOG(FATAL) << "KV pool allocation failed: tried to allocate " << pool_gb << " GB ("
@@ -91,6 +153,9 @@ KVManager::KVManager(int num_layers, int max_batch, int max_seq_len, int kv_dim,
                << " max_batch=" << max_batch_ << " max_seq_len=" << max_seq_len_
                << " kv_dim=" << kv_dim_
                << (paged_ ? " block_size=" + std::to_string(block_size_) : std::string())
+               << (kv_quant_ != kKvQuantNone
+                       ? " kv_quant=" + std::to_string(kv_quant_) + " (pools + scales)"
+                       : std::string())
                << "). Lower max_batch / max_seq_len (or the driver's --gpu-mem-fraction) "
                   "and retry.";
   }
@@ -98,9 +163,14 @@ KVManager::KVManager(int num_layers, int max_batch, int max_seq_len, int kv_dim,
 
 long long KVManager::pool_bytes() const {
   // Derived from the dims, so a failed (empty) allocation still reports the
-  // size that was attempted — see the constructor's failure message.
+  // size that was attempted — see the constructor's failure message. The scale
+  // pools are included: they are real cache memory (~1.5% of the int8 pool at
+  // block_size=16, and a driver sizing the pool from the KV dtype alone would
+  // be wrong by exactly that much).
   return static_cast<long long>(key_cache_.byte_size()) +
-         static_cast<long long>(value_cache_.byte_size());
+         static_cast<long long>(value_cache_.byte_size()) +
+         static_cast<long long>(key_scale_cache_.byte_size()) +
+         static_cast<long long>(value_scale_cache_.byte_size());
 }
 
 int KVManager::allocate() {

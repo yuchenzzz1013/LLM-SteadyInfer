@@ -55,7 +55,8 @@ Scheduler::Scheduler(std::shared_ptr<model::Model> model,
                      int max_gen_len,
                      int block_size,
                      bool enable_prefix_cache,
-                     size_t finished_history_limit)
+                     size_t finished_history_limit,
+                     int kv_quant)
     : model_(model),
       max_batch_size_(max_batch_size),
       max_seq_len_(max_seq_len),
@@ -101,9 +102,13 @@ Scheduler::Scheduler(std::shared_ptr<model::Model> model,
   // that reaches the kernels broken (not a power of two >= 4 dividing 256) is
   // rejected inside KVManager, where it is applied.
   block_size_ = block_size > 0 ? block_size : default_block_size();
+  // KV quantization: explicit arg > env LLAMA_KV_QUANT > off. Same shape as the
+  // block-size resolution above — the env var exists so a speed/PPL A/B can run
+  // both arms out of ONE binary (two binaries would not be comparable).
+  const int kv_quant_mask = kv_quant >= 0 ? kv_quant : kv_quant_from_env();
   kv_manager_ = std::make_unique<KVManager>(num_layers, max_batch_size,
-                                             max_seq_len, kv_dim, alloc,
-                                             model_->device_type(), block_size_);
+                                             max_seq_len, kv_dim, model_->kv_head_num(), alloc,
+                                             model_->device_type(), block_size_, kv_quant_mask);
 
   // The block arithmetic below assumes one block == block_size_ tokens. On a
   // non-paged device (CPU) KVManager builds a degenerate pool whose block is a
@@ -1039,7 +1044,9 @@ void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
     auto status = model_->decode_step(input_ids, positions, block_table,
                                       kv_manager_->key_cache(),
                                       kv_manager_->value_cache(),
-                                      logits_view, table_cols);
+                                      logits_view, table_cols,
+                                      &kv_manager_->key_scale_cache(),
+                                      &kv_manager_->value_scale_cache());
     auto h_launched = std::chrono::steady_clock::now();
     if (!status) {
       force_finish_all("batch decode failed");
@@ -1098,7 +1105,9 @@ void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
                                         kv_manager_->key_cache(),
                                         kv_manager_->value_cache(),
                                         logits_, need_logits, num_decode_rows,
-                                        seq_row_start_ptr, num_prefill_seqs, nullptr, table_cols);
+                                        seq_row_start_ptr, num_prefill_seqs, nullptr, table_cols,
+                                        &kv_manager_->key_scale_cache(),
+                                        &kv_manager_->value_scale_cache());
     if (!status) {
       force_finish_all("batch prefill failed");
       return;

@@ -108,13 +108,16 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
                                 tensor::Tensor& key_cache,
                                 tensor::Tensor& value_cache,
                                 tensor::Tensor& logits,
-                                int32_t table_cols) {
+                                int32_t table_cols,
+                                const tensor::Tensor* key_scale,
+                                const tensor::Tensor* value_scale) {
   const bool use_graph = device_type_ == base::DeviceType::kDeviceCUDA && use_cuda_graphs_;
   if (!use_graph) {
     // Pure decode: every row is a decode row (num_decode_rows == batch), no prefill
     // row map is needed.
     return forward_batch(input_ids, positions, block_table, key_cache, value_cache, logits,
-                         true, input_ids.get_dim(0), nullptr, 0, nullptr, table_cols);
+                         true, input_ids.get_dim(0), nullptr, 0, nullptr, table_cols, key_scale,
+                         value_scale);
   }
 
   const int32_t batch = input_ids.get_dim(0);
@@ -227,11 +230,18 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
     if (no_graph) {
       return forward_batch(stage_ids, stage_pos, block_table, key_cache, value_cache,
                            entry->logits_view, true, batch, nullptr, 0,
-                           entry->scratch.get(), table_cols);
+                           entry->scratch.get(), table_cols, key_scale, value_scale);
     }
   }
 
   cudaStream_t stream = cuda_config_->stream;
+  // Same normalization for the quantization scales: a null pointer and an
+  // empty tensor both mean "bf16 pool" (see forward_batch).
+  const void* key_scale_ptr =
+      (key_scale != nullptr && !key_scale->is_empty()) ? key_scale->get_buffer()->ptr() : nullptr;
+  const void* value_scale_ptr = (value_scale != nullptr && !value_scale->is_empty())
+                                    ? value_scale->get_buffer()->ptr()
+                                    : nullptr;
 
   // Validate the Scheduler-owned pointers baked into the graph at capture
   // time. KV caches and the logits buffer belong to the Scheduler instance;
@@ -243,6 +253,8 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
       (entry->captured_key_ptr != key_cache.get_buffer()->ptr() ||
        entry->captured_value_ptr != value_cache.get_buffer()->ptr() ||
        entry->captured_logits_ptr != logits.get_buffer()->ptr() ||
+       entry->captured_key_scale_ptr != key_scale_ptr ||
+       entry->captured_value_scale_ptr != value_scale_ptr ||
        entry->captured_key_slots != num_slots ||
        entry->captured_key_seq_len != max_seq_len ||
        entry->captured_key_blocks != dims.num_blocks ||
@@ -267,12 +279,12 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
                    << "); falling back to direct decode for batch=" << batch;
       return forward_batch(stage_ids, stage_pos, block_table, key_cache, value_cache,
                            entry->logits_view, true, batch, nullptr, 0,
-                           entry->scratch.get(), table_cols);
+                           entry->scratch.get(), table_cols, key_scale, value_scale);
     }
 
     auto status = forward_batch(stage_ids, stage_pos, block_table, key_cache, value_cache,
                                 entry->logits_view, true, batch, nullptr, 0,
-                           entry->scratch.get(), table_cols);
+                           entry->scratch.get(), table_cols, key_scale, value_scale);
     cudaGraph_t graph = nullptr;
     cap_err = cudaStreamEndCapture(stream, &graph);
     if (cap_err != cudaSuccess || !status || graph == nullptr) {
@@ -288,7 +300,7 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
                    << "; falling back to direct decode.";
       return forward_batch(stage_ids, stage_pos, block_table, key_cache, value_cache,
                            entry->logits_view, true, batch, nullptr, 0,
-                           entry->scratch.get(), table_cols);
+                           entry->scratch.get(), table_cols, key_scale, value_scale);
     }
 
     cap_err = cudaGraphInstantiate(&entry->exec, graph, 0);
@@ -299,7 +311,7 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
                    << "); falling back to direct decode for batch=" << batch;
       return forward_batch(stage_ids, stage_pos, block_table, key_cache, value_cache,
                            entry->logits_view, true, batch, nullptr, 0,
-                           entry->scratch.get(), table_cols);
+                           entry->scratch.get(), table_cols, key_scale, value_scale);
     }
     graph_stats_.captures++;
     graph_stats_.capture_ms += std::chrono::duration<double, std::milli>(
@@ -309,6 +321,8 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
     entry->captured_key_ptr = key_cache.get_buffer()->ptr();
     entry->captured_value_ptr = value_cache.get_buffer()->ptr();
     entry->captured_logits_ptr = logits.get_buffer()->ptr();
+    entry->captured_key_scale_ptr = key_scale_ptr;
+    entry->captured_value_scale_ptr = value_scale_ptr;
     entry->captured_key_slots = num_slots;
     entry->captured_key_seq_len = max_seq_len;
     entry->captured_key_blocks = dims.num_blocks;
@@ -341,7 +355,7 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
   // capture_failed forever: direct batched forward with the stable scratch.
   return forward_batch(stage_ids, stage_pos, block_table, key_cache, value_cache,
                        entry->logits_view, true, batch, nullptr, 0, entry->scratch.get(),
-                       table_cols);
+                       table_cols, key_scale, value_scale);
 }
 
 base::ModelType Model::model_type() const { return model_type_; }

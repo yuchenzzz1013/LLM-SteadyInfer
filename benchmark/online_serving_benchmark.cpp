@@ -88,6 +88,10 @@ struct Args {
   // prefix_caching_benchmark 的 A/B;需要按线上 serving 口径跑时用
   // --prefix-cache 1 打开。
   int prefix_cache = 0;
+
+  // KV Cache int8 量化掩码 (scheduler::KvQuant): 0=off, 1=K, 2=V, 3=K+V;
+  // -1 = 读 LLAMA_KV_QUANT 环境变量(与 Scheduler 的默认解析一致)。
+  int kv_quant = -1;
 };
 
 // 解析浮点参数,支持 "inf"(无穷大 → -1)
@@ -159,6 +163,15 @@ static Args parse_args(int argc, char** argv) {
     a.tpot_sla_ms = to_double(get_arg(argc, argv, "--tpot-sla-ms"));
   if (has_arg(argc, argv, "--prefix-cache"))
     a.prefix_cache = to_int(get_arg(argc, argv, "--prefix-cache"));
+  if (has_arg(argc, argv, "--kv-quant"))
+    a.kv_quant = to_int(get_arg(argc, argv, "--kv-quant"));
+  // 掩码写错(比如按开关的思路写 7)不能在 KVManager 的 CHECK 里才炸:那时模型
+  // 都加载完了。这里直接拒绝,顺带把编码再讲一遍。
+  if (a.kv_quant < -1 || a.kv_quant > 3) {
+    LOG(FATAL) << "--kv-quant 必须是 0(off) / 1(K) / 2(V) / 3(K+V),或 -1(= 读 "
+                  "LLAMA_KV_QUANT);注意 1 是\"只量化 K\",不是开关。得到: "
+               << a.kv_quant;
+  }
 
   // 参数兜底:负的 iterations/max_gen 此前会在 vector 分配处抛 length_error 崩溃,
   // rate==0 会让到达间隔变成 inf(请求永不提交,压测挂死)。
@@ -216,6 +229,10 @@ static void print_usage(const char* prog) {
       << "                         极低,开着只会把已完成请求的 prompt 块钉在池里并\n"
       << "                         计入哈希开销;要看净收益用\n"
       << "                         prefix_caching_benchmark 的 A/B\n"
+      << "  --kv-quant <0|1|2|3>   KV Cache int8 量化:0=off,1=K,2=V,3=K+V\n"
+      << "                         (默认 -1 = 读 LLAMA_KV_QUANT 环境变量)。注意 1 是\n"
+      << "                         \"只量化 K\",不是开关。仅 Paged CUDA 布局;开启后\n"
+      << "                         KV 池按 int8 估算,autobatch 的并发上限随之放宽\n"
       << "  --output-csv <path>    结果 CSV 路径(默认 results/serving_metrics.csv)\n";
 }
 
@@ -226,6 +243,7 @@ struct ServingMetrics {
   int num_requests = 0, submitted = 0, completed = 0, rejected = 0, dropped = 0;
   // 本轮实际生效的调度配置(autobatch 会自动放大 max_batch,写进 CSV 才能复现)
   int max_batch = 0, max_gen = 0, block_size = 0;
+  int kv_quant = 0;  // 生效的 int8 掩码(0=off, 1=K, 2=V, 3=K+V)
   bool auto_batch = false;  // max_batch 是否由空闲显存自动决定
   // 正式窗口内的 CUDA graph 捕获开销(预热后清零,见 offline 同名字段)
   long long graph_captures = 0, graph_evictions = 0;
@@ -301,6 +319,11 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
   const long long avg_prompt_len =
       prompt_tokens.empty() ? 0 : prompt_len_sum / static_cast<long long>(prompt_tokens.size());
   const int block_size = Scheduler::resolve_block_size(avg_prompt_len);
+  // 本轮生效的量化掩码:--kv-quant 优先,否则与 Scheduler 一样读
+  // LLAMA_KV_QUANT。下面的 autobatch 估算与 Scheduler 构造共用这一个值,
+  // 不允许"估的是 bf16、跑的是 int8"这种口径裂缝(那会让估算出的并发上限
+  // 白白少一半)。
+  const int kv_quant = args.kv_quant >= 0 ? args.kv_quant : scheduler::kv_quant_from_env();
 
   // ---- 自适应 max_batch ----
   // 显存按上限整池预留:max_batch * ceil(max_seq_len/block_size) 个物理块在
@@ -315,9 +338,18 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
   int max_batch = requested_batch;
   {
     const int64_t blocks_per_seq = (max_total_seq_len + block_size - 1) / block_size;
-    // bf16 x [num_layers, num_blocks, block_size, kv_dim] x {K,V}
-    const int64_t bytes_per_seq = static_cast<int64_t>(model->layer_num()) * blocks_per_seq *
-                                  block_size * model->kv_dim() * 2 * 2;
+    // 每 sequence 的 KV 池字节 = 它那份 [num_layers, blocks_per_seq, block_size,
+    // kv_dim] x {K,V};元素未量化 2B(bf16),量化后 1B(int8)。另加每个被量化
+    // 张量一份 fp32 scale 池 [num_layers, blocks_per_seq, kv_head_num,
+    // block_size] —— 与 KVManager 的分配同款布局,照抄公式而不是拍个系数。
+    const bool kq = (kv_quant & scheduler::kKvQuantK) != 0;
+    const bool vq = (kv_quant & scheduler::kKvQuantV) != 0;
+    const int64_t kv_elems = static_cast<int64_t>(model->layer_num()) * blocks_per_seq *
+                             block_size * model->kv_dim();
+    const int64_t scale_elems = static_cast<int64_t>(model->layer_num()) * blocks_per_seq *
+                                block_size * model->kv_head_num();
+    const int64_t bytes_per_seq = kv_elems * ((kq ? 1 : 2) + (vq ? 1 : 2)) +
+                                  scale_elems * 4 * ((kq ? 1 : 0) + (vq ? 1 : 0));
     size_t free_b = 0, total_b = 0;
     if (bytes_per_seq > 0 && cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
       // 预留给 logits 缓冲、每步临时张量、显存碎片,以及最容易被低估的一块:
@@ -347,6 +379,7 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
   m.max_batch = max_batch;
   m.max_gen = args.max_gen;
   m.auto_batch = !args.max_batch_explicit;
+  m.kv_quant = kv_quant;
 
   // 前缀缓存默认关闭(--prefix-cache 1 打开):请求独立时命中率极低,开着只会
   // 把已完成请求的 prompt 块钉在池里、并把哈希开销计入延迟。缓存收益本身由
@@ -356,7 +389,8 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
   // get_finished() 复核(在线压测的条数上界 = 数据集条数 + 预热条数,可控)。
   Scheduler sched(model, max_batch, max_total_seq_len, args.max_gen, block_size,
                   /*enable_prefix_cache=*/args.prefix_cache != 0,
-                  /*finished_history_limit=*/0);
+                  /*finished_history_limit=*/0,
+                  /*kv_quant=*/kv_quant);
   m.block_size = sched.get_block_size();
 
   // ---- 预热:与正式压测共用同一 Scheduler(同 offline,统计中跳过) ----
@@ -633,7 +667,7 @@ static void write_csv(const std::string& path,
     return;
   }
   f << "run_id,request_rate,burstiness,duration_s,max_batch,auto_batch,max_gen,"
-       "block_size,num_requests,submitted,"
+       "block_size,kv_quant,num_requests,submitted,"
        "completed,rejected,dropped,prompt_tokens,output_tokens,total_tokens,wall_time_s,"
        "completed_rps,output_tps,total_tps,"
        "ttft_avg_ms,ttft_p50_ms,ttft_p99_ms,"
@@ -654,6 +688,7 @@ static void write_csv(const std::string& path,
     f << r.run_id << "," << r.request_rate << "," << r.burstiness << ","
       << r.duration_s << "," << r.max_batch << "," << (r.auto_batch ? 1 : 0) << ","
       << r.max_gen << "," << r.block_size << ","
+      << r.kv_quant << ","
       << r.num_requests << "," << r.submitted << ","
       << r.completed << "," << r.rejected << "," << r.dropped << ","
       << r.prompt_tokens << ","
@@ -693,7 +728,8 @@ static void print_report(const ServingMetrics& r, const Args& args) {
   std::cout << "Dropped requests (0 tokens):            " << r.dropped << "\n";
   std::cout << "Scheduler config:                       max_batch=" << r.max_batch
             << (r.auto_batch ? " (auto)" : " (explicit)")
-            << " max_gen=" << r.max_gen << " block_size=" << r.block_size << "\n";
+            << " max_gen=" << r.max_gen << " block_size=" << r.block_size
+            << " kv_quant=" << r.kv_quant << "\n";
   std::cout << "Benchmark duration (s):                 " << r.wall_time_s << "\n";
   std::cout << "Total input tokens:                     " << r.prompt_tokens << "\n";
   std::cout << "Total generated tokens:                 " << r.output_tokens << "\n";

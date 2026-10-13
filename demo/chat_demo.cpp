@@ -68,6 +68,7 @@ struct Args {
   // 也就是把 A100 的显存尽量变成 KV 池(每 token KV = layers x 2 x kv_dim x dtype)。
   int max_seq_len = 0;
   int max_batch = 1;              // 调度器槽位数;KV 池 = max_batch x max_seq_len
+  int kv_quant = -1;              // KV int8 掩码(0/1/2/3);-1 = 走 LLAMA_KV_QUANT
   double gpu_mem_fraction = 0.9;  // KV 池最多占空闲显存的比例(留 10% 给激活/临时缓冲)
   int max_new_tokens = 1024;      // 每轮最多生成多少 token
   bool thinking = false;               // Qwen3 思考模式(默认关闭,回答更直接)
@@ -91,6 +92,7 @@ void print_usage(const char* prog) {
       << "  --max-batch <N>      调度器槽位数(默认 1);KV 池按 max_batch x max_seq_len\n"
       << "                       整块预分配,想多占显存可以调大\n"
       << "  --gpu-mem-fraction <f>  KV 池最多占空闲显存的比例(默认 0.9)\n"
+      << "  --kv-quant <0|1|2|3>    KV int8 量化(1=K,2=V,3=both;默认读 LLAMA_KV_QUANT)\n"
       << "  --max-new-tokens <N> 每轮最大生成长度(默认 1024)\n"
       << "  --questions <q1|q2>  非交互模式:用 | 分隔多个问题,依次提问后退出\n"
       << "  --thinking           Qwen3 思考模式(默认关闭:追加空 think 块,直出答案)\n"
@@ -152,6 +154,8 @@ Args parse_args(int argc, char** argv) {
       a.max_batch = parse_int(value("--max-batch"), "--max-batch");
     } else if (k == "--gpu-mem-fraction") {
       a.gpu_mem_fraction = parse_double(value("--gpu-mem-fraction"), "--gpu-mem-fraction");
+    } else if (k == "--kv-quant") {
+      a.kv_quant = parse_int(value("--kv-quant"), "--kv-quant");
     } else if (k == "--max-new-tokens") {
       a.max_new_tokens = parse_int(value("--max-new-tokens"), "--max-new-tokens");
     } else if (k == "--questions") {
@@ -333,14 +337,30 @@ struct ChatEngine {
   int ctx = 0;             // KV cache 容量(prompt + 生成)
   int prompt_budget = 0;   // 留给 prompt 的 token 预算
   int max_batch = 1;       // 调度器槽位数
+  int kv_quant = 0;        // 生效的 int8 掩码(scheduler::KvQuant)
   long long kv_bytes = 0;  // KV 池实际占用(整块预分配)
   long long vram_free = 0;
   long long vram_total = 0;
 
-  // 每个 token 的 KV 字节数: 层数 x (K+V) x kv_dim x 元素字节(BF16=2 / FP32=4)
+  // 每个 token 的 KV 字节数: 层数 x (K+V) x kv_dim x 元素字节,再按量化的
+  // 半边打折,并加上每 (token, kv head) 一个 fp32 scale 的开销。
+  // 元素字节:INT8=1 / BF16=2 / FP32=4(CPU 路径)。
+  // 量化的依据是 KVManager 实际采用的掩码(CLI > LLAMA_KV_QUANT),不是编译宏 ——
+  // 这个预算函数必须和真正分配池子的那个开关读同一个来源,否则显存会算乐观。
   long long kv_bytes_per_token() const {
     const long long elem = (model->compute_dtype() == base::DataType::kDataTypeBF16) ? 2 : 4;
-    return static_cast<long long>(model->layer_num()) * 2 * model->kv_dim() * elem;
+    const int quant = kv_quant;
+    // 每 token 每个 KV head 的 scale(只有被量化的那半边有)
+    const long long scale = static_cast<long long>(model->layer_num()) *
+                            model->kv_head_num() * sizeof(float);
+    long long bytes = 0;
+    bytes += static_cast<long long>(model->layer_num()) * model->kv_dim() *
+             ((quant & scheduler::kKvQuantK) ? 1 : elem);
+    bytes += static_cast<long long>(model->layer_num()) * model->kv_dim() *
+             ((quant & scheduler::kKvQuantV) ? 1 : elem);
+    if (quant & scheduler::kKvQuantK) bytes += scale;
+    if (quant & scheduler::kKvQuantV) bytes += scale;
+    return bytes;
   }
 
   // 按 args 加载模型并建调度器;失败返回 false(已打印原因)
@@ -361,6 +381,7 @@ struct ChatEngine {
       return false;
     }
 
+    kv_quant = args.kv_quant >= 0 ? args.kv_quant : scheduler::kv_quant_from_env();
     std::cout << "正在加载模型 " << args.model_dir << " ..." << std::endl;
     base::Status st = model->init(device_type);
     if (!st) {
@@ -431,7 +452,9 @@ struct ChatEngine {
     // 整块复用上一轮已算好的 KV,只 prefill 新增的尾巴,TTFT 与算力都省。
     sched = std::make_unique<scheduler::Scheduler>(model, max_batch, ctx, args.max_new_tokens,
                                                    /*block_size=*/0,
-                                                   /*enable_prefix_cache=*/true);
+                                                   /*enable_prefix_cache=*/true,
+                                                   scheduler::Scheduler::kDefaultFinishedHistory,
+                                                   kv_quant);
     // KV 池的字节数直接问调度器要(含块对齐的真实分配),而不是按 token 估算。
     kv_bytes = sched->kv_pool_bytes();
     return true;

@@ -189,11 +189,22 @@ if (VERIFY_TOKENS)
     set_target_properties(verify_tokens PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 endif()
 
+# KV 量化 PPL 门禁 (bf16 基线 vs int8 臂,见 ppl_benchmark.cpp 头注释)
+# 直接驱动 model->decode_step 并把 NLL 归约放在设备端,所以需要一个 .cu
+# 编译单元 —— 即仅在根项目子目录模式(开启了 CUDA 语言)下构建。
+option(PPL_BENCHMARK "Build the KV-quantization PPL gate" ON)
+if (PPL_BENCHMARK AND NOT BENCH_STANDALONE AND CMAKE_CUDA_COMPILER)
+    message(STATUS "Building ppl_benchmark (KV-quant PPL gate)")
+    add_executable(ppl_benchmark ppl_benchmark.cpp ppl_nll_kernel.cu)
+    target_link_libraries(ppl_benchmark PRIVATE bench_deps)
+    set_target_properties(ppl_benchmark PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+endif()
+
 # ---------- 独立模式:运行时库搜索路径(作用于全部目标) ----------
 if(BENCH_STANDALONE)
   list(REMOVE_DUPLICATES RPATH_DIRS)
   foreach(tgt offline_batch_benchmark online_serving_benchmark
-              prefix_caching_benchmark verify_tokens)
+              prefix_caching_benchmark verify_tokens ppl_benchmark)
     if(TARGET ${tgt})
       set_target_properties(${tgt} PROPERTIES
         BUILD_RPATH "${RPATH_DIRS}"

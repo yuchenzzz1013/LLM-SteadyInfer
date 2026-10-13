@@ -36,13 +36,17 @@ class Scheduler {
   //   batches (see retire_finished). 0 keeps everything (only for short
   //   deterministic runs). Benchmarks pass their request count so their
   //   per-request statistics always cover the whole run.
+  //   kv_quant: KV-cache int8 quantization mask (scheduler::KvQuant: 0 = off,
+  //     1 = K only, 2 = V only, 3 = both), or -1 to resolve from LLAMA_KV_QUANT.
+  //     Paged CUDA pools only; anything else is rejected by KVManager.
   Scheduler(std::shared_ptr<model::Model> model,
             int max_batch_size,
             int max_seq_len,
             int max_gen_len = 0,
             int block_size = 0,
             bool enable_prefix_cache = false,
-            size_t finished_history_limit = kDefaultFinishedHistory);
+            size_t finished_history_limit = kDefaultFinishedHistory,
+            int kv_quant = -1);
 
   // Verifies the block pool invariant (no refcount leak stranded blocks).
   ~Scheduler();

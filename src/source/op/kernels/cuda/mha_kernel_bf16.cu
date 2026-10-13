@@ -43,6 +43,41 @@
 #include "model/qkv_split.h"
 namespace kernel {
 
+// ========== KV pool dtype gate ==========
+// The KV wrappers below cannot tell a mis-typed pool from a correct one:
+// Tensor::ptr<T>() is an unchecked reinterpret_cast, so a pool that is int8
+// while the kernels read it as bf16 (or the reverse) computes garbage with no
+// error anywhere. KV-cache quantization turns that into a live hazard — the
+// pool dtype becomes runtime state, and every read site has to be updated by
+// hand — so each wrapper states which dtypes its kernels can actually address
+// and everything else fails here, at the entry, with the pool named.
+//
+// The two dtypes are a package with the scale pool: an int8 pool without its
+// scales is unreadable (every dequantized row would be zero or garbage), and a
+// bf16 pool with scales means the caller thinks quantization is on while the
+// writer wrote full-precision rows. Both are wiring bugs, so they are rejected
+// on the argument pair rather than at the first read.
+//
+// This is deliberately a separate, single function: teaching the kernels a new
+// dtype means editing this one line in the same commit, and forgetting leaves
+// a loud failure rather than a silent misread.
+static void check_kv_pool_dtype(const tensor::Tensor& pool, const tensor::Tensor& scale,
+                                const char* what) {
+  const base::DataType dtype = pool.data_type();
+  CHECK(dtype == base::DataType::kDataTypeBF16 || dtype == base::DataType::kDataTypeInt8)
+      << what << " has dtype " << static_cast<int>(dtype)
+      << ", but the KV kernels address bf16 and int8 pools only";
+  if (dtype == base::DataType::kDataTypeInt8) {
+    CHECK(!scale.is_empty() && scale.data_type() == base::DataType::kDataTypeFp32)
+        << what << " is int8 but its scale pool is missing (empty=" << scale.is_empty()
+        << ", dtype=" << static_cast<int>(scale.data_type()) << ")";
+  } else {
+    CHECK(scale.is_empty()) << what
+                            << " is bf16 but a scale pool was passed; the writer and the readers "
+                               "disagree on whether quantization is on";
+  }
+}
+
 // ========== Dynamic shared-memory opt-in ==========
 // The flash-decoding kernels size their K/V tile scratch from max_seq_len /
 // num_splits, so beyond ~97K context (head_size 128, 8 splits) the requested
@@ -410,7 +445,13 @@ void mha_kernel_cu_batch(int32_t head_num, int32_t layer_idx, int32_t num_slots,
 }
 
 // ========== Paged KV scatter ==========
-// Raw bf16 element copy through the block table (2-byte elements).
+// Raw bf16 copy through the block table. The row moves 8 bytes (4 bf16) at a
+// time: every address term below is a multiple of kv_dim, so with kv_dim a
+// multiple of 4 both sides sit on 8-byte boundaries of CUDA-aligned pool
+// tensors and each row is a plain run of uint2. kv_dim = kv_head_num *
+// head_size is a multiple of 4 in every served geometry (head_size >= 8), but
+// the element-wise loop stays as the fallback so an odd kv_dim degrades to the
+// old behaviour instead of misaligning a vector access.
 __global__ void paged_kv_scatter_kernel_bf16(const __nv_bfloat16* src, __nv_bfloat16* dst,
                                              const int32_t* block_table, int32_t table_stride,
                                              const int32_t* positions, int32_t kv_dim,
@@ -430,19 +471,151 @@ __global__ void paged_kv_scatter_kernel_bf16(const __nv_bfloat16* src, __nv_bflo
   const int64_t base = layer_base + static_cast<int64_t>(block_id) * (block_size * kv_dim) +
                        static_cast<int64_t>(off) * kv_dim;
   const __nv_bfloat16* src_row = src + static_cast<int64_t>(b) * kv_dim;
-  for (int d = tid; d < kv_dim; d += blockDim.x) {
-    dst[base + d] = src_row[d];
+  if ((kv_dim & 3) == 0) {
+    const uint2* src_vec = reinterpret_cast<const uint2*>(src_row);
+    uint2* dst_vec = reinterpret_cast<uint2*>(dst + base);
+    const int n_vec = kv_dim >> 2;
+    for (int i = tid; i < n_vec; i += blockDim.x) {
+      dst_vec[i] = src_vec[i];
+    }
+  } else {
+    for (int d = tid; d < kv_dim; d += blockDim.x) {
+      dst[base + d] = src_row[d];
+    }
+  }
+}
+
+// Quantizing scatter: one warp per (batch row, kv head), lane l owning head
+// dims [l*4, l*4+4) — the same 4-contiguous-dims mapping the attention kernels
+// read a row back with, so a row is written and consumed in one layout and the
+// round trip needs no reshape.
+//
+// The scale is per (token, kv head), so the amax has to be reduced across the
+// lanes that own the head's dims: that is what forces a warp-shaped kernel
+// where the bf16 path is a flat element-wise copy. The reduction is the same
+// 5-step shfl_xor the attention kernels use; every lane then holds the same
+// scale and quantizes its own 4 values, and lane 0 writes the scale out. Data
+// and scale come out of one pass, so nothing is re-read and blocks stay
+// independent of each other.
+//
+// head_size <= 128 is one pass (the served geometries: 64 and 128). A
+// head_size in (128, 256] needs the amax over BOTH passes before anything can
+// be quantized, so the values stay in registers and a single reduction covers
+// the whole head — a per-chunk reduction would emit two scales for one head,
+// and the reader, which dequantizes a head with one scale, would take half the
+// row at the wrong magnitude. Lanes whose dims fall past the end of a < 128-dim
+// head feed the max its neutral element (0.0, and |x| >= 0 always).
+__global__ void paged_kv_scatter_quant_kernel_bf16(const __nv_bfloat16* __restrict__ src,
+                                                   int8_t* __restrict__ dst,
+                                                   float* __restrict__ dst_scale,
+                                                   const int32_t* __restrict__ block_table,
+                                                   int32_t table_stride,
+                                                   const int32_t* __restrict__ positions,
+                                                   int32_t kv_dim, int32_t kv_head_num,
+                                                   int32_t num_blocks, int32_t block_size,
+                                                   int32_t layer_idx) {
+  const int b = blockIdx.x;
+  const int warp = threadIdx.x >> 5;
+  const int n_warps = blockDim.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int pos = positions[b];
+  const int32_t* table_row = block_table + static_cast<int64_t>(b) * table_stride;
+  const int block_id = __ldg(table_row + (pos / block_size));
+  // Physical page again: see the bf16 kernel for why this is pos % block_size
+  // and not pos - block_id * block_size.
+  const int off = pos % block_size;
+  const int head_size = kv_dim / kv_head_num;
+  const int n_chunks = (head_size + 127) >> 7;  // 1 for <= 128, 2 up to the 256 cap
+  const int64_t layer_data_base =
+      static_cast<int64_t>(layer_idx) * num_blocks * block_size * kv_dim +
+      static_cast<int64_t>(block_id) * (block_size * kv_dim) + static_cast<int64_t>(off) * kv_dim;
+  const int64_t layer_scale_base =
+      static_cast<int64_t>(layer_idx) * num_blocks * block_size * kv_head_num;
+  const __nv_bfloat16* src_row = src + static_cast<int64_t>(b) * kv_dim;
+
+  for (int head = warp; head < kv_head_num; head += n_warps) {
+    const __nv_bfloat16* head_src = src_row + static_cast<int64_t>(head) * head_size;
+    float val[2][4];
+    float amax = 0.f;
+#pragma unroll
+    for (int c = 0; c < 2; ++c) {
+      if (c >= n_chunks) break;
+      const int d = c * 128 + lane * 4;
+      if (d >= head_size) break;
+      const uint2 raw = *reinterpret_cast<const uint2*>(head_src + d);
+      const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&raw);
+      val[c][0] = __bfloat162float(h[0].x);
+      val[c][1] = __bfloat162float(h[0].y);
+      val[c][2] = __bfloat162float(h[1].x);
+      val[c][3] = __bfloat162float(h[1].y);
+      amax = fmaxf(amax, fmaxf(fmaxf(fabsf(val[c][0]), fabsf(val[c][1])),
+                               fmaxf(fabsf(val[c][2]), fabsf(val[c][3]))));
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+      amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    }
+    // An all-zero row (masked padding, a head whose weights zeroed it) would
+    // divide by zero; the floor keeps the scale positive and 0 * inv_scale
+    // still quantizes to 0, so such a row round-trips exactly.
+    const float scale = fmaxf(amax, 1e-8f) * (1.0f / 127.0f);
+    const float inv_scale = 1.0f / scale;
+    int8_t* head_dst = dst + layer_data_base + static_cast<int64_t>(head) * head_size;
+#pragma unroll
+    for (int c = 0; c < 2; ++c) {
+      if (c >= n_chunks) break;
+      const int d = c * 128 + lane * 4;
+      if (d >= head_size) break;
+      uint32_t packed = 0;
+#pragma unroll
+      for (int v = 0; v < 4; ++v) {
+        // Round-to-nearest, then clamp: |x| <= amax makes |q| <= 127 already,
+        // so the clamp only ever catches a value the reduction never saw.
+        const int q = min(127, max(-127, __float2int_rn(val[c][v] * inv_scale)));
+        packed |= static_cast<uint32_t>(static_cast<uint8_t>(static_cast<int8_t>(q))) << (8 * v);
+      }
+      *reinterpret_cast<uint32_t*>(head_dst + d) = packed;
+    }
+    if (lane == 0) {
+      dst_scale[layer_scale_base +
+                (static_cast<int64_t>(block_id) * kv_head_num + head) * block_size + off] = scale;
+    }
   }
 }
 
 void paged_kv_scatter_cu(const tensor::Tensor& src, tensor::Tensor& dst_cache,
-                              const tensor::Tensor& block_table, const tensor::Tensor& positions,
-                              int32_t kv_dim, int32_t num_blocks, int32_t block_size,
-                              int32_t layer_idx, void* stream) {
+                         const tensor::Tensor& dst_scale, const tensor::Tensor& block_table,
+                         const tensor::Tensor& positions, int32_t kv_dim, int32_t kv_head_num,
+                         int32_t num_blocks, int32_t block_size, int32_t layer_idx,
+                         void* stream) {
   cudaStream_t stream_ = stream ? static_cast<cudaStream_t>(stream) : nullptr;
-  int32_t batch = src.get_dim(0);
-  __nv_bfloat16* dst = const_cast<__nv_bfloat16*>(dst_cache.ptr<__nv_bfloat16>());
+  check_kv_pool_dtype(dst_cache, dst_scale, "paged_kv_scatter_cu: dst_cache");
+  const int32_t batch = src.get_dim(0);
   const int32_t table_stride = block_table.get_dim(1);
+  if (dst_cache.data_type() == base::DataType::kDataTypeInt8) {
+    CHECK(kv_head_num > 0 && kv_dim % kv_head_num == 0)
+        << "kv_dim=" << kv_dim << " kv_head_num=" << kv_head_num;
+    const int32_t head_size = kv_dim / kv_head_num;
+    CHECK((head_size & 3) == 0 && head_size <= 256)
+        << "the quantizing scatter needs a head_size that is a multiple of 4 and at most 256, got "
+        << head_size;
+    int8_t* dst = const_cast<int8_t*>(dst_cache.ptr<int8_t>());
+    float* dst_scale_ptr = const_cast<float*>(dst_scale.ptr<float>());
+    constexpr int kThreads = 256;  // 8 warps: one kv head per warp per pass, then stride
+    if (stream_) {
+      paged_kv_scatter_quant_kernel_bf16<<<batch, kThreads, 0, stream_>>>(
+          src.ptr<__nv_bfloat16>(), dst, dst_scale_ptr, block_table.ptr<int32_t>(), table_stride,
+          positions.ptr<int32_t>(), kv_dim, kv_head_num, num_blocks, block_size, layer_idx);
+      CUDA_KERNEL_CHECK();
+    } else {
+      paged_kv_scatter_quant_kernel_bf16<<<batch, kThreads>>>(
+          src.ptr<__nv_bfloat16>(), dst, dst_scale_ptr, block_table.ptr<int32_t>(), table_stride,
+          positions.ptr<int32_t>(), kv_dim, kv_head_num, num_blocks, block_size, layer_idx);
+      CUDA_KERNEL_CHECK();
+    }
+    return;
+  }
+  __nv_bfloat16* dst = const_cast<__nv_bfloat16*>(dst_cache.ptr<__nv_bfloat16>());
   if (stream_) {
     paged_kv_scatter_kernel_bf16<<<batch, 256, 0, stream_>>>(
         src.ptr<__nv_bfloat16>(), dst, block_table.ptr<int32_t>(), table_stride,
@@ -509,7 +682,9 @@ __global__ void paged_attn_split_kernel_bf16(
     int32_t table_stride, int32_t num_blocks, int32_t block_size, int32_t block_shift,
     int32_t layer_idx, int32_t dim, const __nv_bfloat16* __restrict__ query,
     float* __restrict__ partials, const __nv_bfloat16* __restrict__ key_cache,
-    const __nv_bfloat16* __restrict__ value_cache, int32_t kv_dim, int32_t kv_head_num,
+    const __nv_bfloat16* __restrict__ value_cache, const int8_t* __restrict__ key_cache_i8,
+    const int8_t* __restrict__ value_cache_i8, const float* __restrict__ key_scale,
+    const float* __restrict__ value_scale, int32_t kv_dim, int32_t kv_head_num,
     int32_t head_num, int32_t head_size, int32_t num_splits, int32_t head_groups) {
   constexpr int kVec = 4;    // head dims per lane
   constexpr int kGroup = 4;  // positions per online-softmax step
@@ -616,6 +791,19 @@ __global__ void paged_attn_split_kernel_bf16(
   const int32_t* table_row = block_table + static_cast<int64_t>(b) * table_stride;
   const int64_t layer_base = static_cast<int64_t>(layer_idx) * num_blocks * block_size * kv_dim;
   const int64_t kv_head_off = static_cast<int64_t>(kv_head) * head_size;
+  // Quantized pools: (key_cache_i8, key_scale) are non-null together and the
+  // bf16 pointer is null, and likewise for V (the KVManager fixes the dtype
+  // for the whole process, so this never changes after warm-up). Selected by a
+  // branch rather than a template parameter on purpose: the KV-quant A/B has
+  // to run both arms through the same compiled code, and doubling the (G,
+  // CHUNKS) instantiation grid costs more in compile time and I-cache than a
+  // warp-uniform test. The scale itself is folded into multiplies the kernel
+  // already performs (see below), so the quantized arm adds no load-path work
+  // beyond what the 4-byte rows save.
+  const bool kq = key_scale != nullptr;
+  const bool vq = value_scale != nullptr;
+  const int64_t layer_scale_base =
+      static_cast<int64_t>(layer_idx) * num_blocks * block_size * kv_head_num;
   int64_t row[kGroup];
   int gpos = begin;
   for (; gpos + kGroup <= end; gpos += kGroup) {
@@ -625,7 +813,33 @@ __global__ void paged_attn_split_kernel_bf16(
                          kv_head_off + static_cast<int64_t>(off) * kv_dim + d0;
 #pragma unroll
     for (int j = 0; j < kGroup; ++j) row[j] = row0 + static_cast<int64_t>(j) * kv_dim;
-    // One K and one V load per (position, lane) for the whole head group.
+    // The 4 per-position dequantization scales of this group. The pos index is
+    // the innermost scale-pool dimension and gpos is group-aligned, so the four
+    // are one contiguous 16-byte-aligned float4.
+    float ks[kGroup];
+    float vs[kGroup];
+    if (kq || vq) {
+      const int64_t srow = layer_scale_base +
+                           (static_cast<int64_t>(pg) * kv_head_num + kv_head) * block_size + off;
+      if (kq) {
+        const float4 t = *reinterpret_cast<const float4*>(key_scale + srow);
+        ks[0] = t.x;
+        ks[1] = t.y;
+        ks[2] = t.z;
+        ks[3] = t.w;
+      }
+      if (vq) {
+        const float4 t = *reinterpret_cast<const float4*>(value_scale + srow);
+        vs[0] = t.x;
+        vs[1] = t.y;
+        vs[2] = t.z;
+        vs[3] = t.w;
+      }
+    }
+    // One K and one V load per (position, lane) for the whole head group: 4
+    // bf16 (8 bytes) or 4 int8 (4 bytes) per chunk. The int8 arm still expands
+    // to fp32 lanes here — the dequantization itself is folded into the
+    // multiplies below, not paid per lane.
     float v_reg[kGroup][CHUNKS * kVec];
     float kf[kGroup][CHUNKS * kVec];
 #pragma unroll
@@ -639,18 +853,34 @@ __global__ void paged_attn_split_kernel_bf16(
           }
           continue;
         }
-        const uint2 kraw = *reinterpret_cast<const uint2*>(key_cache + row[j] + c * 128);
-        const __nv_bfloat162* kh = reinterpret_cast<const __nv_bfloat162*>(&kraw);
-        kf[j][c * kVec + 0] = __bfloat162float(kh[0].x);
-        kf[j][c * kVec + 1] = __bfloat162float(kh[0].y);
-        kf[j][c * kVec + 2] = __bfloat162float(kh[1].x);
-        kf[j][c * kVec + 3] = __bfloat162float(kh[1].y);
-        const uint2 vraw = *reinterpret_cast<const uint2*>(value_cache + row[j] + c * 128);
-        const __nv_bfloat162* vh = reinterpret_cast<const __nv_bfloat162*>(&vraw);
-        v_reg[j][c * kVec + 0] = __bfloat162float(vh[0].x);
-        v_reg[j][c * kVec + 1] = __bfloat162float(vh[0].y);
-        v_reg[j][c * kVec + 2] = __bfloat162float(vh[1].x);
-        v_reg[j][c * kVec + 3] = __bfloat162float(vh[1].y);
+        if (kq) {
+          const uint32_t kraw = *reinterpret_cast<const uint32_t*>(key_cache_i8 + row[j] + c * 128);
+          kf[j][c * kVec + 0] = static_cast<float>(static_cast<int8_t>(kraw & 0xffu));
+          kf[j][c * kVec + 1] = static_cast<float>(static_cast<int8_t>((kraw >> 8) & 0xffu));
+          kf[j][c * kVec + 2] = static_cast<float>(static_cast<int8_t>((kraw >> 16) & 0xffu));
+          kf[j][c * kVec + 3] = static_cast<float>(static_cast<int8_t>((kraw >> 24) & 0xffu));
+        } else {
+          const uint2 kraw = *reinterpret_cast<const uint2*>(key_cache + row[j] + c * 128);
+          const __nv_bfloat162* kh = reinterpret_cast<const __nv_bfloat162*>(&kraw);
+          kf[j][c * kVec + 0] = __bfloat162float(kh[0].x);
+          kf[j][c * kVec + 1] = __bfloat162float(kh[0].y);
+          kf[j][c * kVec + 2] = __bfloat162float(kh[1].x);
+          kf[j][c * kVec + 3] = __bfloat162float(kh[1].y);
+        }
+        if (vq) {
+          const uint32_t vraw = *reinterpret_cast<const uint32_t*>(value_cache_i8 + row[j] + c * 128);
+          v_reg[j][c * kVec + 0] = static_cast<float>(static_cast<int8_t>(vraw & 0xffu));
+          v_reg[j][c * kVec + 1] = static_cast<float>(static_cast<int8_t>((vraw >> 8) & 0xffu));
+          v_reg[j][c * kVec + 2] = static_cast<float>(static_cast<int8_t>((vraw >> 16) & 0xffu));
+          v_reg[j][c * kVec + 3] = static_cast<float>(static_cast<int8_t>((vraw >> 24) & 0xffu));
+        } else {
+          const uint2 vraw = *reinterpret_cast<const uint2*>(value_cache + row[j] + c * 128);
+          const __nv_bfloat162* vh = reinterpret_cast<const __nv_bfloat162*>(&vraw);
+          v_reg[j][c * kVec + 0] = __bfloat162float(vh[0].x);
+          v_reg[j][c * kVec + 1] = __bfloat162float(vh[0].y);
+          v_reg[j][c * kVec + 2] = __bfloat162float(vh[1].x);
+          v_reg[j][c * kVec + 3] = __bfloat162float(vh[1].y);
+        }
       }
     }
 #pragma unroll
@@ -674,22 +904,43 @@ __global__ void paged_attn_split_kernel_bf16(
 #pragma unroll
         for (int off = 16; off; off >>= 1) s[j] += __shfl_xor_sync(0xffffffffu, s[j], off);
       }
+      // Dequantize K by scaling the score: the stored key is q * s_k, so
+      // <q_int8, q_int8 * s_k> = s_k * <q_int8, q_int8> with s_k > 0, and the
+      // softmax has to see the scaled score — the running max below is an
+      // anchor for exp(), so it must be taken over the same values exp() gets.
+      // One multiply per (head, position); skipped (not multiplied by 1.0)
+      // when the pool is bf16 so the baseline's arithmetic stays byte-for-byte
+      // what it was before quantization existed.
+      if (kq) {
+#pragma unroll
+        for (int j = 0; j < kGroup; ++j) s[j] *= ks[j];
+      }
       float m_new = m_i[i];
 #pragma unroll
       for (int j = 0; j < kGroup; ++j) m_new = fmaxf(m_new, s[j]);
       const float alpha = __expf(m_i[i] - m_new);
       float l_new = l_i[i] * alpha;
       float p[kGroup];
+      float pv[kGroup];
 #pragma unroll
       for (int j = 0; j < kGroup; ++j) {
         p[j] = __expf(s[j] - m_new);
         l_new += p[j];
+        pv[j] = p[j];
+      }
+      // V dequantization: only the numerator carries the scale. l is the
+      // softmax denominator and must stay the sum of the RAW weights — out is
+      // sum(p_j * q_v_j) * s_v / sum(p_j), so folding s_v into l would cancel
+      // it out of the numerator and divide the result by the scale.
+      if (vq) {
+#pragma unroll
+        for (int j = 0; j < kGroup; ++j) pv[j] *= vs[j];
       }
 #pragma unroll
       for (int c = 0; c < CHUNKS * kVec; ++c) {
         float a = acc[i][c] * alpha;
 #pragma unroll
-        for (int j = 0; j < kGroup; ++j) a += p[j] * v_reg[j][c];
+        for (int j = 0; j < kGroup; ++j) a += pv[j] * v_reg[j][c];
         acc[i][c] = a;
       }
       m_i[i] = m_new;
@@ -698,8 +949,18 @@ __global__ void paged_attn_split_kernel_bf16(
   }
   for (; gpos < end; ++gpos) {
     const int32_t pg = __ldg(table_row + (gpos >> block_shift));
+    const int32_t poff = gpos & (block_size - 1);
     const int64_t row = layer_base + static_cast<int64_t>(pg) * (block_size * kv_dim) +
-                        kv_head_off + static_cast<int64_t>(gpos & (block_size - 1)) * kv_dim + d0;
+                        kv_head_off + static_cast<int64_t>(poff) * kv_dim + d0;
+    // One position, so one scale per pool here (no group to vectorize over).
+    float ks1 = 0.f;
+    float vs1 = 0.f;
+    if (kq || vq) {
+      const int64_t srow = layer_scale_base +
+                           (static_cast<int64_t>(pg) * kv_head_num + kv_head) * block_size + poff;
+      if (kq) ks1 = __ldg(key_scale + srow);
+      if (vq) vs1 = __ldg(value_scale + srow);
+    }
     float v_reg[CHUNKS * kVec];
     float kf[CHUNKS * kVec];
 #pragma unroll
@@ -711,18 +972,34 @@ __global__ void paged_attn_split_kernel_bf16(
         }
         continue;
       }
-      const uint2 kraw = *reinterpret_cast<const uint2*>(key_cache + row + c * 128);
-      const __nv_bfloat162* kh = reinterpret_cast<const __nv_bfloat162*>(&kraw);
-      kf[c * kVec + 0] = __bfloat162float(kh[0].x);
-      kf[c * kVec + 1] = __bfloat162float(kh[0].y);
-      kf[c * kVec + 2] = __bfloat162float(kh[1].x);
-      kf[c * kVec + 3] = __bfloat162float(kh[1].y);
-      const uint2 vraw = *reinterpret_cast<const uint2*>(value_cache + row + c * 128);
-      const __nv_bfloat162* vh = reinterpret_cast<const __nv_bfloat162*>(&vraw);
-      v_reg[c * kVec + 0] = __bfloat162float(vh[0].x);
-      v_reg[c * kVec + 1] = __bfloat162float(vh[0].y);
-      v_reg[c * kVec + 2] = __bfloat162float(vh[1].x);
-      v_reg[c * kVec + 3] = __bfloat162float(vh[1].y);
+      if (kq) {
+        const uint32_t kraw = *reinterpret_cast<const uint32_t*>(key_cache_i8 + row + c * 128);
+        kf[c * kVec + 0] = static_cast<float>(static_cast<int8_t>(kraw & 0xffu));
+        kf[c * kVec + 1] = static_cast<float>(static_cast<int8_t>((kraw >> 8) & 0xffu));
+        kf[c * kVec + 2] = static_cast<float>(static_cast<int8_t>((kraw >> 16) & 0xffu));
+        kf[c * kVec + 3] = static_cast<float>(static_cast<int8_t>((kraw >> 24) & 0xffu));
+      } else {
+        const uint2 kraw = *reinterpret_cast<const uint2*>(key_cache + row + c * 128);
+        const __nv_bfloat162* kh = reinterpret_cast<const __nv_bfloat162*>(&kraw);
+        kf[c * kVec + 0] = __bfloat162float(kh[0].x);
+        kf[c * kVec + 1] = __bfloat162float(kh[0].y);
+        kf[c * kVec + 2] = __bfloat162float(kh[1].x);
+        kf[c * kVec + 3] = __bfloat162float(kh[1].y);
+      }
+      if (vq) {
+        const uint32_t vraw = *reinterpret_cast<const uint32_t*>(value_cache_i8 + row + c * 128);
+        v_reg[c * kVec + 0] = static_cast<float>(static_cast<int8_t>(vraw & 0xffu));
+        v_reg[c * kVec + 1] = static_cast<float>(static_cast<int8_t>((vraw >> 8) & 0xffu));
+        v_reg[c * kVec + 2] = static_cast<float>(static_cast<int8_t>((vraw >> 16) & 0xffu));
+        v_reg[c * kVec + 3] = static_cast<float>(static_cast<int8_t>((vraw >> 24) & 0xffu));
+      } else {
+        const uint2 vraw = *reinterpret_cast<const uint2*>(value_cache + row + c * 128);
+        const __nv_bfloat162* vh = reinterpret_cast<const __nv_bfloat162*>(&vraw);
+        v_reg[c * kVec + 0] = __bfloat162float(vh[0].x);
+        v_reg[c * kVec + 1] = __bfloat162float(vh[0].y);
+        v_reg[c * kVec + 2] = __bfloat162float(vh[1].x);
+        v_reg[c * kVec + 3] = __bfloat162float(vh[1].y);
+      }
     }
 #pragma unroll
     for (int i = 0; i < G; ++i) {
@@ -736,12 +1013,15 @@ __global__ void paged_attn_split_kernel_bf16(
       }
 #pragma unroll
       for (int off = 16; off; off >>= 1) s += __shfl_xor_sync(0xffffffffu, s, off);
+      if (kq) s *= ks1;  // dequantize before the max sees it (see the group loop)
       const float m_new = fmaxf(m_i[i], s);
       const float alpha = __expf(m_i[i] - m_new);
       const float pr = __expf(s - m_new);
+      // l stays the sum of raw weights, only the numerator is dequantized.
       l_i[i] = l_i[i] * alpha + pr;
+      const float pv = vq ? pr * vs1 : pr;
 #pragma unroll
-      for (int c = 0; c < CHUNKS * kVec; ++c) acc[i][c] = acc[i][c] * alpha + pr * v_reg[c];
+      for (int c = 0; c < CHUNKS * kVec; ++c) acc[i][c] = acc[i][c] * alpha + pv * v_reg[c];
       m_i[i] = m_new;
     }
   }
@@ -835,14 +1115,16 @@ static void launch_paged_attn_split(int32_t heads_per_warp, int32_t chunks, unsi
                                     int32_t num_blocks, int32_t block_size, int32_t block_shift,
                                     int32_t layer_idx, int32_t dim, const __nv_bfloat16* query,
                                     float* partials, const __nv_bfloat16* key_cache,
-                                    const __nv_bfloat16* value_cache, int32_t kv_dim,
-                                    int32_t kv_head_num, int32_t head_num, int32_t head_size,
-                                    int32_t num_splits, int32_t head_groups, cudaStream_t stream) {
-#define LAUNCH_PAGED_SPLIT(G, C)                                                              \
-  paged_attn_split_kernel_bf16<G, C><<<grid, 256, 0, stream>>>(                               \
-      positions, batch, block_table, table_stride, num_blocks, block_size, block_shift,       \
-      layer_idx, dim, query, partials, key_cache, value_cache, kv_dim, kv_head_num, head_num, \
-      head_size, num_splits, head_groups)
+                                    const __nv_bfloat16* value_cache, const int8_t* key_cache_i8,
+                                    const int8_t* value_cache_i8, const float* key_scale,
+                                    const float* value_scale, int32_t kv_dim, int32_t kv_head_num,
+                                    int32_t head_num, int32_t head_size, int32_t num_splits,
+                                    int32_t head_groups, cudaStream_t stream) {
+#define LAUNCH_PAGED_SPLIT(G, C)                                                             \
+  paged_attn_split_kernel_bf16<G, C><<<grid, 256, 0, stream>>>(                              \
+      positions, batch, block_table, table_stride, num_blocks, block_size, block_shift,      \
+      layer_idx, dim, query, partials, key_cache, value_cache, key_cache_i8, value_cache_i8, \
+      key_scale, value_scale, kv_dim, kv_head_num, head_num, head_size, num_splits, head_groups)
   if (chunks == 1) {
     switch (heads_per_warp) {
       case 1: LAUNCH_PAGED_SPLIT(1, 1); break;
@@ -866,7 +1148,10 @@ void paged_attention_cu_batch(int32_t head_num, int32_t layer_idx, int32_t num_b
                               const tensor::Tensor& block_table, const tensor::Tensor& query_batch,
                               tensor::Tensor& score_batch, const tensor::Tensor& mha_out,
                               const tensor::Tensor& key_cache, const tensor::Tensor& value_cache,
+                              const tensor::Tensor& key_scale, const tensor::Tensor& value_scale,
                               CudaConfig* config) {
+  check_kv_pool_dtype(key_cache, key_scale, "paged_attention_cu_batch: key_cache");
+  check_kv_pool_dtype(value_cache, value_scale, "paged_attention_cu_batch: value_cache");
   const int32_t batch = query_batch.get_dim(0);
   const int32_t dim = query_batch.get_dim(1);
   const int32_t table_stride = block_table.get_dim(1);
@@ -924,11 +1209,24 @@ void paged_attention_cu_batch(int32_t head_num, int32_t layer_idx, int32_t num_b
   __nv_bfloat16* output = const_cast<__nv_bfloat16*>(mha_out.ptr<__nv_bfloat16>());
   cudaStream_t stream = config->stream;
 
+  // Exactly one of the two cache views is meaningful: the int8 one is built
+  // from a different element type and cannot be aliased from the bf16 one, so
+  // the unused pair is passed as nullptr and the kernel selects on it. The
+  // checks above already tie the dtype to the presence of the scale pool.
+  const bool kq = key_cache.data_type() == base::DataType::kDataTypeInt8;
+  const bool vq = value_cache.data_type() == base::DataType::kDataTypeInt8;
+  const __nv_bfloat16* kcache = kq ? nullptr : key_cache.ptr<__nv_bfloat16>();
+  const __nv_bfloat16* vcache = vq ? nullptr : value_cache.ptr<__nv_bfloat16>();
+  const int8_t* kcache_i8 = kq ? key_cache.ptr<int8_t>() : nullptr;
+  const int8_t* vcache_i8 = vq ? value_cache.ptr<int8_t>() : nullptr;
+  const float* kscale = kq ? key_scale.ptr<float>() : nullptr;
+  const float* vscale = vq ? value_scale.ptr<float>() : nullptr;
+
   launch_paged_attn_split(heads_per_warp, chunks, grid, positions.ptr<int32_t>(), batch,
                           block_table.ptr<int32_t>(), table_stride, num_blocks, block_size,
-                          block_shift, layer_idx, dim, query, partials,
-                          key_cache.ptr<__nv_bfloat16>(), value_cache.ptr<__nv_bfloat16>(), kv_dim,
-                          kv_head_num, head_num, head_size, num_splits, head_groups, stream);
+                          block_shift, layer_idx, dim, query, partials, kcache, vcache, kcache_i8,
+                          vcache_i8, kscale, vscale, kv_dim, kv_head_num, head_num, head_size,
+                          num_splits, head_groups, stream);
   CUDA_KERNEL_CHECK();
 
   // Combine pass: one block per (row, head) pair, one output dim per thread.
@@ -972,21 +1270,40 @@ __global__ void paged_prefill_kernel_bf16(
     int32_t block_size, int32_t block_shift, int32_t layer_idx, int32_t dim,
     const __nv_bfloat16* __restrict__ query, __nv_bfloat16* __restrict__ output,
     const __nv_bfloat16* __restrict__ key_cache, const __nv_bfloat16* __restrict__ value_cache,
-    int32_t kv_dim, int32_t kv_head_num, int32_t head_num, int32_t head_size) {
+    const int8_t* __restrict__ key_cache_i8, const int8_t* __restrict__ value_cache_i8,
+    const float* __restrict__ key_scale, const float* __restrict__ value_scale, int32_t kv_dim,
+    int32_t kv_head_num, int32_t head_num, int32_t head_size) {
   constexpr int kVec = 4;       // head dims per lane (one uint2 load per row)
   constexpr int kGroup = 4;     // positions sharing one softmax rescale (as in decode)
   constexpr int kTileKv = 64;   // KV rows staged per tile
   constexpr int kLoadVec = 8;   // bf16 per loader vector (16B, one uint4)
   constexpr int kChunks = 128 / kLoadVec;  // loader vectors per row (head_size == 128)
+  constexpr int kInt8Vec = 4;   // int8 per loader vector (4B, one uint32)
+  constexpr int kInt8Chunks = 128 / kInt8Vec;  // ... same row, int8 arm
   constexpr int kPad = 136;     // 136 * 2B = 272B: rows stay 16B aligned
   __shared__ __align__(16) __nv_bfloat16 s_k[kTileKv][kPad];
   __shared__ __align__(16) __nv_bfloat16 s_v[kTileKv][kPad];
+  // Per-position dequantization scales of the staged tile (int8 pools only;
+  // one float per staged row, since the CTA covers one kv head).
+  __shared__ float s_ks[kTileKv];
+  __shared__ float s_vs[kTileKv];
   __shared__ int s_max_pos;
 
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
   const int lane = tid & 31;
   const int nwarps = blockDim.x >> 5;
+  // The int8 arm stages the raw quantized rows in the same storage — they need
+  // half of it — and dequantizes in the compute loop. Dequantizing on the way
+  // in (int8 -> bf16 in smem) would round every K/V value to an 8-bit mantissa,
+  // which is the same order of error as the quantization itself, and it would
+  // put the prefill and the decode arm of the same row on different arithmetic.
+  // A 136-byte int8 row keeps the same 4-byte-aligned lane reads the bf16 row's
+  // uint2 reads use (lane * 4 bytes).
+  const bool kq = key_scale != nullptr;
+  const bool vq = value_scale != nullptr;
+  int8_t (*s_k8)[kPad] = reinterpret_cast<int8_t (*)[kPad]>(&s_k[0][0]);
+  int8_t (*s_v8)[kPad] = reinterpret_cast<int8_t (*)[kPad]>(&s_v[0][0]);
 
   const int seq = blockIdx.y;
   const int kv_head = blockIdx.z;
@@ -1051,29 +1368,81 @@ __global__ void paged_prefill_kernel_bf16(
   // the first row's copy.
   const int32_t* table_row = block_table + static_cast<int64_t>(row_start) * table_stride;
   const int64_t layer_base = static_cast<int64_t>(layer_idx) * num_blocks * block_size * kv_dim;
+  const int64_t layer_scale_base =
+      static_cast<int64_t>(layer_idx) * num_blocks * block_size * kv_head_num;
   const int kv_head_off = (head_begin * kv_head_num / head_num) * head_size;
-
+  // Loader geometry per arm: the int8 arm moves 4 elements per access (a
+  // uint32 of 4 int8, one byte each) where the bf16 arm moves 8 (a uint4 of 8
+  // bf16), so the int8 arm takes twice as many chunks per row. Both divide the
+  // 256-thread CTA, so chunk = tid % chunks addresses like an AoS store and
+  // row_off walks the tile in CTA-wide strides either way. ch is a ROW OFFSET
+  // IN ELEMENTS of the row — 8 bf16 or 4 int8 — and it is used as one:
+  // `s_k[r][ch]` and `key_cache + src`.
+  //
+  // K and V get one walk each, from their OWN dtype. The masks can differ
+  // (kv_quant 1|2), and a shared chunk count derived from kq would size the V
+  // store with the K arm's stride: with K int8 and V bf16 that puts a 16-byte
+  // uint4 at an 8-byte-aligned offset (ch = chunk*4 *bf16 elements*) — a
+  // misaligned-address fault — and with V int8 and K bf16 it leaves half of
+  // every V byte covered. Both arms write the full 128-dim row either way; a
+  // uint4 store needs its row base (272B, 16B-aligned) plus a 16B multiple.
   for (int t = 0; t < tiles; ++t) {
     // tile_pos is the sequence position of this tile's first KV row; the tile
     // covers positions [tile_pos, tile_pos + kTileKv) of the sequence.
     const int tile_pos = t * kTileKv;
     const int tile_n = min(kTileKv, s_max_pos - tile_pos);
-    // Cooperative load: thread -> (row, 16B chunk of the 128-dim head slice).
-    // kChunks divides the CTA size, so chunk = tid % kChunks addresses like an
-    // AoS store and row_off walks the tile in CTA-wide strides.
-    const int chunk = tid % kChunks;
-    const int row_off = tid / kChunks;
-    const int ch = chunk * kLoadVec;
-    for (int r = row_off; r < tile_n; r += blockDim.x / kChunks) {
-      const int gpos = tile_pos + r;
-      const int32_t pg = __ldg(table_row + (gpos >> block_shift));
-      const int64_t src = layer_base + static_cast<int64_t>(pg) * (block_size * kv_dim) +
-                          static_cast<int64_t>(gpos & (block_size - 1)) * kv_dim + kv_head_off +
-                          ch;
-      *reinterpret_cast<uint4*>(&s_k[r][ch]) =
-          *reinterpret_cast<const uint4*>(key_cache + src);
-      *reinterpret_cast<uint4*>(&s_v[r][ch]) =
-          *reinterpret_cast<const uint4*>(value_cache + src);
+    // One thread per row stages that row's scales: the scale is per
+    // (position, kv head) and the CTA holds exactly one kv head, so the whole
+    // tile needs one float per row. Its own loop rather than a corner of the
+    // load walk, whose thread-to-row mapping now depends on the tensor.
+    if (kq || vq) {
+      for (int r = tid; r < tile_n; r += blockDim.x) {
+        const int gpos = tile_pos + r;
+        const int32_t pg = __ldg(table_row + (gpos >> block_shift));
+        const int64_t srow = layer_scale_base +
+                             (static_cast<int64_t>(pg) * kv_head_num + kv_head) * block_size +
+                             (gpos & (block_size - 1));
+        if (kq) s_ks[r] = __ldg(key_scale + srow);
+        if (vq) s_vs[r] = __ldg(value_scale + srow);
+      }
+    }
+    const int chunks_k = kq ? kInt8Chunks : kChunks;
+    const int chunks_v = vq ? kInt8Chunks : kChunks;
+    {
+      const int chunk = tid % chunks_k;
+      const int ch = chunk * (kq ? kInt8Vec : kLoadVec);
+      for (int r = tid / chunks_k; r < tile_n; r += blockDim.x / chunks_k) {
+        const int gpos = tile_pos + r;
+        const int32_t pg = __ldg(table_row + (gpos >> block_shift));
+        const int64_t src = layer_base + static_cast<int64_t>(pg) * (block_size * kv_dim) +
+                            static_cast<int64_t>(gpos & (block_size - 1)) * kv_dim + kv_head_off +
+                            ch;
+        if (kq) {
+          *reinterpret_cast<uint32_t*>(&s_k8[r][ch]) =
+              *reinterpret_cast<const uint32_t*>(key_cache_i8 + src);
+        } else {
+          *reinterpret_cast<uint4*>(&s_k[r][ch]) =
+              *reinterpret_cast<const uint4*>(key_cache + src);
+        }
+      }
+    }
+    {
+      const int chunk = tid % chunks_v;
+      const int ch = chunk * (vq ? kInt8Vec : kLoadVec);
+      for (int r = tid / chunks_v; r < tile_n; r += blockDim.x / chunks_v) {
+        const int gpos = tile_pos + r;
+        const int32_t pg = __ldg(table_row + (gpos >> block_shift));
+        const int64_t src = layer_base + static_cast<int64_t>(pg) * (block_size * kv_dim) +
+                            static_cast<int64_t>(gpos & (block_size - 1)) * kv_dim + kv_head_off +
+                            ch;
+        if (vq) {
+          *reinterpret_cast<uint32_t*>(&s_v8[r][ch]) =
+              *reinterpret_cast<const uint32_t*>(value_cache_i8 + src);
+        } else {
+          *reinterpret_cast<uint4*>(&s_v[r][ch]) =
+              *reinterpret_cast<const uint4*>(value_cache + src);
+        }
+      }
     }
     __syncthreads();
 
@@ -1085,23 +1454,44 @@ __global__ void paged_prefill_kernel_bf16(
       for (; p + kGroup <= p_end; p += kGroup) {
         float kf[kGroup][kVec];
         float vf[kGroup][kVec];
+        // Per-position dequantization scales, staged with the tile.
+        float ks[kGroup];
+        float vs[kGroup];
         const int sp = p - tile_pos;
 #pragma unroll
         for (int j = 0; j < kGroup; ++j) {
           // The K/V slice of a kv head is shared by all G q heads, so it is
           // read once per (position, lane) and reused across the head loop.
-          const uint2 kraw = *reinterpret_cast<const uint2*>(&s_k[sp + j][lane * kVec]);
-          const uint2 vraw = *reinterpret_cast<const uint2*>(&s_v[sp + j][lane * kVec]);
-          const __nv_bfloat162* kh = reinterpret_cast<const __nv_bfloat162*>(&kraw);
-          const __nv_bfloat162* vh = reinterpret_cast<const __nv_bfloat162*>(&vraw);
-          kf[j][0] = __bfloat162float(kh[0].x);
-          kf[j][1] = __bfloat162float(kh[0].y);
-          kf[j][2] = __bfloat162float(kh[1].x);
-          kf[j][3] = __bfloat162float(kh[1].y);
-          vf[j][0] = __bfloat162float(vh[0].x);
-          vf[j][1] = __bfloat162float(vh[0].y);
-          vf[j][2] = __bfloat162float(vh[1].x);
-          vf[j][3] = __bfloat162float(vh[1].y);
+          if (kq) {
+            const uint32_t kraw = *reinterpret_cast<const uint32_t*>(&s_k8[sp + j][lane * kVec]);
+            kf[j][0] = static_cast<float>(static_cast<int8_t>(kraw & 0xffu));
+            kf[j][1] = static_cast<float>(static_cast<int8_t>((kraw >> 8) & 0xffu));
+            kf[j][2] = static_cast<float>(static_cast<int8_t>((kraw >> 16) & 0xffu));
+            kf[j][3] = static_cast<float>(static_cast<int8_t>((kraw >> 24) & 0xffu));
+          } else {
+            const uint2 kraw = *reinterpret_cast<const uint2*>(&s_k[sp + j][lane * kVec]);
+            const __nv_bfloat162* kh = reinterpret_cast<const __nv_bfloat162*>(&kraw);
+            kf[j][0] = __bfloat162float(kh[0].x);
+            kf[j][1] = __bfloat162float(kh[0].y);
+            kf[j][2] = __bfloat162float(kh[1].x);
+            kf[j][3] = __bfloat162float(kh[1].y);
+          }
+          if (vq) {
+            const uint32_t vraw = *reinterpret_cast<const uint32_t*>(&s_v8[sp + j][lane * kVec]);
+            vf[j][0] = static_cast<float>(static_cast<int8_t>(vraw & 0xffu));
+            vf[j][1] = static_cast<float>(static_cast<int8_t>((vraw >> 8) & 0xffu));
+            vf[j][2] = static_cast<float>(static_cast<int8_t>((vraw >> 16) & 0xffu));
+            vf[j][3] = static_cast<float>(static_cast<int8_t>((vraw >> 24) & 0xffu));
+          } else {
+            const uint2 vraw = *reinterpret_cast<const uint2*>(&s_v[sp + j][lane * kVec]);
+            const __nv_bfloat162* vh = reinterpret_cast<const __nv_bfloat162*>(&vraw);
+            vf[j][0] = __bfloat162float(vh[0].x);
+            vf[j][1] = __bfloat162float(vh[0].y);
+            vf[j][2] = __bfloat162float(vh[1].x);
+            vf[j][3] = __bfloat162float(vh[1].y);
+          }
+          if (kq) ks[j] = s_ks[sp + j];
+          if (vq) vs[j] = s_vs[sp + j];
         }
 #pragma unroll
         for (int i = 0; i < G; ++i) {
@@ -1119,6 +1509,13 @@ __global__ void paged_prefill_kernel_bf16(
               s[j] += __shfl_xor_sync(0xffffffffu, s[j], off);
             }
           }
+          // K dequantization, before the max sees the scores (see
+          // paged_attn_split_kernel_bf16 for why it lands here and not on the
+          // loaded values).
+          if (kq) {
+#pragma unroll
+            for (int j = 0; j < kGroup; ++j) s[j] *= ks[j];
+          }
           float m_new = m_i[i];
 #pragma unroll
           for (int j = 0; j < kGroup; ++j) {
@@ -1127,17 +1524,25 @@ __global__ void paged_prefill_kernel_bf16(
           const float alpha = __expf(m_i[i] - m_new);
           float l_new = l_i[i] * alpha;
           float pr[kGroup];
+          float pv[kGroup];
 #pragma unroll
           for (int j = 0; j < kGroup; ++j) {
             pr[j] = __expf(s[j] - m_new);
             l_new += pr[j];
+            pv[j] = pr[j];
+          }
+          // Only the numerator carries the V scale; l must stay the sum of the
+          // raw weights (see the decode kernel).
+          if (vq) {
+#pragma unroll
+            for (int j = 0; j < kGroup; ++j) pv[j] *= vs[j];
           }
 #pragma unroll
           for (int c = 0; c < kVec; ++c) {
             float a = acc[i][c] * alpha;
 #pragma unroll
             for (int j = 0; j < kGroup; ++j) {
-              a += pr[j] * vf[j][c];
+              a += pv[j] * vf[j][c];
             }
             acc[i][c] = a;
           }
@@ -1149,18 +1554,37 @@ __global__ void paged_prefill_kernel_bf16(
       // decode kernel's).
       for (; p < p_end; ++p) {
         const int sp = p - tile_pos;
-        const uint2 kraw = *reinterpret_cast<const uint2*>(&s_k[sp][lane * kVec]);
-        const uint2 vraw = *reinterpret_cast<const uint2*>(&s_v[sp][lane * kVec]);
-        const __nv_bfloat162* kh = reinterpret_cast<const __nv_bfloat162*>(&kraw);
-        const __nv_bfloat162* vh = reinterpret_cast<const __nv_bfloat162*>(&vraw);
-        const float kf0 = __bfloat162float(kh[0].x);
-        const float kf1 = __bfloat162float(kh[0].y);
-        const float kf2 = __bfloat162float(kh[1].x);
-        const float kf3 = __bfloat162float(kh[1].y);
-        const float vf0 = __bfloat162float(vh[0].x);
-        const float vf1 = __bfloat162float(vh[0].y);
-        const float vf2 = __bfloat162float(vh[1].x);
-        const float vf3 = __bfloat162float(vh[1].y);
+        float kf0, kf1, kf2, kf3, vf0, vf1, vf2, vf3;
+        if (kq) {
+          const uint32_t kraw = *reinterpret_cast<const uint32_t*>(&s_k8[sp][lane * kVec]);
+          kf0 = static_cast<float>(static_cast<int8_t>(kraw & 0xffu));
+          kf1 = static_cast<float>(static_cast<int8_t>((kraw >> 8) & 0xffu));
+          kf2 = static_cast<float>(static_cast<int8_t>((kraw >> 16) & 0xffu));
+          kf3 = static_cast<float>(static_cast<int8_t>((kraw >> 24) & 0xffu));
+        } else {
+          const uint2 kraw = *reinterpret_cast<const uint2*>(&s_k[sp][lane * kVec]);
+          const __nv_bfloat162* kh = reinterpret_cast<const __nv_bfloat162*>(&kraw);
+          kf0 = __bfloat162float(kh[0].x);
+          kf1 = __bfloat162float(kh[0].y);
+          kf2 = __bfloat162float(kh[1].x);
+          kf3 = __bfloat162float(kh[1].y);
+        }
+        if (vq) {
+          const uint32_t vraw = *reinterpret_cast<const uint32_t*>(&s_v8[sp][lane * kVec]);
+          vf0 = static_cast<float>(static_cast<int8_t>(vraw & 0xffu));
+          vf1 = static_cast<float>(static_cast<int8_t>((vraw >> 8) & 0xffu));
+          vf2 = static_cast<float>(static_cast<int8_t>((vraw >> 16) & 0xffu));
+          vf3 = static_cast<float>(static_cast<int8_t>((vraw >> 24) & 0xffu));
+        } else {
+          const uint2 vraw = *reinterpret_cast<const uint2*>(&s_v[sp][lane * kVec]);
+          const __nv_bfloat162* vh = reinterpret_cast<const __nv_bfloat162*>(&vraw);
+          vf0 = __bfloat162float(vh[0].x);
+          vf1 = __bfloat162float(vh[0].y);
+          vf2 = __bfloat162float(vh[1].x);
+          vf3 = __bfloat162float(vh[1].y);
+        }
+        const float ks1 = kq ? s_ks[sp] : 0.f;
+        const float vs1 = vq ? s_vs[sp] : 0.f;
 #pragma unroll
         for (int i = 0; i < G; ++i) {
           if (i >= heads_here) break;
@@ -1169,14 +1593,16 @@ __global__ void paged_prefill_kernel_bf16(
           for (int off = 16; off; off >>= 1) {
             s += __shfl_xor_sync(0xffffffffu, s, off);
           }
+          if (kq) s *= ks1;
           const float m_new = fmaxf(m_i[i], s);
           const float alpha = __expf(m_i[i] - m_new);
           const float pr = __expf(s - m_new);
           l_i[i] = l_i[i] * alpha + pr;
-          acc[i][0] = acc[i][0] * alpha + pr * vf0;
-          acc[i][1] = acc[i][1] * alpha + pr * vf1;
-          acc[i][2] = acc[i][2] * alpha + pr * vf2;
-          acc[i][3] = acc[i][3] * alpha + pr * vf3;
+          const float pv = vq ? pr * vs1 : pr;
+          acc[i][0] = acc[i][0] * alpha + pv * vf0;
+          acc[i][1] = acc[i][1] * alpha + pv * vf1;
+          acc[i][2] = acc[i][2] * alpha + pv * vf2;
+          acc[i][3] = acc[i][3] * alpha + pv * vf3;
           m_i[i] = m_new;
         }
       }
@@ -1257,10 +1683,14 @@ void paged_prefill_attention_cu_batch(int32_t row_begin, int32_t head_num, int32
                                       const tensor::Tensor& query_batch,
                                       const tensor::Tensor& mha_out,
                                       const tensor::Tensor& key_cache,
-                                      const tensor::Tensor& value_cache, CudaConfig* config) {
+                                      const tensor::Tensor& value_cache,
+                                      const tensor::Tensor& key_scale,
+                                      const tensor::Tensor& value_scale, CudaConfig* config) {
   const int32_t batch = positions.get_dim(0);
   const int32_t rows = batch - row_begin;
   if (rows <= 0 || num_prefill_seqs <= 0 || seq_row_start == nullptr) return;
+  check_kv_pool_dtype(key_cache, key_scale, "paged_prefill_attention_cu_batch: key_cache");
+  check_kv_pool_dtype(value_cache, value_scale, "paged_prefill_attention_cu_batch: value_cache");
   CHECK(config != nullptr);
   const int32_t dim = query_batch.get_dim(1);
   const int32_t table_stride = block_table.get_dim(1);
@@ -1284,56 +1714,72 @@ void paged_prefill_attention_cu_batch(int32_t row_begin, int32_t head_num, int32
   const int32_t* table = block_table.ptr<int32_t>();
   const __nv_bfloat16* query = query_batch.ptr<__nv_bfloat16>();
   __nv_bfloat16* output = const_cast<__nv_bfloat16*>(mha_out.ptr<__nv_bfloat16>());
-  const __nv_bfloat16* kcache = key_cache.ptr<__nv_bfloat16>();
-  const __nv_bfloat16* vcache = value_cache.ptr<__nv_bfloat16>();
+  // Exactly one view per cache is meaningful; the unused one is nullptr and
+  // the kernel selects on it (see paged_attention_cu_batch).
+  const bool kq = key_cache.data_type() == base::DataType::kDataTypeInt8;
+  const bool vq = value_cache.data_type() == base::DataType::kDataTypeInt8;
+  const __nv_bfloat16* kcache = kq ? nullptr : key_cache.ptr<__nv_bfloat16>();
+  const __nv_bfloat16* vcache = vq ? nullptr : value_cache.ptr<__nv_bfloat16>();
+  const int8_t* kcache_i8 = kq ? key_cache.ptr<int8_t>() : nullptr;
+  const int8_t* vcache_i8 = vq ? value_cache.ptr<int8_t>() : nullptr;
+  const float* kscale = kq ? key_scale.ptr<float>() : nullptr;
+  const float* vscale = vq ? value_scale.ptr<float>() : nullptr;
   cudaStream_t stream = config->stream;
   switch (heads_per_kv) {
     case 1:
       paged_prefill_kernel_bf16<1><<<grid, block, 0, stream>>>(
           pos, row_map, table, table_stride, num_blocks, block_size, block_shift, layer_idx, dim,
-          query, output, kcache, vcache, kv_dim, kv_head_num, head_num, head_size);
+          query, output, kcache, vcache, kcache_i8, vcache_i8, kscale, vscale, kv_dim,
+          kv_head_num, head_num, head_size);
       CUDA_KERNEL_CHECK();
       break;
     case 2:
       paged_prefill_kernel_bf16<2><<<grid, block, 0, stream>>>(
           pos, row_map, table, table_stride, num_blocks, block_size, block_shift, layer_idx, dim,
-          query, output, kcache, vcache, kv_dim, kv_head_num, head_num, head_size);
+          query, output, kcache, vcache, kcache_i8, vcache_i8, kscale, vscale, kv_dim,
+          kv_head_num, head_num, head_size);
       CUDA_KERNEL_CHECK();
       break;
     case 3:
       paged_prefill_kernel_bf16<3><<<grid, block, 0, stream>>>(
           pos, row_map, table, table_stride, num_blocks, block_size, block_shift, layer_idx, dim,
-          query, output, kcache, vcache, kv_dim, kv_head_num, head_num, head_size);
+          query, output, kcache, vcache, kcache_i8, vcache_i8, kscale, vscale, kv_dim,
+          kv_head_num, head_num, head_size);
       CUDA_KERNEL_CHECK();
       break;
     case 4:
       paged_prefill_kernel_bf16<4><<<grid, block, 0, stream>>>(
           pos, row_map, table, table_stride, num_blocks, block_size, block_shift, layer_idx, dim,
-          query, output, kcache, vcache, kv_dim, kv_head_num, head_num, head_size);
+          query, output, kcache, vcache, kcache_i8, vcache_i8, kscale, vscale, kv_dim,
+          kv_head_num, head_num, head_size);
       CUDA_KERNEL_CHECK();
       break;
     case 5:
       paged_prefill_kernel_bf16<5><<<grid, block, 0, stream>>>(
           pos, row_map, table, table_stride, num_blocks, block_size, block_shift, layer_idx, dim,
-          query, output, kcache, vcache, kv_dim, kv_head_num, head_num, head_size);
+          query, output, kcache, vcache, kcache_i8, vcache_i8, kscale, vscale, kv_dim,
+          kv_head_num, head_num, head_size);
       CUDA_KERNEL_CHECK();
       break;
     case 6:
       paged_prefill_kernel_bf16<6><<<grid, block, 0, stream>>>(
           pos, row_map, table, table_stride, num_blocks, block_size, block_shift, layer_idx, dim,
-          query, output, kcache, vcache, kv_dim, kv_head_num, head_num, head_size);
+          query, output, kcache, vcache, kcache_i8, vcache_i8, kscale, vscale, kv_dim,
+          kv_head_num, head_num, head_size);
       CUDA_KERNEL_CHECK();
       break;
     case 7:
       paged_prefill_kernel_bf16<7><<<grid, block, 0, stream>>>(
           pos, row_map, table, table_stride, num_blocks, block_size, block_shift, layer_idx, dim,
-          query, output, kcache, vcache, kv_dim, kv_head_num, head_num, head_size);
+          query, output, kcache, vcache, kcache_i8, vcache_i8, kscale, vscale, kv_dim,
+          kv_head_num, head_num, head_size);
       CUDA_KERNEL_CHECK();
       break;
     default:
       paged_prefill_kernel_bf16<8><<<grid, block, 0, stream>>>(
           pos, row_map, table, table_stride, num_blocks, block_size, block_shift, layer_idx, dim,
-          query, output, kcache, vcache, kv_dim, kv_head_num, head_num, head_size);
+          query, output, kcache, vcache, kcache_i8, vcache_i8, kscale, vscale, kv_dim,
+          kv_head_num, head_num, head_size);
       CUDA_KERNEL_CHECK();
       break;
   }
@@ -1346,7 +1792,8 @@ void paged_attention_dispatch(int32_t head_num, int32_t layer_idx, int32_t num_b
                               const tensor::Tensor& positions, const tensor::Tensor& block_table,
                               const tensor::Tensor& query_batch, tensor::Tensor& score_batch,
                               const tensor::Tensor& mha_out, const tensor::Tensor& key_cache,
-                              const tensor::Tensor& value_cache, CudaConfig* config) {
+                              const tensor::Tensor& value_cache, const tensor::Tensor& key_scale,
+                              const tensor::Tensor& value_scale, CudaConfig* config) {
   const int32_t batch = query_batch.get_dim(0);
   CHECK(config != nullptr);
   const int32_t decode_rows = std::max(0, std::min(num_decode_rows, batch));
@@ -1364,7 +1811,7 @@ void paged_attention_dispatch(int32_t head_num, int32_t layer_idx, int32_t num_b
       !prefill_geometry_ok(head_num, kv_head_num, head_size, table_stride, block_size)) {
     paged_attention_cu_batch(head_num, layer_idx, num_blocks, block_size, kv_dim, kv_head_num,
                              head_size, positions, block_table, query_batch, score_batch, mha_out,
-                             key_cache, value_cache, config);
+                             key_cache, value_cache, key_scale, value_scale, config);
     return;
   }
   if (decode_rows > 0) {
@@ -1373,12 +1820,12 @@ void paged_attention_dispatch(int32_t head_num, int32_t layer_idx, int32_t num_b
                              row_range_view(block_table, 0, decode_rows, table_stride),
                              row_range_view(query_batch, 0, decode_rows, dim), score_batch,
                              row_range_view(mha_out, 0, decode_rows, dim), key_cache, value_cache,
-                             config);
+                             key_scale, value_scale, config);
   }
   paged_prefill_attention_cu_batch(decode_rows, head_num, layer_idx, num_blocks, block_size,
                                    kv_dim, kv_head_num, head_size, seq_row_start, num_prefill_seqs,
                                    positions, block_table, query_batch, mha_out, key_cache,
-                                   value_cache, config);
+                                   value_cache, key_scale, value_scale, config);
 }
 
 // ========== Fused-QKV de-interleave ========================================

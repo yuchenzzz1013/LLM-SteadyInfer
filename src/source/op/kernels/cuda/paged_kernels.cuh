@@ -32,11 +32,25 @@ inline bool paged_decode_geometry_ok(int32_t head_size, int32_t table_stride, in
 //   dst[layer][table[b][pos / block_size]][pos % block_size][d] = src[b][d]
 // One block per batch row; positions are per-token (prefill rows and decode
 // rows are both single-token rows after the scheduler flattens chunks).
-// Raw bf16 element copy.
+//
+// Two write paths, selected by dst_cache's dtype (see KVManager::kv_quant):
+//   bf16 pool  — raw element copy; dst_scale is unused and must be empty.
+//   int8 pool  — symmetric per-(token, kv head) quantization; dst_scale is the
+//                fp32 pool [num_layers, num_blocks, kv_head_num, block_size]
+//                that receives one scale per written row, at
+//                [layer][block][head][pos % block_size]. amax is taken over the
+//                head's dims, so the reduction spans lanes: one warp per
+//                (row, kv head), lane l owning head dims [l*4, l*4+4) — the
+//                same 4-contiguous-dims layout the attention kernels read back
+//                with. kv_head_num therefore has to be passed in (head_size is
+//                kv_dim / kv_head_num).
+// The quantizing path requires (head_size & 3) == 0 — guaranteed by
+// paged_decode_geometry_ok (head_size % 8 == 0) for every geometry the paged
+// decode path accepts.
 void paged_kv_scatter_cu(const tensor::Tensor& src, tensor::Tensor& dst_cache,
-                         const tensor::Tensor& block_table, const tensor::Tensor& positions,
-                         int32_t kv_dim, int32_t num_blocks, int32_t block_size,
-                         int32_t layer_idx, void* stream);
+                         const tensor::Tensor& dst_scale, const tensor::Tensor& block_table,
+                         const tensor::Tensor& positions, int32_t kv_dim, int32_t kv_head_num,
+                         int32_t num_blocks, int32_t block_size, int32_t layer_idx, void* stream);
 
 // Batched decode / chunked-prefill MHA over the paged cache (Flash Decoding):
 // one split-KV launch pair per layer for the whole batch. Identical grid /
@@ -54,12 +68,18 @@ void paged_kv_scatter_cu(const tensor::Tensor& src, tensor::Tensor& dst_cache,
 //                instead of silently computing garbage.
 //   mha_out      [batch, dim]
 //   key/value_cache [num_layers, num_blocks, block_size, kv_dim]
+//   key/value_scale [num_layers, num_blocks, kv_head_num, block_size] fp32, the
+//                per-(token, kv head) dequantization scales. Required (and
+//                non-empty) exactly when the corresponding cache is int8; an
+//                empty tensor means "bf16 pool", and a mismatch between the
+//                two is rejected up front rather than read as garbage.
 void paged_attention_cu_batch(int32_t head_num, int32_t layer_idx, int32_t num_blocks,
                               int32_t block_size, int32_t kv_dim, int32_t kv_head_num,
                               int32_t head_size, const tensor::Tensor& positions,
                               const tensor::Tensor& block_table, const tensor::Tensor& query_batch,
                               tensor::Tensor& score_batch, const tensor::Tensor& mha_out,
                               const tensor::Tensor& key_cache, const tensor::Tensor& value_cache,
+                              const tensor::Tensor& key_scale, const tensor::Tensor& value_scale,
                               CudaConfig* config);
 
 // ========== Mixed decode + prefill dispatch ==========
@@ -87,7 +107,8 @@ void paged_attention_dispatch(int32_t head_num, int32_t layer_idx, int32_t num_b
                               const tensor::Tensor& positions, const tensor::Tensor& block_table,
                               const tensor::Tensor& query_batch, tensor::Tensor& score_batch,
                               const tensor::Tensor& mha_out, const tensor::Tensor& key_cache,
-                              const tensor::Tensor& value_cache, CudaConfig* config);
+                              const tensor::Tensor& value_cache, const tensor::Tensor& key_scale,
+                              const tensor::Tensor& value_scale, CudaConfig* config);
 
 }  // namespace kernel
 #endif
