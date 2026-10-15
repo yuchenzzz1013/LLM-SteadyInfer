@@ -82,9 +82,15 @@ struct BatchScratch {
 
 // One entry of the decode CUDA-Graph pool (indexed by batch size).
 struct CudaGraphDecodeEntry {
+  // Capture attempts that failed. A single failure is not sticky: the direct
+  // fallback pass that follows a failed attempt warms whatever first-touch
+  // state broke the capture (e.g. the lazily-created cuBLAS handle), so one
+  // retry is worth making; only after kMaxCaptureAttempts does the entry fall
+  // back to the direct path permanently.
+  static constexpr int32_t kMaxCaptureAttempts = 2;
   int32_t batch = 0;
   cudaGraphExec_t exec = nullptr;  // instantiated graph; nullptr until captured
-  bool capture_failed = false;     // fall back to the direct path forever
+  int32_t capture_attempts = 0;
   int64_t last_used = 0;
   std::unique_ptr<BatchScratch> scratch;
   tensor::Tensor logits_view;  // [batch, vocab] view into the scheduler's logits buffer

@@ -262,19 +262,31 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
        entry->captured_table_stride != table_stride)) {
     cudaGraphExecDestroy(entry->exec);
     entry->exec = nullptr;
+    // A rebuilt Scheduler is a fresh context — give capture another chance
+    // (this also un-sticks an entry whose attempts were exhausted against the
+    // old buffers).
+    entry->capture_attempts = 0;
     // 让流上空闲后再重新捕获,提高 BeginCapture 成功率(发生在压测边界,
     // 同步开销可忽略)。
     cudaStreamSynchronize(stream);
   }
 
-  if (entry->exec == nullptr && !entry->capture_failed) {
+  if (entry->exec == nullptr && entry->capture_attempts < CudaGraphDecodeEntry::kMaxCaptureAttempts) {
     // 3. First call for this batch size: capture the decode kernels.
     // Timed into graph_stats_ (capture + instantiate only — the graph launch
     // at the end of this block is the step's real decode work, not overhead).
+    //
+    // The cuBLAS handle is created lazily on first use. When that first use
+    // lands inside the capture, cublasCreate itself runs during capture and
+    // fails with CUBLAS_STATUS_NOT_INITIALIZED (measured), which invalidates
+    // the whole recording — cudaStreamEndCapture returns 901 and the entry
+    // degrades to the direct path. Touch the handle here, outside the
+    // capture, so every GEMM the recording sees reuses it.
+    (void)cuda_config_->cublas_handle();
     const auto capture_start = std::chrono::steady_clock::now();
     cudaError_t cap_err = cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal);
     if (cap_err != cudaSuccess) {
-      entry->capture_failed = true;
+      entry->capture_attempts++;
       LOG(WARNING) << "[GRAPH] cudaStreamBeginCapture failed (" << cudaGetErrorString(cap_err)
                    << "); falling back to direct decode for batch=" << batch;
       return forward_batch(stage_ids, stage_pos, block_table, key_cache, value_cache,
@@ -288,7 +300,7 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
     cudaGraph_t graph = nullptr;
     cap_err = cudaStreamEndCapture(stream, &graph);
     if (cap_err != cudaSuccess || !status || graph == nullptr) {
-      entry->capture_failed = true;
+      entry->capture_attempts++;
       if (graph) {
         cudaGraphDestroy(graph);
       }
@@ -306,7 +318,7 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
     cap_err = cudaGraphInstantiate(&entry->exec, graph, 0);
     cudaGraphDestroy(graph);
     if (cap_err != cudaSuccess) {
-      entry->capture_failed = true;
+      entry->capture_attempts++;
       LOG(WARNING) << "[GRAPH] cudaGraphInstantiate failed (" << cudaGetErrorString(cap_err)
                    << "); falling back to direct decode for batch=" << batch;
       return forward_batch(stage_ids, stage_pos, block_table, key_cache, value_cache,
@@ -352,7 +364,7 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
     return base::error::Success();
   }
 
-  // capture_failed forever: direct batched forward with the stable scratch.
+  // Capture attempts exhausted: direct batched forward with the stable scratch.
   return forward_batch(stage_ids, stage_pos, block_table, key_cache, value_cache,
                        entry->logits_view, true, batch, nullptr, 0, entry->scratch.get(),
                        table_cols, key_scale, value_scale);
