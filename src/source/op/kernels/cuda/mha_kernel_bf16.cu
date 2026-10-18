@@ -768,13 +768,16 @@ __device__ __forceinline__ void stage_kv_row_chunk(__nv_bfloat16* tile_bf16, int
 //
 //   score = <q_i8, k_i8> * (q_scale * softmax_scale) * k_scale
 //
-// The integer part is exact (each lane's 4 products and the 5-step shfl_xor
-// reduction run in int32; |v| <= 127 bounds even the whole-warp sum at
-// 128 * 16129, far inside int32), and the dequantization is two multiplies per
-// (head, position) — the same multiply-per-position the fp32 arm already pays
-// for k_scale. q_scale stays per (token, head) and cannot be folded into the
-// per-(position) k_scale, so the softmax scale rides along with q_scale
-// instead of being pre-multiplied onto q's fp32 values.
+// The integer part is exact (each lane's 4 products and the whole-warp sum run
+// in int32; |v| <= 127 bounds even the whole-warp sum at 128 * 16129, far
+// inside int32), and the dequantization is two multiplies per (head, position)
+// — the same multiply-per-position the fp32 arm already pays for k_scale.
+// q_scale stays per (token, head) and cannot be folded into the per-(position)
+// k_scale, so the softmax scale rides along with q_scale instead of being
+// pre-multiplied onto q's fp32 values. The whole-warp sum is the hardware's
+// REDUX.SYNC.ADD (__reduce_add_sync, sm_80+, integer-only on this target) —
+// one instruction, not the ten of a butterfly, which is what the fp32 arm has
+// to run and the largest single cost the int8 inner loop had.
 //
 // Q is quantized IN the warp that consumes it, not by a separate pass: a warp
 // owns exactly the (row, head) pairs it needs, and its lanes already hold those
@@ -791,6 +794,9 @@ __device__ __forceinline__ void stage_kv_row_chunk(__nv_bfloat16* tile_bf16, int
 // dp4a code or the fp32 code, never both. An int8 K pool is always scored this
 // way (the launcher sends every kq to the QI8 instantiation); the fp32 arm
 // survives only for a V-only pool, where there is no int8 K to dp4a against.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+#error "the paged decode kernel's int8 scoring arm needs __reduce_add_sync (sm_80+)"
+#endif
 template <int G, int CHUNKS, bool QUANT, bool QI8>
 __global__ void paged_attn_split_kernel_bf16(
     const int32_t* __restrict__ positions, int32_t batch, const int32_t* __restrict__ block_table,
@@ -1041,18 +1047,27 @@ __global__ void paged_attn_split_kernel_bf16(
       float s[kGroup];
       if constexpr (QI8) {
         // One dp4a per (head, position) carries the lane's whole contribution
-        // (its 4 dims), then the same 5-step butterfly the fp32 arm runs — in
-        // int32, where it is exact. The scales land after the reduction: one
-        // product per (head, position) instead of a dequantized K value per
-        // lane. As in the fp32 arm, k_scale is applied before the max below,
-        // because the running max anchors exp() and must see the same values.
+        // (its 4 dims), then the cross-lane sum. The scales land after the
+        // reduction: one product per (head, position) instead of a dequantized
+        // K value per lane. As in the fp32 arm, k_scale is applied before the
+        // max below, because the running max anchors exp() and must see the
+        // same values.
+        //
+        // The sum is REDUX.SYNC.ADD (__reduce_add_sync), not the fp32 arm's
+        // 5-step butterfly: redux is integer-only before sm_90, and an int
+        // sum is order-independent, so this is the same number the butterfly
+        // would produce, in one instruction and one link of latency instead of
+        // ten. That matters because this reduction is the single largest block
+        // of the int8 arm's inner loop; the lane set is safe to name because it
+        // is the same 0xffffffff the butterfly names, and lanes past head_size
+        // contribute exact zeros on both operands (see the q8 pack above and
+        // kp below), so leaving them in the mask cannot change the sum.
 #pragma unroll
         for (int j = 0; j < kGroup; ++j) {
           int32_t dpa = 0;
 #pragma unroll
           for (int c = 0; c < CHUNKS; ++c) dpa = __dp4a(q8[i][c], kp[j][c], dpa);
-#pragma unroll
-          for (int off = 16; off; off >>= 1) dpa += __shfl_xor_sync(0xffffffffu, dpa, off);
+          dpa = __reduce_add_sync(0xffffffffu, dpa);
           s[j] = static_cast<float>(dpa) * q8_scale[i] * ks[j];
         }
       } else {
@@ -1161,8 +1176,7 @@ __global__ void paged_attn_split_kernel_bf16(
         int32_t dpa = 0;
 #pragma unroll
         for (int c = 0; c < CHUNKS; ++c) dpa = __dp4a(q8[i][c], kp[c], dpa);
-#pragma unroll
-        for (int off = 16; off; off >>= 1) dpa += __shfl_xor_sync(0xffffffffu, dpa, off);
+        dpa = __reduce_add_sync(0xffffffffu, dpa);  // see the group loop
         s = static_cast<float>(dpa) * q8_scale[i] * ks1;
       } else {
         s = q[i][0] * kf[0] + q[i][1] * kf[1] + q[i][2] * kf[2] + q[i][3] * kf[3];
