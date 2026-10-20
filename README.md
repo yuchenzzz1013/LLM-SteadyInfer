@@ -42,14 +42,20 @@ LLM-SteadyInfer 是一个基于 **C++ / CUDA C++** 实现的轻量级大语言�
   - 采用 Flash Decoding 风格 Split-KV 并行与 Online Softmax
   - 支持 Partial Attention Merge 优化长序列 Decode
 
-- **量化（KV Cache INT8）**
-  - K / V 可独立量化（掩码 `0=off / 1=K / 2=V / 3=K+V`）:对称 int8,FP32 scale、
-    粒度 per-(token, kv-head),随 KV 写入 scatter 进 scale 池
-  - 纯运行时开关（`LLAMA_KV_QUANT` / benchmark `--kv-quant` / Scheduler 构造参数）,
-    无需重新编译;仅支持 Paged CUDA 布局,不满足时直接报错拒绝,不会静默回退 BF16
-  - 实测（Qwen3-4B / ShareGPT / 32 并发 × 4096 上下文 / block size 16）:
-    KV 池 18.00 → 9.28 GB（1.94×）;四臂 PPL 的 |ΔPPL| ≤ 0.0074（0.05%）且不随
-    上下文累积,量化关闭时输出与 BF16 逐 bit 相同
+- **量化（KV Cache K int8 + V int4）**
+  - 只有一个量化形态：K 存 INT8（每值一字节）、V 存 INT4（每值半字节,每字节两个
+    4-bit 值,qmax=7,V 池行宽 kv_dim/2）;两半永远同时量化,所以这不是掩码而是一个
+    开关:`0=off / 1=K int8 + V int4`。FP32 scale、粒度 per-(token, kv head),
+    随 KV 写入 scatter 进 scale 池
+  - 实测（Qwen3-4B / ShareGPT / 32 并发 × 4096 上下文 / block size 16 / A100,
+    单遍 PPL 共 131040 token;PASS 为 4096 步 decode 的累计秒数;
+
+    | kv_quant | KV 池 | 压缩比 | PASS (s) | PPL | ΔPPL |
+    | --- | --- | --- | --- | --- | --- |
+    | 0（BF16） | 18.00 GB | 1.00× | 80.9 | 14.614163 | 基准 |
+    | 1（K int8 + V int4） | 7.03 GB | 2.56× | 77.6 | 14.633198 | +0.130% |
+
+
 
 - **Continuous Batching Scheduler**
   - 状态机驱动请求调度

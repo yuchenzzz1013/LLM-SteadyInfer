@@ -68,7 +68,7 @@ struct Args {
   // 也就是把 A100 的显存尽量变成 KV 池(每 token KV = layers x 2 x kv_dim x dtype)。
   int max_seq_len = 0;
   int max_batch = 1;              // 调度器槽位数;KV 池 = max_batch x max_seq_len
-  int kv_quant = -1;              // KV int8 掩码(0/1/2/3);-1 = 走 LLAMA_KV_QUANT
+  int kv_quant = -1;              // KV 量化(0 或 1,见 scheduler::KvQuant);-1 = 走 LLAMA_KV_QUANT
   double gpu_mem_fraction = 0.9;  // KV 池最多占空闲显存的比例(留 10% 给激活/临时缓冲)
   int max_new_tokens = 1024;      // 每轮最多生成多少 token
   bool thinking = false;               // Qwen3 思考模式(默认关闭,回答更直接)
@@ -92,7 +92,8 @@ void print_usage(const char* prog) {
       << "  --max-batch <N>      调度器槽位数(默认 1);KV 池按 max_batch x max_seq_len\n"
       << "                       整块预分配,想多占显存可以调大\n"
       << "  --gpu-mem-fraction <f>  KV 池最多占空闲显存的比例(默认 0.9)\n"
-      << "  --kv-quant <0|1|2|3>    KV int8 量化(1=K,2=V,3=both;默认读 LLAMA_KV_QUANT)\n"
+      << "  --kv-quant <0|1>        KV 量化(0=off,1=K int8 + V int4;默认读\n"
+      << "                          LLAMA_KV_QUANT)\n"
       << "  --max-new-tokens <N> 每轮最大生成长度(默认 1024)\n"
       << "  --questions <q1|q2>  非交互模式:用 | 分隔多个问题,依次提问后退出\n"
       << "  --thinking           Qwen3 思考模式(默认关闭:追加空 think 块,直出答案)\n"
@@ -103,7 +104,9 @@ void print_usage(const char* prog) {
       << "  /model <type> <模型目录> [tokenizer]   热切换模型(会清空记忆)\n"
       << "  /history                       查看记忆轮数\n"
       << "  /clear                         清空记忆\n"
-      << "  exit | quit                    退出\n";
+      << "  exit | quit                    退出\n\n"
+      << "环境变量:\n"
+      << "  LLAMA_KV_QUANT <0|1>           KV 量化(等价于 --kv-quant,命令行优先)\n";
 }
 
 // std::stoi / std::stod throw on bad input — report and exit instead of aborting.
@@ -337,30 +340,31 @@ struct ChatEngine {
   int ctx = 0;             // KV cache 容量(prompt + 生成)
   int prompt_budget = 0;   // 留给 prompt 的 token 预算
   int max_batch = 1;       // 调度器槽位数
-  int kv_quant = 0;        // 生效的 int8 掩码(scheduler::KvQuant)
+  int kv_quant = 0;        // 生效的量化掩码(scheduler::KvQuant: 0 或 1)
   long long kv_bytes = 0;  // KV 池实际占用(整块预分配)
   long long vram_free = 0;
   long long vram_total = 0;
 
   // 每个 token 的 KV 字节数: 层数 x (K+V) x kv_dim x 元素字节,再按量化的
   // 半边打折,并加上每 (token, kv head) 一个 fp32 scale 的开销。
-  // 元素字节:INT8=1 / BF16=2 / FP32=4(CPU 路径)。
-  // 量化的依据是 KVManager 实际采用的掩码(CLI > LLAMA_KV_QUANT),不是编译宏 ——
-  // 这个预算函数必须和真正分配池子的那个开关读同一个来源,否则显存会算乐观。
+  // 元素字节:未量化 BF16=2 / FP32=4(CPU 路径);量化后 K 是 1B(int8)、V 是
+  // 半字节(4-bit,每字节两个值,行只有一半长),scale 粒度不变(仍是每
+  // (token, kv head) 一个 fp32)。量化的依据是 KVManager 实际采用的掩码
+  // (CLI > LLAMA_KV_QUANT),不是编译宏 —— 这个预算函数必须和真正分配池子的那
+  // 个开关读同一个来源,否则显存会算乐观。
   long long kv_bytes_per_token() const {
     const long long elem = (model->compute_dtype() == base::DataType::kDataTypeBF16) ? 2 : 4;
-    const int quant = kv_quant;
-    // 每 token 每个 KV head 的 scale(只有被量化的那半边有)
+    const bool quant = kv_quant != scheduler::kKvQuantNone;
+    // 每 token 每个 KV head 的 scale(K 与 V 各一份,只有量化时才有)
     const long long scale = static_cast<long long>(model->layer_num()) *
                             model->kv_head_num() * sizeof(float);
-    long long bytes = 0;
-    bytes += static_cast<long long>(model->layer_num()) * model->kv_dim() *
-             ((quant & scheduler::kKvQuantK) ? 1 : elem);
-    bytes += static_cast<long long>(model->layer_num()) * model->kv_dim() *
-             ((quant & scheduler::kKvQuantV) ? 1 : elem);
-    if (quant & scheduler::kKvQuantK) bytes += scale;
-    if (quant & scheduler::kKvQuantV) bytes += scale;
-    return bytes;
+    const long long layers_kv_dim = static_cast<long long>(model->layer_num()) * model->kv_dim();
+    if (quant) {
+      // K 每个值 1B;V 每两个值 1B(kv_dim 个值只占 kv_dim/2 字节,整数除是精确的,
+      // 池子按同一式子分配);两半各带一份 per-(token, kv head) 的 fp32 scale。
+      return layers_kv_dim /*K: 1B/值*/ + layers_kv_dim / 2 /*V: 0.5B/值*/ + 2 * scale;
+    }
+    return layers_kv_dim * 2 * elem;  // 未量化:两半都是 elem 字节/值
   }
 
   // 按 args 加载模型并建调度器;失败返回 false(已打印原因)
@@ -417,8 +421,11 @@ struct ChatEngine {
         const int block_size = scheduler::Scheduler::default_block_size();
         const long long per_token = kv_bytes_per_token() * max_batch;
         const long long bytes_per_block = per_token * block_size;
+        const double kv_budget = budget;
         const long long fit_blocks =
-            static_cast<long long>(budget / static_cast<double>(bytes_per_block));
+            kv_budget > 0.0
+                ? static_cast<long long>(kv_budget / static_cast<double>(bytes_per_block))
+                : 0;
         const long long fit = fit_blocks * block_size;
         if (fit < ctx) {
           std::cout << "[提示] 显存只放得下 " << fit << " tokens 的 KV(空闲 "

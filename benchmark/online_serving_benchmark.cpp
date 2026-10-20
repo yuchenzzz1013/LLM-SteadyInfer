@@ -89,7 +89,8 @@ struct Args {
   // --prefix-cache 1 打开。
   int prefix_cache = 0;
 
-  // KV Cache int8 量化掩码 (scheduler::KvQuant): 0=off, 1=K, 2=V, 3=K+V;
+  // KV 量化掩码 (scheduler::KvQuant): 0=off, 1=K int8, 2=V int8, 3=K+V int8,
+  // 4=V int4, 5=K int8+V int4;
   // -1 = 读 LLAMA_KV_QUANT 环境变量(与 Scheduler 的默认解析一致)。
   int kv_quant = -1;
 };
@@ -166,10 +167,11 @@ static Args parse_args(int argc, char** argv) {
   if (has_arg(argc, argv, "--kv-quant"))
     a.kv_quant = to_int(get_arg(argc, argv, "--kv-quant"));
   // 掩码写错(比如按开关的思路写 7)不能在 KVManager 的 CHECK 里才炸:那时模型
-  // 都加载完了。这里直接拒绝,顺带把编码再讲一遍。
-  if (a.kv_quant < -1 || a.kv_quant > 3) {
-    LOG(FATAL) << "--kv-quant 必须是 0(off) / 1(K) / 2(V) / 3(K+V),或 -1(= 读 "
-                  "LLAMA_KV_QUANT);注意 1 是\"只量化 K\",不是开关。得到: "
+  // 都加载完了。这里直接拒绝,顺带把编码再讲一遍。只认 0 和 1 —— 2/3/4 三条臂
+  // 已随掩码收敛删除,当别名用会跑出一个没人能归因的数。
+  if (a.kv_quant != -1 && a.kv_quant != 0 && a.kv_quant != scheduler::kKvQuantK8V4) {
+    LOG(FATAL) << "--kv-quant 必须是 0(off) 或 1(K int8 + V int4),或 -1(= 读 "
+                  "LLAMA_KV_QUANT)。得到: "
                << a.kv_quant;
   }
 
@@ -229,10 +231,10 @@ static void print_usage(const char* prog) {
       << "                         极低,开着只会把已完成请求的 prompt 块钉在池里并\n"
       << "                         计入哈希开销;要看净收益用\n"
       << "                         prefix_caching_benchmark 的 A/B\n"
-      << "  --kv-quant <0|1|2|3>   KV Cache int8 量化:0=off,1=K,2=V,3=K+V\n"
-      << "                         (默认 -1 = 读 LLAMA_KV_QUANT 环境变量)。注意 1 是\n"
-      << "                         \"只量化 K\",不是开关。仅 Paged CUDA 布局;开启后\n"
-      << "                         KV 池按 int8 估算,autobatch 的并发上限随之放宽\n"
+      << "  --kv-quant <0|1>       KV Cache 量化:0=off,1=K int8 + V int4\n"
+      << "                         (默认 -1 = 读 LLAMA_KV_QUANT 环境变量)。仅 Paged\n"
+      << "                         CUDA 布局;开启后 KV 池按 K 1B + V 0.5B/值估算,\n"
+      << "                         autobatch 的并发上限随之放宽\n"
       << "  --output-csv <path>    结果 CSV 路径(默认 results/serving_metrics.csv)\n";
 }
 
@@ -243,7 +245,7 @@ struct ServingMetrics {
   int num_requests = 0, submitted = 0, completed = 0, rejected = 0, dropped = 0;
   // 本轮实际生效的调度配置(autobatch 会自动放大 max_batch,写进 CSV 才能复现)
   int max_batch = 0, max_gen = 0, block_size = 0;
-  int kv_quant = 0;  // 生效的 int8 掩码(0=off, 1=K, 2=V, 3=K+V)
+  int kv_quant = 0;  // 生效的量化掩码(0=off, 1=K int8 + V int4)
   bool auto_batch = false;  // max_batch 是否由空闲显存自动决定
   // 正式窗口内的 CUDA graph 捕获开销(预热后清零,见 offline 同名字段)
   long long graph_captures = 0, graph_evictions = 0;
@@ -339,17 +341,20 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
   {
     const int64_t blocks_per_seq = (max_total_seq_len + block_size - 1) / block_size;
     // 每 sequence 的 KV 池字节 = 它那份 [num_layers, blocks_per_seq, block_size,
-    // kv_dim] x {K,V};元素未量化 2B(bf16),量化后 1B(int8)。另加每个被量化
-    // 张量一份 fp32 scale 池 [num_layers, blocks_per_seq, kv_head_num,
-    // block_size] —— 与 KVManager 的分配同款布局,照抄公式而不是拍个系数。
-    const bool kq = (kv_quant & scheduler::kKvQuantK) != 0;
-    const bool vq = (kv_quant & scheduler::kKvQuantV) != 0;
-    const int64_t kv_elems = static_cast<int64_t>(model->layer_num()) * blocks_per_seq *
-                             block_size * model->kv_dim();
+    // kv_dim] x {K,V};元素未量化 2B(bf16),量化后 K 是 1B(int8)、V 是半字节
+    // (4-bit,每字节两个值,行只有一半长,见 KVManager)。另加每个量化张量一份
+    // fp32 scale 池 [num_layers, blocks_per_seq, kv_head_num, block_size] —— 与
+    // KVManager 的分配同款布局,照抄公式而不是拍个系数(4-bit 的 scale 粒度不变,
+    // 仍是每个 (token, kv head) 一个 fp32)。
+    const bool quant = kv_quant != scheduler::kKvQuantNone;
+    const int64_t k_elems = static_cast<int64_t>(model->layer_num()) * blocks_per_seq *
+                            block_size * model->kv_dim();
+    // 4-bit: 两个值挤进一字节,所以 V 那半按 0.5B/元素算。
+    const int64_t v_elems = quant ? k_elems / 2 : k_elems;
     const int64_t scale_elems = static_cast<int64_t>(model->layer_num()) * blocks_per_seq *
                                 block_size * model->kv_head_num();
-    const int64_t bytes_per_seq = kv_elems * ((kq ? 1 : 2) + (vq ? 1 : 2)) +
-                                  scale_elems * 4 * ((kq ? 1 : 0) + (vq ? 1 : 0));
+    const int64_t bytes_per_seq = k_elems * (quant ? 1 : 2) + v_elems * (quant ? 1 : 2) +
+                                  scale_elems * 4 * (quant ? 2 : 0);
     size_t free_b = 0, total_b = 0;
     if (bytes_per_seq > 0 && cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
       // 预留给 logits 缓冲、每步临时张量、显存碎片,以及最容易被低估的一块:

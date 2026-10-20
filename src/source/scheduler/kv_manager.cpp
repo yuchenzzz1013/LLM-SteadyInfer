@@ -12,22 +12,20 @@ int kv_quant_from_env() {
   // Case-insensitive: the value is typed by hand on a command line.
   std::string v(raw);
   for (char& c : v) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
-  // A single digit is the MASK itself (0..3), identical to the Scheduler
-  // constructor argument and the benchmarks' --kv-quant, so the two entry
-  // points cannot be read against each other: "1" is K-only in both, and
-  // there is no spelling of the mask that means "both" when typed as a digit.
-  // (Words carry the intent for anyone who finds the mask opaque.)
+  // "1" is the switch itself, identical to the Scheduler constructor argument
+  // and the benchmarks' --kv-quant, so the two entry points cannot be read
+  // against each other. "5" is accepted as the same thing because that is what
+  // the arm used to be called while the mask existed and what every reproduce
+  // command in results/ says; both spellings select one arm, so accepting both
+  // cannot be ambiguous. Every other digit is a LOG(FATAL) rather than an alias,
+  // because 2/3/4 named precisions this build no longer has and quietly handing
+  // back a different one produces a number nobody can attribute.
   if (v == "0" || v == "off" || v == "none" || v == "false") return kKvQuantNone;
-  if (v == "1") return kKvQuantK;
-  if (v == "2") return kKvQuantV;
-  if (v == "3") return kKvQuantBoth;
-  if (v == "k" || v == "key" || v == "keys") return kKvQuantK;
-  if (v == "v" || v == "value" || v == "values") return kKvQuantV;
-  if (v == "on" || v == "true" || v == "kv" || v == "both" || v == "all") {
-    return kKvQuantBoth;
-  }
+  if (v == "1" || v == "kv4" || v == "k+v4" || v == "5") return kKvQuantK8V4;
   LOG(FATAL) << "LLAMA_KV_QUANT: unrecognized value '" << raw
-             << "' (expected 0/off, 1/k, 2/v, 3/kv, or the words k, v, kv, both)";
+             << "' (expected 0/off or 1/kv4 — K int8 + V int4; the arms 2 (V int8), "
+                "3 (K+V int8) and 4 (V int4 over a bf16 K) were removed, and 1 used to "
+                "mean \"K only\" while the mask existed)";
   return kKvQuantNone;
 }
 
@@ -45,16 +43,33 @@ KVManager::KVManager(int num_layers, int max_batch, int max_seq_len, int kv_dim,
   paged_ = false;
 #endif
 
-  // int8 requires the paged layout (see the header). Reject rather than
-  // downgrade: a caller that asked for quantization and silently got bf16
+  // Quantization requires the paged layout (see the header). Reject rather
+  // than downgrade: a caller that asked for quantization and silently got bf16
   // would measure no speedup, no PPL change, and no error.
   CHECK(kv_quant == kKvQuantNone || paged_)
       << "KV quantization (LLAMA_KV_QUANT) is only implemented for the paged CUDA layout "
          "(USE_PAGED_ATTENTION + device=kDeviceCUDA); requested mask="
       << kv_quant << ", paged=" << paged_;
-  CHECK(kv_quant >= kKvQuantNone && kv_quant <= kKvQuantBoth)
-      << "Invalid KV quantization mask " << kv_quant << " (expected 0..3)";
+  // Mask validation: exactly two values, and the removed ones are an error
+  // rather than an alias for 5. A driver or a script that still passes 1/2/3/4
+  // is asking for a precision this build does not have; resolving it to "K int8
+  // + V int4" would produce a PPL number attributed to an arm that never ran.
+  CHECK(kv_quant == kKvQuantNone || kv_quant == kKvQuantK8V4)
+      << "Invalid KV quantization mask " << kv_quant
+      << " (expected 0 for off or 1 for K int8 + V int4; the arms 2 (V int8), 3 (K+V int8) "
+         "and 4 (V int4 over a bf16 K) were removed)";
   kv_quant_ = kv_quant;
+
+  // The 4-bit V residual window is gone. Every script and reproduce command in
+  // results/ exported LLAMA_KV_WINDOW, and a run that still sets it would
+  // silently measure the windowless regime while its own logs claim otherwise,
+  // so it is a hard error rather than an ignored variable.
+  const char* window_env = std::getenv("LLAMA_KV_WINDOW");
+  CHECK(window_env == nullptr)
+      << "LLAMA_KV_WINDOW=" << window_env
+      << " is no longer supported: the 4-bit V residual window was removed, and the KV cache "
+         "is now the quantized pool alone (kv_quant 5 stores K int8 and V int4). Unset it — "
+         "any value here, including 0, is a leftover.";
 
   if (paged_) {
     // Paged layout: [num_layers, num_blocks, block_size, kv_dim]. One block
@@ -100,30 +115,35 @@ KVManager::KVManager(int num_layers, int max_batch, int max_seq_len, int kv_dim,
 
   if (paged_) {
     // Element (layer, block, pos_in_block, d) at
-    //   layer * (num_blocks * block_size * kv_dim)
-    // + block * (block_size * kv_dim)
-    // + pos_in_block * kv_dim + d
+    //   layer * (num_blocks * block_size * row_bytes)
+    // + block * (block_size * row_bytes)
+    // + pos_in_block * row_bytes + d
     // d-innermost within a page: the flash-decoding kernels walk consecutive
     // positions contiguously, crossing page boundaries through block_table.
     // Quantized, the same shape in int8 (half the bytes) — the addressing
     // arithmetic is unchanged, only the element size and the load width are.
-    const base::DataType key_dtype =
-        key_is_quantized() ? base::DataType::kDataTypeInt8 : kv_dtype;
-    const base::DataType value_dtype =
-        value_is_quantized() ? base::DataType::kDataTypeInt8 : kv_dtype;
-    key_cache_ = tensor::Tensor(key_dtype, num_layers_, num_blocks_, block_size_, kv_dim_,
+    //
+    // The V pool is the same int8 dtype with row_bytes = kv_dim/2: dim d lives
+    // in byte d/2, low nibble for even d. The last dim is the discriminator the
+    // kernels read the width from, so it is set here and nowhere else.
+    const base::DataType cached_dtype =
+        quantized() ? base::DataType::kDataTypeInt8 : kv_dtype;
+    const int value_row_bytes = quantized() ? kv_dim_ / 2 : kv_dim_;
+    if (quantized()) {
+      CHECK(kv_dim_ % 2 == 0)
+          << "4-bit V needs an even kv_dim (two values per byte), got " << kv_dim_;
+    }
+    key_cache_ = tensor::Tensor(cached_dtype, num_layers_, num_blocks_, block_size_, kv_dim_,
                                 true, alloc);
-    value_cache_ = tensor::Tensor(value_dtype, num_layers_, num_blocks_, block_size_, kv_dim_,
-                                  true, alloc);
+    value_cache_ = tensor::Tensor(cached_dtype, num_layers_, num_blocks_, block_size_,
+                                  value_row_bytes, true, alloc);
 
     // Scale pools, one fp32 per (layer, block, kv_head, pos_in_block). Only
-    // allocated for the quantized halves; the addressing (and why pos is the
-    // innermost dim) is documented on the members in the header.
-    if (key_is_quantized()) {
+    // allocated when quantized; the addressing (and why pos is the innermost
+    // dim) is documented on the members in the header.
+    if (quantized()) {
       key_scale_cache_ = tensor::Tensor(base::DataType::kDataTypeFp32, num_layers_, num_blocks_,
                                         kv_head_num_, block_size_, true, alloc);
-    }
-    if (value_is_quantized()) {
       value_scale_cache_ = tensor::Tensor(base::DataType::kDataTypeFp32, num_layers_,
                                           num_blocks_, kv_head_num_, block_size_, true, alloc);
     }
@@ -143,8 +163,7 @@ KVManager::KVManager(int num_layers, int max_batch, int max_seq_len, int kv_dim,
   // nothing pointing at the pool size or the knobs that control it. Fail at
   // construction instead, with the numbers needed to size it down.
   const bool scales_ok =
-      (key_is_quantized() ? !key_scale_cache_.is_empty() : true) &&
-      (value_is_quantized() ? !value_scale_cache_.is_empty() : true);
+      (!quantized() || (!key_scale_cache_.is_empty() && !value_scale_cache_.is_empty()));
   if (key_cache_.is_empty() || value_cache_.is_empty() || !scales_ok) {
     const double pool_gb =
         static_cast<double>(pool_bytes()) / (1024.0 * 1024.0 * 1024.0);
@@ -153,9 +172,10 @@ KVManager::KVManager(int num_layers, int max_batch, int max_seq_len, int kv_dim,
                << " max_batch=" << max_batch_ << " max_seq_len=" << max_seq_len_
                << " kv_dim=" << kv_dim_
                << (paged_ ? " block_size=" + std::to_string(block_size_) : std::string())
-               << (kv_quant_ != kKvQuantNone
-                       ? " kv_quant=" + std::to_string(kv_quant_) + " (pools + scales)"
-                       : std::string())
+               << (quantized() ? " kv_quant=" + std::to_string(kv_quant_) +
+                                         " (K int8 + V int4, V row packed to kv_dim/2 bytes, "
+                                         "plus the two scale pools)"
+                               : std::string())
                << "). Lower max_batch / max_seq_len (or the driver's --gpu-mem-fraction) "
                   "and retry.";
   }

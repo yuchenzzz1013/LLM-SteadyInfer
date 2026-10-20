@@ -50,7 +50,8 @@ inline bool paged_decode_geometry_ok(int32_t head_size, int32_t table_stride, in
 void paged_kv_scatter_cu(const tensor::Tensor& src, tensor::Tensor& dst_cache,
                          const tensor::Tensor& dst_scale, const tensor::Tensor& block_table,
                          const tensor::Tensor& positions, int32_t kv_dim, int32_t kv_head_num,
-                         int32_t num_blocks, int32_t block_size, int32_t layer_idx, void* stream);
+                         int32_t num_blocks, int32_t block_size, int32_t layer_idx,
+                         void* stream);
 
 // Batched decode / chunked-prefill MHA over the paged cache (Flash Decoding):
 // one split-KV launch pair per layer for the whole batch. Identical grid /

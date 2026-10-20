@@ -16,19 +16,18 @@
 // the whole batch on paged_attention_cu_batch / mha_kernel_cu_batch, which
 // handle every supported head size.
 //
-// KV quantization (int8 K and/or V pools) is a compile-time arm split, not a
-// runtime flag inside one kernel: both paged kernels are templated on QUANT and
-// the int8 reads are guarded with `if constexpr`, so the QUANT false
-// instantiations are the pre-quantization kernels — same registers, same
-// instructions (the write path was already split this way: paged_kv_scatter_cu
-// dispatches the quantizing scatter as its own kernel). The runtime flag that
-// survives is the K/V mask (0/1/2/3) inside the QUANT true instantiations,
-// where both arms are live by construction. This matters because ptxas sizes
-// a kernel's register file for its worst path: with quantization folded into
-// the bf16 kernel as a runtime branch, the decode instantiation went from 71
-// to 94 registers per thread (~28 -> ~21 resident warps per SM on A100) and
-// the whole offline benchmark lost ~7% throughput with quantization off — the
-// switch was numerically transparent but not performance transparent.
+// KV quantization (K int8 + V int4, the only shape this build has — see
+// KvQuant) is a compile-time arm split, not a runtime flag inside one kernel:
+// both paged kernels are templated on QUANT and the int8 reads are guarded with
+// `if constexpr`, so the QUANT false instantiations are the pre-quantization
+// kernels — same registers, same instructions (the write path was already split
+// this way: paged_kv_scatter_cu dispatches the quantizing scatter as its own
+// kernel). This matters because ptxas sizes a kernel's register file for its
+// worst path: with quantization folded into the bf16 kernel as a runtime
+// branch, the decode instantiation went from 71 to 94 registers per thread
+// (~28 -> ~21 resident warps per SM on A100) and the whole offline benchmark
+// lost ~7% throughput with quantization off — the switch was numerically
+// transparent but not performance transparent.
 //
 // All q/k/v/output caches are raw bfloat16 (CUDA __nv_bfloat16, bit-compatible
 // with the uint16_t host representation). Internal score / softmax / output
@@ -90,6 +89,28 @@ static void check_kv_pool_dtype(const tensor::Tensor& pool, const tensor::Tensor
                             << " is bf16 but a scale pool was passed; the writer and the readers "
                                "disagree on whether quantization is on";
   }
+}
+
+// How wide the values in an int8 V pool are: 8 bits (one per byte, kv_dim
+// bytes per row) or 4 bits (two per byte, kv_dim/2 bytes per row). The dtype
+// gate above cannot separate the two — both are kDataTypeInt8, because the
+// 4-bit pool is a byte array with a packed row — so the WIDTH is read back
+// from the one thing that follows the tensor into every kernel: its last dim.
+// KVManager sets that dim (kv_dim for 8-bit, kv_dim/2 for 4-bit) and is the
+// only producer of these pools.
+//
+// Any other last dim is a loud failure rather than a guess: an int8 V pool
+// whose row is neither kv_dim nor kv_dim/2 bytes is not addressable by either
+// arm, and reading it as one of them would silently mis-address every row
+// after the first.
+static bool kv_pool_is_v4(const tensor::Tensor& value_pool, int32_t kv_dim, const char* what) {
+  if (value_pool.data_type() != base::DataType::kDataTypeInt8) return false;
+  const int64_t row_bytes = value_pool.get_dim(3);
+  CHECK(row_bytes == kv_dim || row_bytes == kv_dim / 2)
+      << what << ": int8 V pool has " << row_bytes << " bytes per row, but kv_dim=" << kv_dim
+      << " means either " << kv_dim << " (8-bit, one value per byte) or " << (kv_dim / 2)
+      << " (4-bit, two per byte)";
+  return row_bytes == kv_dim / 2;
 }
 
 // ========== Dynamic shared-memory opt-in ==========
@@ -519,6 +540,13 @@ __global__ void paged_kv_scatter_kernel_bf16(const __nv_bfloat16* src, __nv_bflo
 // and the reader, which dequantizes a head with one scale, would take half the
 // row at the wrong magnitude. Lanes whose dims fall past the end of a < 128-dim
 // head feed the max its neutral element (0.0, and |x| >= 0 always).
+//
+// v4 packs two 4-bit values per byte instead of one 8-bit value: the same
+// lane-to-dims mapping, the same per-(token, kv head) fp32 scale, and the same
+// round-to-nearest — only the code range changes (±7 instead of ±127) and the
+// lane's four values land in two bytes instead of four. Dim d goes in byte
+// d/2, low nibble for even d; that is the layout load_v4_chunk4 unpacks, and
+// it keeps a lane's chunk (dims [4l, 4l+4)) a single 2-byte store.
 __global__ void paged_kv_scatter_quant_kernel_bf16(const __nv_bfloat16* __restrict__ src,
                                                    int8_t* __restrict__ dst,
                                                    float* __restrict__ dst_scale,
@@ -527,7 +555,7 @@ __global__ void paged_kv_scatter_quant_kernel_bf16(const __nv_bfloat16* __restri
                                                    const int32_t* __restrict__ positions,
                                                    int32_t kv_dim, int32_t kv_head_num,
                                                    int32_t num_blocks, int32_t block_size,
-                                                   int32_t layer_idx) {
+                                                   int32_t layer_idx, bool v4) {
   const int b = blockIdx.x;
   const int warp = threadIdx.x >> 5;
   const int n_warps = blockDim.x >> 5;
@@ -546,6 +574,13 @@ __global__ void paged_kv_scatter_quant_kernel_bf16(const __nv_bfloat16* __restri
   const int64_t layer_scale_base =
       static_cast<int64_t>(layer_idx) * num_blocks * block_size * kv_head_num;
   const __nv_bfloat16* src_row = src + static_cast<int64_t>(b) * kv_dim;
+  // 4-bit: dim d lives in byte d/2 of a kv_dim/2-byte row, so every element
+  // offset into the pool halves. All the terms above are multiples of kv_dim
+  // (even) and head_size is a multiple of 4 (CHECKed at launch), so the
+  // halvings are exact and the uint16 stores below stay 2-byte aligned.
+  const int64_t data_base = v4 ? (layer_data_base >> 1) : layer_data_base;
+  const int64_t head_stride = v4 ? (head_size >> 1) : head_size;
+  const int qmax = v4 ? 7 : 127;
 
   for (int head = warp; head < kv_head_num; head += n_warps) {
     const __nv_bfloat16* head_src = src_row + static_cast<int64_t>(head) * head_size;
@@ -572,9 +607,9 @@ __global__ void paged_kv_scatter_quant_kernel_bf16(const __nv_bfloat16* __restri
     // An all-zero row (masked padding, a head whose weights zeroed it) would
     // divide by zero; the floor keeps the scale positive and 0 * inv_scale
     // still quantizes to 0, so such a row round-trips exactly.
-    const float scale = fmaxf(amax, 1e-8f) * (1.0f / 127.0f);
+    const float scale = fmaxf(amax, 1e-8f) * (1.0f / qmax);
     const float inv_scale = 1.0f / scale;
-    int8_t* head_dst = dst + layer_data_base + static_cast<int64_t>(head) * head_size;
+    int8_t* head_dst = dst + data_base + static_cast<int64_t>(head) * head_stride;
 #pragma unroll
     for (int c = 0; c < 2; ++c) {
       if (c >= n_chunks) break;
@@ -583,12 +618,18 @@ __global__ void paged_kv_scatter_quant_kernel_bf16(const __nv_bfloat16* __restri
       uint32_t packed = 0;
 #pragma unroll
       for (int v = 0; v < 4; ++v) {
-        // Round-to-nearest, then clamp: |x| <= amax makes |q| <= 127 already,
+        // Round-to-nearest, then clamp: |x| <= amax makes |q| <= qmax already,
         // so the clamp only ever catches a value the reduction never saw.
-        const int q = min(127, max(-127, __float2int_rn(val[c][v] * inv_scale)));
-        packed |= static_cast<uint32_t>(static_cast<uint8_t>(static_cast<int8_t>(q))) << (8 * v);
+        const int q = min(qmax, max(-qmax, __float2int_rn(val[c][v] * inv_scale)));
+        // Low nibble first for v4 (dim d in byte d/2, even d in the low half),
+        // one byte per value for int8.
+        packed |= (static_cast<uint32_t>(q) & (v4 ? 0xfu : 0xffu)) << ((v4 ? 4 : 8) * v);
       }
-      *reinterpret_cast<uint32_t*>(head_dst + d) = packed;
+      if (v4) {
+        *reinterpret_cast<uint16_t*>(head_dst + (d >> 1)) = static_cast<uint16_t>(packed);
+      } else {
+        *reinterpret_cast<uint32_t*>(head_dst + d) = packed;
+      }
     }
     if (lane == 0) {
       dst_scale[layer_scale_base +
@@ -613,18 +654,24 @@ void paged_kv_scatter_cu(const tensor::Tensor& src, tensor::Tensor& dst_cache,
     CHECK((head_size & 3) == 0 && head_size <= 256)
         << "the quantizing scatter needs a head_size that is a multiple of 4 and at most 256, got "
         << head_size;
+    // The width comes from the destination pool's own last dim (see
+    // kv_pool_is_v4) — the caller (KVManager through the models) allocates a
+    // 4-bit V pool with a kv_dim/2-byte row and this is where the writer picks
+    // that up. `head_size` is already checked to be a multiple of 4 above, so
+    // the packed row keeps every lane's 2-byte chunk 2-byte aligned.
+    const bool v4 = kv_pool_is_v4(dst_cache, kv_dim, "paged_kv_scatter_cu: dst_cache");
     int8_t* dst = const_cast<int8_t*>(dst_cache.ptr<int8_t>());
     float* dst_scale_ptr = const_cast<float*>(dst_scale.ptr<float>());
     constexpr int kThreads = 256;  // 8 warps: one kv head per warp per pass, then stride
     if (stream_) {
       paged_kv_scatter_quant_kernel_bf16<<<batch, kThreads, 0, stream_>>>(
           src.ptr<__nv_bfloat16>(), dst, dst_scale_ptr, block_table.ptr<int32_t>(), table_stride,
-          positions.ptr<int32_t>(), kv_dim, kv_head_num, num_blocks, block_size, layer_idx);
+          positions.ptr<int32_t>(), kv_dim, kv_head_num, num_blocks, block_size, layer_idx, v4);
       CUDA_KERNEL_CHECK();
     } else {
       paged_kv_scatter_quant_kernel_bf16<<<batch, kThreads>>>(
           src.ptr<__nv_bfloat16>(), dst, dst_scale_ptr, block_table.ptr<int32_t>(), table_stride,
-          positions.ptr<int32_t>(), kv_dim, kv_head_num, num_blocks, block_size, layer_idx);
+          positions.ptr<int32_t>(), kv_dim, kv_head_num, num_blocks, block_size, layer_idx, v4);
       CUDA_KERNEL_CHECK();
     }
     return;
@@ -759,6 +806,82 @@ __device__ __forceinline__ void stage_kv_row_chunk(__nv_bfloat16* tile_bf16, int
   *reinterpret_cast<uint4*>(tile_bf16) = *reinterpret_cast<const uint4*>(cache_bf16 + off);
 }
 
+// ========== 4-bit V arm ==========
+// The V-side counterpart of the int8 arm: a 4-bit pool keeps two values per
+// byte, dim d in byte d/2 (low nibble for even d), which is exactly the layout
+// the quantizing scatter writes. `off` is an ELEMENT offset like everywhere
+// else — one element is one dim — so the byte an access starts in is off/2;
+// every call site passes a chunk-aligned offset (a multiple of 4), so the
+// halving is exact and the uint16 accesses below stay 2-byte aligned.
+//
+// The scale still multiplies the unpacked value at the call site, unchanged:
+// the 4-bit pool carries the same per-(token, kv head) fp32 scale as the 8-bit
+// one, only computed over a ±7 code range instead of ±127.
+//
+// Sign extension is written as ((n ^ 8) - 8) rather than a shift of a signed
+// value: the latter is implementation-defined for negative operands, and this
+// value feeds every score and every output element of the layer.
+__device__ __forceinline__ float v4_nibble_to_float(uint32_t n) {
+  return static_cast<float>(static_cast<int32_t>(n ^ 8u) - 8);
+}
+
+__device__ __forceinline__ void load_v4_chunk4(float* dst, const int8_t* cache_i8, int64_t off) {
+  const uint32_t raw = *reinterpret_cast<const uint16_t*>(cache_i8 + (off >> 1));
+  dst[0] = v4_nibble_to_float(raw & 0xfu);
+  dst[1] = v4_nibble_to_float((raw >> 4) & 0xfu);
+  dst[2] = v4_nibble_to_float((raw >> 8) & 0xfu);
+  dst[3] = v4_nibble_to_float((raw >> 12) & 0xfu);
+}
+
+// V-side loader: the int8-width arm of load_kv_chunk4, plus the 4-bit arm it
+// cannot express. Both are only reachable in the QUANT true instantiation
+// (4-bit V is a quantized V pool), so the QUANT false instantiation is exactly
+// the pre-quantization kernel. Kept on the V side alone on purpose — a 4-bit K
+// pool would have to be taught to dp4a, and K is not where the width goes (see
+// the KvQuant note in kv_manager.h).
+template <bool QUANT>
+__device__ __forceinline__ void load_v_chunk4(float* dst, const __nv_bfloat16* cache_bf16,
+                                              const int8_t* cache_i8, bool vq, bool v4,
+                                              int64_t off) {
+  if constexpr (QUANT) {
+    if (vq && v4) {
+      load_v4_chunk4(dst, cache_i8, off);
+      return;
+    }
+  }
+  load_kv_chunk4<QUANT>(dst, cache_bf16, cache_i8, vq, off);
+}
+
+// 4-bit arm of the V staging walk: one uint16 moves both packed bytes of the
+// chunk. Unlike stage_kv_row_chunk, the tile pointer passed in is the packed
+// tile's byte address for the chunk — the caller has already halved the
+// element offset, because in a packed tile dim d also lives in byte d/2 — so
+// only the source offset is halved here.
+__device__ __forceinline__ void stage_v4_row_chunk(int8_t* tile_dst, const int8_t* cache_i8,
+                                                   int64_t off) {
+  *reinterpret_cast<uint16_t*>(tile_dst) =
+      *reinterpret_cast<const uint16_t*>(cache_i8 + (off >> 1));
+}
+
+// V-side staging: same shape as load_v_chunk4, for the prefill tile walk.
+// The caller decides the tile address (a packed tile's chunk sits at byte
+// ch/2 — see the staging walk in paged_prefill_kernel_bf16), so a v4 caller
+// passes the int8 tile pointer already halved and `stage_bf16`/`tile_bf16`
+// are unused.
+template <bool QUANT>
+__device__ __forceinline__ void stage_v_row_chunk(__nv_bfloat16* tile_bf16, int8_t* tile_i8,
+                                                  const __nv_bfloat16* cache_bf16,
+                                                  const int8_t* cache_i8, bool vq, bool v4,
+                                                  int64_t off) {
+  if constexpr (QUANT) {
+    if (vq && v4) {
+      stage_v4_row_chunk(tile_i8, cache_i8, off);
+      return;
+    }
+  }
+  stage_kv_row_chunk<QUANT>(tile_bf16, tile_i8, cache_bf16, cache_i8, vq, off);
+}
+
 // ========== Q-side int8 + dp4a scoring (P3) ==========
 // The QUANT arm halves the bytes the cache holds, but it still scores in fp32:
 // the cached int8 K is expanded to four fp32 lanes per chunk and dotted against
@@ -792,13 +915,27 @@ __device__ __forceinline__ void stage_kv_row_chunk(__nv_bfloat16* tile_bf16, int
 //
 // QI8 is a compile-time arm exactly like QUANT — an instantiation carries the
 // dp4a code or the fp32 code, never both. An int8 K pool is always scored this
-// way (the launcher sends every kq to the QI8 instantiation); the fp32 arm
-// survives only for a V-only pool, where there is no int8 K to dp4a against.
+// way (the launcher sends every kq to the QI8 instantiation), and with one
+// quantized shape in the build an int8 K pool is the whole quantized arm; the
+// fp32 dot survives for the bf16 baseline.
+//
+// P·V does NOT get the same treatment, and it was measured rather than assumed
+// (A100, Qwen3-4B, 32 x 4096 decode, same binary, back to back): quantizing the
+// softmax weights and running P·V on dp4a as well costs 86.0 / 86.3 s against
+// this kernel's 77.9 / 77.9 s, ~10% slower, at a PPL within noise of the fp32
+// arm (14.619435 vs 14.633198, both far inside the acceptance band). The
+// asymmetry is structural, not a tuning miss: Q·K's dp4a win comes from the
+// reduction it deletes (__reduce_add_sync replaces the 5-step butterfly, 14
+// instructions down to 2), while P·V has no cross-lane reduction to delete — a
+// dp4a only replaces 4 FMA with 1 instruction, and the per-(head, position)
+// weight quantization it needs costs more than the 3 instructions it saves, at
+// any group size. The two arms were built and timed, and the faster one is the
+// one that ships; there is no dead dp4a-P·V code left in this file.
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
 #error "the paged decode kernel's int8 scoring arm needs __reduce_add_sync (sm_80+)"
 #endif
 template <int G, int CHUNKS, bool QUANT, bool QI8>
-__global__ void paged_attn_split_kernel_bf16(
+__global__ void __launch_bounds__(256, 1) paged_attn_split_kernel_bf16(
     const int32_t* __restrict__ positions, int32_t batch, const int32_t* __restrict__ block_table,
     int32_t table_stride, int32_t num_blocks, int32_t block_size, int32_t block_shift,
     int32_t layer_idx, int32_t dim, const __nv_bfloat16* __restrict__ query,
@@ -806,7 +943,8 @@ __global__ void paged_attn_split_kernel_bf16(
     const __nv_bfloat16* __restrict__ value_cache, const int8_t* __restrict__ key_cache_i8,
     const int8_t* __restrict__ value_cache_i8, const float* __restrict__ key_scale,
     const float* __restrict__ value_scale, int32_t kv_dim, int32_t kv_head_num,
-    int32_t head_num, int32_t head_size, int32_t num_splits, int32_t head_groups) {
+    int32_t head_num, int32_t head_size, int32_t num_splits, int32_t head_groups,
+    bool v4) {
   constexpr int kVec = 4;    // head dims per lane
   constexpr int kGroup = 4;  // positions per online-softmax step
   const int warp_id = (blockIdx.x * (blockDim.x >> 5)) + (threadIdx.x >> 5);
@@ -970,10 +1108,18 @@ __global__ void paged_attn_split_kernel_bf16(
   // QUANT true instantiation selects between them at all; in the QUANT false
   // instantiation these fold to false and every int8 read below — pointer
   // tests, scale loads, byte-unpacking — is not compiled in (see
-  // load_kv_chunk4 for why the split cannot be a runtime branch). Within the
-  // quantized instantiation K and V stay a runtime choice: K-only, V-only and
-  // both are all served by it, and the warp-uniform test is what lets one
-  // compiled kernel cover the three masks of the A/B.
+  // load_kv_chunk4 for why the split cannot be a runtime branch). Inside the
+  // quantized instantiation both halves are always quantized — the pool dtype
+  // is the KVManager's, and this build has one quantized shape — so kq/vq are
+  // warp-uniform tests that fold to true there; they stay as tests because the
+  // pointers are what the kernels actually select on, and a pool whose scale
+  // pool is missing is rejected up front rather than read as garbage.
+  //
+  // `v4` (4-bit V) is a runtime choice of the same kind, one level narrower: it
+  // only ever arrives with vq true, it only changes the V loads and the V
+  // staging walk (their byte address halves), and it is warp-uniform and set
+  // once per kernel launch, so the quantized arm pays one branch per (position
+  // group, chunk) and no extra registers in the bf16 instantiation.
   const bool kq = QUANT && key_scale != nullptr;
   const bool vq = QUANT && value_scale != nullptr;
   const int64_t layer_scale_base =
@@ -1037,8 +1183,11 @@ __global__ void paged_attn_split_kernel_bf16(
         } else {
           load_kv_chunk4<QUANT>(kf[j] + c * kVec, key_cache, key_cache_i8, kq, row[j] + c * 128);
         }
-        load_kv_chunk4<QUANT>(v_reg[j] + c * kVec, value_cache, value_cache_i8, vq,
-                              row[j] + c * 128);
+        // V goes through the width-aware loader: with a 4-bit pool (`v4`, the
+        // pool's own last dim — see kv_pool_is_v4) the same chunk is two
+        // packed bytes, and the scale multiply below is unchanged.
+        load_v_chunk4<QUANT>(v_reg[j] + c * kVec, value_cache, value_cache_i8, vq, v4,
+                             row[j] + c * 128);
       }
     }
 #pragma unroll
@@ -1121,6 +1270,7 @@ __global__ void paged_attn_split_kernel_bf16(
 #pragma unroll
         for (int j = 0; j < kGroup; ++j) pv[j] *= vs[j];
       }
+
 #pragma unroll
       for (int c = 0; c < CHUNKS * kVec; ++c) {
         float a = acc[i][c] * alpha;
@@ -1166,7 +1316,7 @@ __global__ void paged_attn_split_kernel_bf16(
       } else {
         load_kv_chunk4<QUANT>(kf + c * kVec, key_cache, key_cache_i8, kq, row + c * 128);
       }
-      load_kv_chunk4<QUANT>(v_reg + c * kVec, value_cache, value_cache_i8, vq, row + c * 128);
+      load_v_chunk4<QUANT>(v_reg + c * kVec, value_cache, value_cache_i8, vq, v4, row + c * 128);
     }
 #pragma unroll
     for (int i = 0; i < G; ++i) {
@@ -1193,7 +1343,9 @@ __global__ void paged_attn_split_kernel_bf16(
       const float m_new = fmaxf(m_i[i], s);
       const float alpha = __expf(m_i[i] - m_new);
       const float pr = __expf(s - m_new);
-      // l stays the sum of raw weights, only the numerator is dequantized.
+      // l stays the sum of raw weights, only the numerator is dequantized —
+      // and only when the V came from the pool (see the group loop; a position
+      // the ring served carries vs1 = 1 by then).
       l_i[i] = l_i[i] * alpha + pr;
       const float pv = vq ? pr * vs1 : pr;
 #pragma unroll
@@ -1301,12 +1453,13 @@ static void launch_paged_attn_split(int32_t heads_per_warp, int32_t chunks, unsi
                                     const int8_t* value_cache_i8, const float* key_scale,
                                     const float* value_scale, int32_t kv_dim, int32_t kv_head_num,
                                     int32_t head_num, int32_t head_size, int32_t num_splits,
-                                    int32_t head_groups, cudaStream_t stream) {
+                                    int32_t head_groups, bool v4, cudaStream_t stream) {
 #define LAUNCH_PAGED_SPLIT(G, C)                                                                \
-  paged_attn_split_kernel_bf16<G, C, QUANT, QI8><<<grid, 256, 0, stream>>>(                     \
+  paged_attn_split_kernel_bf16<G, C, QUANT, QI8><<<grid, 256, 0, stream>>>(                \
       positions, batch, block_table, table_stride, num_blocks, block_size, block_shift,         \
       layer_idx, dim, query, partials, key_cache, value_cache, key_cache_i8, value_cache_i8,    \
-      key_scale, value_scale, kv_dim, kv_head_num, head_num, head_size, num_splits, head_groups)
+      key_scale, value_scale, kv_dim, kv_head_num, head_num, head_size, num_splits, head_groups, \
+      v4)
   if (chunks == 1) {
     switch (heads_per_warp) {
       case 1: LAUNCH_PAGED_SPLIT(1, 1); break;
@@ -1397,6 +1550,12 @@ void paged_attention_cu_batch(int32_t head_num, int32_t layer_idx, int32_t num_b
   // checks above already tie the dtype to the presence of the scale pool.
   const bool kq = key_cache.data_type() == base::DataType::kDataTypeInt8;
   const bool vq = value_cache.data_type() == base::DataType::kDataTypeInt8;
+  // 4-bit V is an int8 pool too, so the dtype cannot separate the two widths:
+  // the pool's own row width does (kv_dim/2 bytes), resolved here where both
+  // the tensor and kv_dim are in hand. The kernels stay templated on the arm,
+  // not on this — only the V load and the V staging walk change with it.
+  const bool v4 =
+      vq && kv_pool_is_v4(value_cache, kv_dim, "paged_attention_cu_batch: value_cache");
   const __nv_bfloat16* kcache = kq ? nullptr : key_cache.ptr<__nv_bfloat16>();
   const __nv_bfloat16* vcache = vq ? nullptr : value_cache.ptr<__nv_bfloat16>();
   const int8_t* kcache_i8 = kq ? key_cache.ptr<int8_t>() : nullptr;
@@ -1404,31 +1563,21 @@ void paged_attention_cu_batch(int32_t head_num, int32_t layer_idx, int32_t num_b
   const float* kscale = kq ? key_scale.ptr<float>() : nullptr;
   const float* vscale = vq ? value_scale.ptr<float>() : nullptr;
 
-  // An int8 K pool is scored with dp4a, always (P3): QI8 is the only arm for
-  // kq, and it is the only arm whose K load stays packed. A V-only pool (kq
-  // false) keeps the fp32 dot — there is no int8 K to dp4a against.
+#define PAGED_SPLIT_ARGS                                                                          \
+  heads_per_warp, chunks, grid, positions.ptr<int32_t>(), batch, block_table.ptr<int32_t>(),      \
+      table_stride, num_blocks, block_size, block_shift, layer_idx, dim, query, partials, kcache, \
+      vcache, kcache_i8, vcache_i8, kscale, vscale, kv_dim, kv_head_num, head_num, head_size,     \
+      num_splits, head_groups, v4, stream
+  // An int8 K pool is always scored with dp4a, and under this build's only
+  // quantized shape an int8 K pool IS the quantized arm (KvQuant: K int8 + V
+  // int4, so kq implies vq and v4). Two launchable arms then instead of the
+  // five a mask sweep needed: the quantized one and the bf16 baseline.
   if (kq) {
-    launch_paged_attn_split<true, true>(heads_per_warp, chunks, grid, positions.ptr<int32_t>(),
-                                        batch, block_table.ptr<int32_t>(), table_stride, num_blocks,
-                                        block_size, block_shift, layer_idx, dim, query, partials,
-                                        kcache, vcache, kcache_i8, vcache_i8, kscale, vscale, kv_dim,
-                                        kv_head_num, head_num, head_size, num_splits, head_groups,
-                                        stream);
-  } else if (vq) {
-    launch_paged_attn_split<true, false>(heads_per_warp, chunks, grid, positions.ptr<int32_t>(),
-                                         batch, block_table.ptr<int32_t>(), table_stride,
-                                         num_blocks, block_size, block_shift, layer_idx, dim, query,
-                                         partials, kcache, vcache, kcache_i8, vcache_i8, kscale,
-                                         vscale, kv_dim, kv_head_num, head_num, head_size,
-                                         num_splits, head_groups, stream);
+    launch_paged_attn_split<true, true>(PAGED_SPLIT_ARGS);
   } else {
-    launch_paged_attn_split<false, false>(heads_per_warp, chunks, grid, positions.ptr<int32_t>(),
-                                          batch, block_table.ptr<int32_t>(), table_stride,
-                                          num_blocks, block_size, block_shift, layer_idx, dim,
-                                          query, partials, kcache, vcache, kcache_i8, vcache_i8,
-                                          kscale, vscale, kv_dim, kv_head_num, head_num, head_size,
-                                          num_splits, head_groups, stream);
+    launch_paged_attn_split<false, false>(PAGED_SPLIT_ARGS);
   }
+#undef PAGED_SPLIT_ARGS
   CUDA_KERNEL_CHECK();
 
   // Combine pass: one block per (row, head) pair, one output dim per thread.
@@ -1474,7 +1623,7 @@ __global__ void paged_prefill_kernel_bf16(
     const __nv_bfloat16* __restrict__ key_cache, const __nv_bfloat16* __restrict__ value_cache,
     const int8_t* __restrict__ key_cache_i8, const int8_t* __restrict__ value_cache_i8,
     const float* __restrict__ key_scale, const float* __restrict__ value_scale, int32_t kv_dim,
-    int32_t kv_head_num, int32_t head_num, int32_t head_size) {
+    int32_t kv_head_num, int32_t head_num, int32_t head_size, bool v4) {
   constexpr int kVec = 4;       // head dims per lane (one uint2 load per row)
   constexpr int kGroup = 4;     // positions sharing one softmax rescale (as in decode)
   constexpr int kTileKv = 64;   // KV rows staged per tile
@@ -1637,7 +1786,13 @@ __global__ void paged_prefill_kernel_bf16(
         const int64_t src = layer_base + static_cast<int64_t>(pg) * (block_size * kv_dim) +
                             static_cast<int64_t>(gpos & (block_size - 1)) * kv_dim + kv_head_off +
                             ch;
-        stage_kv_row_chunk<QUANT>(&s_v[r][ch], &s_v8[r][ch], value_cache, value_cache_i8, vq, src);
+        // The 4-bit tile is packed the same way the pool is (dim d in byte
+        // d/2), so this chunk stages at byte ch/2 — half of the int8 arm's row,
+        // in the same storage. `ch` stays an element offset (the source side
+        // halves inside the helper); the chunk count and the tile stride are
+        // unchanged, which is why only the address moves.
+        stage_v_row_chunk<QUANT>(&s_v[r][ch], &s_v8[r][v4 ? (ch >> 1) : ch], value_cache,
+                                 value_cache_i8, vq, v4, src);
       }
     }
     __syncthreads();
@@ -1659,7 +1814,7 @@ __global__ void paged_prefill_kernel_bf16(
           // The K/V slice of a kv head is shared by all G q heads, so it is
           // read once per (position, lane) and reused across the head loop.
           load_kv_chunk4<QUANT>(kf[j], s_k[sp + j], s_k8[sp + j], kq, lane * kVec);
-          load_kv_chunk4<QUANT>(vf[j], s_v[sp + j], s_v8[sp + j], vq, lane * kVec);
+          load_v_chunk4<QUANT>(vf[j], s_v[sp + j], s_v8[sp + j], vq, v4, lane * kVec);
           if constexpr (QUANT) {
             if (kq) ks[j] = s_ks[sp + j];
             if (vq) vs[j] = s_vs[sp + j];
@@ -1729,7 +1884,7 @@ __global__ void paged_prefill_kernel_bf16(
         float kf[kVec];
         float vf[kVec];
         load_kv_chunk4<QUANT>(kf, s_k[sp], s_k8[sp], kq, lane * kVec);
-        load_kv_chunk4<QUANT>(vf, s_v[sp], s_v8[sp], vq, lane * kVec);
+        load_v_chunk4<QUANT>(vf, s_v[sp], s_v8[sp], vq, v4, lane * kVec);
         float ks1 = 0.f;
         float vs1 = 0.f;
         if constexpr (QUANT) {
@@ -1789,12 +1944,12 @@ static void launch_paged_prefill(int32_t heads_per_kv, const dim3& grid, const d
                                  const __nv_bfloat16* value_cache, const int8_t* key_cache_i8,
                                  const int8_t* value_cache_i8, const float* key_scale,
                                  const float* value_scale, int32_t kv_dim, int32_t kv_head_num,
-                                 int32_t head_num, int32_t head_size, cudaStream_t stream) {
+                                 int32_t head_num, int32_t head_size, bool v4, cudaStream_t stream) {
 #define LAUNCH_PAGED_PREFILL(G)                                                             \
   paged_prefill_kernel_bf16<G, QUANT><<<grid, block, 0, stream>>>(                          \
       positions, seq_row_start, block_table, table_stride, num_blocks, block_size,          \
       block_shift, layer_idx, dim, query, output, key_cache, value_cache, key_cache_i8,      \
-      value_cache_i8, key_scale, value_scale, kv_dim, kv_head_num, head_num, head_size)
+      value_cache_i8, key_scale, value_scale, kv_dim, kv_head_num, head_num, head_size, v4)
   switch (heads_per_kv) {
     case 1: LAUNCH_PAGED_PREFILL(1); break;
     case 2: LAUNCH_PAGED_PREFILL(2); break;
@@ -1903,6 +2058,8 @@ void paged_prefill_attention_cu_batch(int32_t row_begin, int32_t head_num, int32
   // the kernel selects on it (see paged_attention_cu_batch).
   const bool kq = key_cache.data_type() == base::DataType::kDataTypeInt8;
   const bool vq = value_cache.data_type() == base::DataType::kDataTypeInt8;
+  const bool v4 =
+      vq && kv_pool_is_v4(value_cache, kv_dim, "paged_prefill_attention_cu_batch: value_cache");
   const __nv_bfloat16* kcache = kq ? nullptr : key_cache.ptr<__nv_bfloat16>();
   const __nv_bfloat16* vcache = vq ? nullptr : value_cache.ptr<__nv_bfloat16>();
   const int8_t* kcache_i8 = kq ? key_cache.ptr<int8_t>() : nullptr;
@@ -1914,12 +2071,12 @@ void paged_prefill_attention_cu_batch(int32_t row_begin, int32_t head_num, int32
     launch_paged_prefill<true>(heads_per_kv, grid, block, pos, row_map, table, table_stride,
                                num_blocks, block_size, block_shift, layer_idx, dim, query, output,
                                kcache, vcache, kcache_i8, vcache_i8, kscale, vscale, kv_dim,
-                               kv_head_num, head_num, head_size, stream);
+                               kv_head_num, head_num, head_size, v4, stream);
   } else {
     launch_paged_prefill<false>(heads_per_kv, grid, block, pos, row_map, table, table_stride,
                                 num_blocks, block_size, block_shift, layer_idx, dim, query, output,
                                 kcache, vcache, kcache_i8, vcache_i8, kscale, vscale, kv_dim,
-                                kv_head_num, head_num, head_size, stream);
+                                kv_head_num, head_num, head_size, v4, stream);
   }
 }
 
@@ -1953,6 +2110,9 @@ void paged_attention_dispatch(int32_t head_num, int32_t layer_idx, int32_t num_b
     return;
   }
   if (decode_rows > 0) {
+    // The decode rows keep their batch rows [0, decode_rows), and both kernels
+    // read the same cache, so a row's arithmetic does not depend on which side
+    // of the split it landed.
     paged_attention_cu_batch(head_num, layer_idx, num_blocks, block_size, kv_dim, kv_head_num,
                              head_size, row_range_view(positions, 0, decode_rows, 0),
                              row_range_view(block_table, 0, decode_rows, table_stride),

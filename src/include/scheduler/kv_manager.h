@@ -8,22 +8,36 @@
 
 namespace scheduler {
 
-// Which halves of the KV cache are int8-quantized. A bitmask, because during
-// the PPL gate a regression has to be attributable: a K error corrupts the
-// score BEFORE the softmax (it can reorder attention entirely) while a V error
-// corrupts the weighted sum AFTER it (it scales the output, it cannot move the
-// attention). One combined number cannot tell those apart.
+// How the KV cache is quantized. There is exactly one quantized shape left:
+// K at 8 bits per value (one value per byte) and V at 4 bits per value (two
+// values per byte, symmetric around zero, per-(token, kv head) fp32 scale),
+// with the V pool row kv_dim/2 bytes long. Both halves are always quantized
+// together, so this is a switch rather than a mask — and it is spelled 1, the
+// way a switch is.
+//
+// The number is where the old bitmask left off rather than a fresh coinage:
+// 1 was "K only" and 5 was "K int8 + V int4" while the mask existed, and 5 is
+// what every log and reproduce command in results/ says. Both digits still
+// select this arm (see kv_quant_from_env), so an old command line keeps
+// working — but a script that exported 1 expecting K-only now gets K and V
+// quantized, which is the one spelling whose meaning changed.
+//
+// K has no 4-bit mode: a K error moves the softmax itself, which no downstream
+// scaling can undo, so K stays at 8 bits while V — whose error only scales the
+// weighted sum after the softmax — takes the aggressive mode.
 enum KvQuant : int {
-  kKvQuantNone = 0,
-  kKvQuantK = 1,
-  kKvQuantV = 2,
-  kKvQuantBoth = kKvQuantK | kKvQuantV,
+  kKvQuantNone = 0,  // bf16 pool
+  kKvQuantK8V4 = 1,  // K int8 + V int4
 };
 
-// LLAMA_KV_QUANT — "0"/"off" (default, unset) / "1"/"kv"/"both"/"all" /
-// "k"/"key" / "v"/"value". Anything else is a LOG(FATAL): a typo silently
-// leaving quantization off would look like "no speedup and no PPL change",
-// which is the most expensive possible way to find the mistake.
+// LLAMA_KV_QUANT — "0"/"off" (default, unset) / "1"/"kv4"/"k+v4" (and the old
+// spelling "5", which selected exactly this arm before the mask collapsed).
+// Anything else is a LOG(FATAL): a typo silently leaving quantization off would
+// look like "no speedup and no PPL change", which is the most expensive
+// possible way to find the mistake. The removed arms' other spellings ("2",
+// "3", "4", "k", "v", "v4", "kv", …) are an error rather than an alias, for the
+// same reason — a run that quietly means a different precision produces a
+// number nobody can attribute.
 int kv_quant_from_env();
 
 class KVManager {
@@ -38,9 +52,9 @@ class KVManager {
   // block_size: physical block size of the paged pool (default 16). Only used
   //   in paged mode, where the constructor CHECKs it is a power of two >= 4
   //   dividing 256 (kernel geometry).
-  // kv_quant: which halves to store as int8 (KvQuant bitmask). Only the paged
-  //   CUDA layout can be quantized — the continuous layout puts the token index
-  //   in the last (fastest) dim, so a per-token scale would be a strided
+  // kv_quant: whether to store the cache quantized (KvQuant: 0 or 5). Only the
+  //   paged CUDA layout can be quantized — the continuous layout puts the token
+  //   index in the last (fastest) dim, so a per-token scale would be a strided
   //   access — and asking for it anywhere else is a LOG(FATAL) rather than a
   //   silent fallback to bf16.
   // The constructor LOG(FATAL)s if the pool tensors fail to allocate, so a
@@ -81,20 +95,25 @@ class KVManager {
   long long pool_bytes() const;
 
   // int8 dequantization scales, one fp32 per (block, kv_head, pos_in_block) —
-  // see the layout note on the members. Empty tensors unless the matching bit
-  // is set in kv_quant().
+  // see the layout note on the members. Empty tensors unless quantized().
   //
-  // These are SEPARATE pools rather than one combined tensor so that a K-only
-  // or V-only run leaves the other one untouched (zero cost, and the PPL gate
-  // can switch halves independently while sharing one allocation path).
+  // These are SEPARATE pools rather than one combined tensor so that the two
+  // halves keep their own allocation and addressing: K's scale is consumed by
+  // the score, V's by the weighted sum, and folding them into one tensor would
+  // only make the two readers agree on a layout neither of them wants.
   tensor::Tensor& key_scale_cache() { return key_scale_cache_; }
   tensor::Tensor& value_scale_cache() { return value_scale_cache_; }
   const tensor::Tensor& key_scale_cache() const { return key_scale_cache_; }
   const tensor::Tensor& value_scale_cache() const { return value_scale_cache_; }
 
   int kv_quant() const { return kv_quant_; }
-  bool key_is_quantized() const { return (kv_quant_ & kKvQuantK) != 0; }
-  bool value_is_quantized() const { return (kv_quant_ & kKvQuantV) != 0; }
+  // One test, not three: with a single quantized shape, "is K int8", "is V
+  // quantized" and "is V 4-bit" are the same question (see the KvQuant note).
+  // The attention kernels still detect the widths from the pools' own last dims
+  // (see kv_pool_is_v4 in the CUDA kernels) rather than from a flag threaded
+  // through every call — the shape is the one thing that follows the tensor
+  // everywhere — so this predicate is only about the pool the manager built.
+  bool quantized() const { return kv_quant_ != kKvQuantNone; }
 
   tensor::Tensor& key_cache() { return key_cache_; }
   tensor::Tensor& value_cache() { return value_cache_; }
@@ -115,7 +134,10 @@ class KVManager {
 
   // Paged layout: [num_layers, num_blocks, block_size, kv_dim].
   // Continuous layout: [num_layers, max_batch, kv_dim, max_seq_len].
-  // Quantized (paged only) the same paged shape in int8.
+  // Quantized (paged only) the same paged shape in int8 — except V's, whose
+  // last dim is kv_dim/2 (two 4-bit values per byte). The last dim is what the
+  // kernels read the width back from; it must stay the ONLY place the V pool's
+  // width is expressed.
   tensor::Tensor key_cache_;
   tensor::Tensor value_cache_;
 

@@ -242,7 +242,6 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
   const void* value_scale_ptr = (value_scale != nullptr && !value_scale->is_empty())
                                     ? value_scale->get_buffer()->ptr()
                                     : nullptr;
-
   // Validate the Scheduler-owned pointers baked into the graph at capture
   // time. KV caches and the logits buffer belong to the Scheduler instance;
   // after the Scheduler is destroyed and a new one created (benchmark
