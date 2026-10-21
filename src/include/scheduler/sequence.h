@@ -36,6 +36,31 @@ struct Sequence {
   // spreads the cost over distinct sequences instead of concentrating it.
   int preempt_count = 0;
 
+  // S4 K-quantization progress. Tokens [0, k_quantized_tokens) have their K
+  // in the packed int4 pool; the remaining k_residual_count tokens (always
+  // fewer than group_size, and all inside the last, partially filled block)
+  // live in the BF16 residual window. The split is derived from the committed
+  // KV length and the group size, never incremented blindly, so a truncation
+  // that keeps whole blocks rolls it back consistently: every retained block
+  // consists of complete groups, hence k_residual_count = 0 after a cut.
+  int k_quantized_tokens = 0;
+  int k_residual_count = 0;
+
+  // Recompute the S4 counters from the currently committed KV length. Call
+  // after a prefill chunk, a decode step, and a truncation. group_size == 0
+  // (bf16 cache) leaves the counters at their initial values.
+  void sync_kv_quant_state(int group_size) {
+    if (group_size <= 0) {
+      k_quantized_tokens = 0;
+      k_residual_count = 0;
+      return;
+    }
+    const int kv_len = is_prefill_complete ? num_prompt_tokens + num_generated_tokens
+                                           : next_prefill_chunk_start;
+    k_quantized_tokens = (kv_len / group_size) * group_size;
+    k_residual_count = kv_len - k_quantized_tokens;
+  }
+
   // Prefix-cache progress: prefix_hash_chain[b] is the chained hash of prompt
   // block b, and the chain's length is how many leading prompt blocks have
   // already been recorded in the cache. The chain is built incrementally as

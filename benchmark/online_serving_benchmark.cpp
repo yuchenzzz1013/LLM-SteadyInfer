@@ -37,6 +37,7 @@
 #include "bench_common.h"
 
 #include <cuda_runtime.h>
+#include <cstdlib>
 
 #include <algorithm>
 #include <chrono>
@@ -89,8 +90,8 @@ struct Args {
   // --prefix-cache 1 打开。
   int prefix_cache = 0;
 
-  // KV 量化掩码 (scheduler::KvQuant): 0=off, 1=K int8, 2=V int8, 3=K+V int8,
-  // 4=V int4, 5=K int8+V int4;
+  // KV 量化 (scheduler::KvQuant): 0=off, 6=S4 (K int4 分组 + BF16 残差,
+  // V int4 非对称); 旧 mask 取值 1/2/3/4/5 现在都会 FATAL。
   // -1 = 读 LLAMA_KV_QUANT 环境变量(与 Scheduler 的默认解析一致)。
   int kv_quant = -1;
 };
@@ -169,8 +170,8 @@ static Args parse_args(int argc, char** argv) {
   // 掩码写错(比如按开关的思路写 7)不能在 KVManager 的 CHECK 里才炸:那时模型
   // 都加载完了。这里直接拒绝,顺带把编码再讲一遍。只认 0 和 1 —— 2/3/4 三条臂
   // 已随掩码收敛删除,当别名用会跑出一个没人能归因的数。
-  if (a.kv_quant != -1 && a.kv_quant != 0 && a.kv_quant != scheduler::kKvQuantK8V4) {
-    LOG(FATAL) << "--kv-quant 必须是 0(off) 或 1(K int8 + V int4),或 -1(= 读 "
+  if (a.kv_quant != -1 && a.kv_quant != 0 && a.kv_quant != scheduler::kKvQuantS4) {
+    LOG(FATAL) << "--kv-quant 必须是 0(off) 或 6(S4: K int4 分组+残差窗口, V int4 非对称),或 -1(= 读 "
                   "LLAMA_KV_QUANT)。得到: "
                << a.kv_quant;
   }
@@ -231,7 +232,7 @@ static void print_usage(const char* prog) {
       << "                         极低,开着只会把已完成请求的 prompt 块钉在池里并\n"
       << "                         计入哈希开销;要看净收益用\n"
       << "                         prefix_caching_benchmark 的 A/B\n"
-      << "  --kv-quant <0|1>       KV Cache 量化:0=off,1=K int8 + V int4\n"
+      << "  --kv-quant <0|6>       KV Cache 量化:0=off,6=S4(K int4 分组+残差, V int4 非对称)\n"
       << "                         (默认 -1 = 读 LLAMA_KV_QUANT 环境变量)。仅 Paged\n"
       << "                         CUDA 布局;开启后 KV 池按 K 1B + V 0.5B/值估算,\n"
       << "                         autobatch 的并发上限随之放宽\n"
@@ -245,7 +246,7 @@ struct ServingMetrics {
   int num_requests = 0, submitted = 0, completed = 0, rejected = 0, dropped = 0;
   // 本轮实际生效的调度配置(autobatch 会自动放大 max_batch,写进 CSV 才能复现)
   int max_batch = 0, max_gen = 0, block_size = 0;
-  int kv_quant = 0;  // 生效的量化掩码(0=off, 1=K int8 + V int4)
+  int kv_quant = 0;  // 生效的量化值(0=off, 6=S4)
   bool auto_batch = false;  // max_batch 是否由空闲显存自动决定
   // 正式窗口内的 CUDA graph 捕获开销(预热后清零,见 offline 同名字段)
   long long graph_captures = 0, graph_evictions = 0;
@@ -323,8 +324,8 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
   const int block_size = Scheduler::resolve_block_size(avg_prompt_len);
   // 本轮生效的量化掩码:--kv-quant 优先,否则与 Scheduler 一样读
   // LLAMA_KV_QUANT。下面的 autobatch 估算与 Scheduler 构造共用这一个值,
-  // 不允许"估的是 bf16、跑的是 int8"这种口径裂缝(那会让估算出的并发上限
-  // 白白少一半)。
+  // 不允许"估的是 bf16、跑的是别的量化形态"这种口径裂缝(那会让估算出的
+  // 并发上限与实际可容纳量不符)。
   const int kv_quant = args.kv_quant >= 0 ? args.kv_quant : scheduler::kv_quant_from_env();
 
   // ---- 自适应 max_batch ----
@@ -340,21 +341,57 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
   int max_batch = requested_batch;
   {
     const int64_t blocks_per_seq = (max_total_seq_len + block_size - 1) / block_size;
-    // 每 sequence 的 KV 池字节 = 它那份 [num_layers, blocks_per_seq, block_size,
-    // kv_dim] x {K,V};元素未量化 2B(bf16),量化后 K 是 1B(int8)、V 是半字节
-    // (4-bit,每字节两个值,行只有一半长,见 KVManager)。另加每个量化张量一份
-    // fp32 scale 池 [num_layers, blocks_per_seq, kv_head_num, block_size] —— 与
-    // KVManager 的分配同款布局,照抄公式而不是拍个系数(4-bit 的 scale 粒度不变,
-    // 仍是每个 (token, kv head) 一个 fp32)。
+    // 每 sequence 的 KV 池字节，必须与 KVManager 的实际分配同款布局：
+    //   bf16: K + V 各 2 B/元素。
+    //   S4 : K、V 都是 int4（0.5 B/元素），外加
+    //        - K scale + zero: 每 (layer, block, group-in-block, channel group)
+    //        - V scale + zero: 每 (layer, block, kv head, pos-in-block)
+    //        - K BF16 残差窗口: 每 (layer, sequence, group_size, kv_dim)
+    // 旧公式（K 1B + V 0.5B + 两份对称 scale）是 K int8 + V int4 的布局，
+    // 套到 S4 上会高估每 sequence 的 KV，从而把 autobatch 的 max_batch
+    // 压在旧方案的水平（这正是"最大 BS 和 K int8+V int4 一样"的原因）。
     const bool quant = kv_quant != scheduler::kKvQuantNone;
     const int64_t k_elems = static_cast<int64_t>(model->layer_num()) * blocks_per_seq *
                             block_size * model->kv_dim();
-    // 4-bit: 两个值挤进一字节,所以 V 那半按 0.5B/元素算。
-    const int64_t v_elems = quant ? k_elems / 2 : k_elems;
-    const int64_t scale_elems = static_cast<int64_t>(model->layer_num()) * blocks_per_seq *
-                                block_size * model->kv_head_num();
-    const int64_t bytes_per_seq = k_elems * (quant ? 1 : 2) + v_elems * (quant ? 1 : 2) +
-                                  scale_elems * 4 * (quant ? 2 : 0);
+    int64_t bytes_per_seq = 0;
+    if (!quant) {
+      bytes_per_seq = k_elems * 2 + k_elems * 2;
+    } else {
+      // Resolve the same S4 grouping KVManager will use (env > default). Keep
+      // these rules in sync with KVManager's constructor.
+      auto env_positive = [](const char* name) -> int {
+        const char* raw = std::getenv(name);
+        if (raw == nullptr || raw[0] == '\0') return 0;
+        return std::max(0, std::atoi(raw));
+      };
+      const int kv_dim = model->kv_dim();
+      const int kv_head_num = model->kv_head_num();
+      CHECK_GT(kv_head_num, 0);
+      const int head_size = kv_dim / kv_head_num;
+      const int group_size_env = env_positive("LLAMA_KV_GROUP_SIZE");
+      const int channel_group_env = env_positive("LLAMA_KV_CHANNEL_GROUP");
+      const int group_size = group_size_env > 0 ? group_size_env : block_size;
+      const int channel_group =
+          channel_group_env > 0
+              ? channel_group_env
+              : (head_size % 8 == 0 ? 8 : head_size);
+      CHECK(group_size > 0 && block_size % group_size == 0)
+          << "LLAMA_KV_GROUP_SIZE=" << group_size << " must divide block_size=" << block_size;
+      CHECK(channel_group > 0 && kv_dim % channel_group == 0)
+          << "LLAMA_KV_CHANNEL_GROUP=" << channel_group << " must divide kv_dim=" << kv_dim;
+      const int groups_per_block = block_size / group_size;
+      const int channel_groups = kv_dim / channel_group;
+      const int64_t k_meta = static_cast<int64_t>(model->layer_num()) * blocks_per_seq *
+                             groups_per_block * channel_groups;
+      const int64_t v_meta = static_cast<int64_t>(model->layer_num()) * blocks_per_seq *
+                             kv_head_num * block_size;
+      const int64_t residual = static_cast<int64_t>(model->layer_num()) * group_size * kv_dim;
+      // K + V packed rows, 4 fp32 metadata pools (scale+zero for K and V), and
+      // this sequence's share of the BF16 residual window.
+      bytes_per_seq = k_elems / 2 + k_elems / 2 + (k_meta + v_meta) * 4 * 2 + residual * 2;
+      std::cout << "[AUTOBATCH] S4 footprint: group_size=" << group_size
+                << " channel_group=" << channel_group << "\n";
+    }
     size_t free_b = 0, total_b = 0;
     if (bytes_per_seq > 0 && cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
       // 预留给 logits 缓冲、每步临时张量、显存碎片,以及最容易被低估的一块:
@@ -367,9 +404,12 @@ static ServingMetrics serve_once(const std::shared_ptr<model::Model>& model,
       const int fit = static_cast<int>(budget / bytes_per_seq);
       if (!args.max_batch_explicit) {
         max_batch = std::clamp(fit, 1, 256);
+        // 同时打印未截断的 fit 和上限：两者都等于 256 时，bf16 与 S4 看起来
+        // "最大 BS 一样"，其实只是都撞到了 CUDA-graph 内存保护上限。
         std::cout << "[AUTOBATCH] max_batch 未显式指定,按空闲显存自动取 " << max_batch
-                  << " (每 sequence KV " << (bytes_per_seq >> 20) << " MB, 空闲 "
-                  << (free_b >> 30) << " GB, 预留 " << (reserve >> 30) << " GB)\n";
+                  << " (fit=" << fit << ", cap=256, 每 sequence KV "
+                  << (bytes_per_seq >> 20) << " MB, 空闲 " << (free_b >> 30)
+                  << " GB, 预留 " << (reserve >> 30) << " GB)\n";
       } else if (requested_batch > fit) {
         max_batch = std::max(1, fit);
         std::cout << "[AUTOBATCH] 警告:--max-batch " << requested_batch << " 需要 "

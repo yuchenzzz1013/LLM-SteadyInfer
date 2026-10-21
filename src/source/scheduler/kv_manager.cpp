@@ -12,26 +12,42 @@ int kv_quant_from_env() {
   // Case-insensitive: the value is typed by hand on a command line.
   std::string v(raw);
   for (char& c : v) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
-  // "1" is the switch itself, identical to the Scheduler constructor argument
-  // and the benchmarks' --kv-quant, so the two entry points cannot be read
-  // against each other. "5" is accepted as the same thing because that is what
-  // the arm used to be called while the mask existed and what every reproduce
-  // command in results/ says; both spellings select one arm, so accepting both
-  // cannot be ambiguous. Every other digit is a LOG(FATAL) rather than an alias,
-  // because 2/3/4 named precisions this build no longer has and quietly handing
-  // back a different one produces a number nobody can attribute.
+  // "6" is the switch: the number is the arm's enum value, identical to the
+  // Scheduler constructor argument and the benchmarks' --kv-quant, so the two
+  // entry points cannot be read against each other. Every other value is a
+  // LOG(FATAL) rather than an alias — in particular 1 and 5 named the removed
+  // K-int8 + V-int4 shape, and 2/3/4 named mask arms that no longer exist.
+  // Quietly resolving any of them to a different precision would produce a
+  // number nobody can attribute.
   if (v == "0" || v == "off" || v == "none" || v == "false") return kKvQuantNone;
-  if (v == "1" || v == "kv4" || v == "k+v4" || v == "5") return kKvQuantK8V4;
+  if (v == "6" || v == "s4") return kKvQuantS4;
   LOG(FATAL) << "LLAMA_KV_QUANT: unrecognized value '" << raw
-             << "' (expected 0/off or 1/kv4 — K int8 + V int4; the arms 2 (V int8), "
-                "3 (K+V int8) and 4 (V int4 over a bf16 K) were removed, and 1 used to "
-                "mean \"K only\" while the mask existed)";
+             << "' (expected 0/off or 6/s4 — S4: K int4 grouped with a BF16 residual "
+                "window + V int4 asymmetric). The old K-int8 + V-int4 spellings 1 and 5, "
+                "and the removed mask arms 2/3/4, are hard errors: rewrite reproduce "
+                "commands to use 6.";
   return kKvQuantNone;
+}
+
+// Read a non-negative integer tunable from the environment. Unset, empty and
+// "0" all mean "use the built-in default" (the caller passes 0). Anything that
+// does not parse as a non-negative integer is a hard error: a typo must not
+// silently fall back to a different grouping.
+static int grouping_from_env(const char* name) {
+  const char* raw = std::getenv(name);
+  if (raw == nullptr || raw[0] == '\0') return 0;
+  char* end = nullptr;
+  const long value = std::strtol(raw, &end, 10);
+  CHECK(end != nullptr && *end == '\0' && value >= 0)
+      << name << ": expected a non-negative integer, got '" << raw << "'";
+  CHECK(value <= 4096) << name << "=" << value << " is unreasonably large";
+  return static_cast<int>(value);
 }
 
 KVManager::KVManager(int num_layers, int max_batch, int max_seq_len, int kv_dim,
                      int kv_head_num, std::shared_ptr<base::DeviceAllocator> alloc,
-                     base::DeviceType device, int block_size, int kv_quant)
+                     base::DeviceType device, int block_size, int kv_quant, int group_size,
+                     int channel_group)
     : num_layers_(num_layers),
       max_batch_(max_batch),
       max_seq_len_(max_seq_len),
@@ -50,26 +66,27 @@ KVManager::KVManager(int num_layers, int max_batch, int max_seq_len, int kv_dim,
       << "KV quantization (LLAMA_KV_QUANT) is only implemented for the paged CUDA layout "
          "(USE_PAGED_ATTENTION + device=kDeviceCUDA); requested mask="
       << kv_quant << ", paged=" << paged_;
-  // Mask validation: exactly two values, and the removed ones are an error
-  // rather than an alias for 5. A driver or a script that still passes 1/2/3/4
-  // is asking for a precision this build does not have; resolving it to "K int8
-  // + V int4" would produce a PPL number attributed to an arm that never ran.
-  CHECK(kv_quant == kKvQuantNone || kv_quant == kKvQuantK8V4)
-      << "Invalid KV quantization mask " << kv_quant
-      << " (expected 0 for off or 1 for K int8 + V int4; the arms 2 (V int8), 3 (K+V int8) "
-         "and 4 (V int4 over a bf16 K) were removed)";
+  // Value validation: exactly two values, and the removed ones are an error
+  // rather than an alias for S4. A driver or a script that still passes
+  // 1/2/3/4/5 is asking for a precision this build does not have; resolving it
+  // to S4 would produce a PPL number attributed to an arm that never ran.
+  CHECK(kv_quant == kKvQuantNone || kv_quant == kKvQuantS4)
+      << "Invalid KV quantization value " << kv_quant
+      << " (expected 0 for off or 6 for S4: K int4 grouped with a BF16 residual window + "
+         "V int4 asymmetric). The old K-int8 + V-int4 values 1 and 5 and the removed mask "
+         "arms 2/3/4 are hard errors.";
   kv_quant_ = kv_quant;
 
-  // The 4-bit V residual window is gone. Every script and reproduce command in
-  // results/ exported LLAMA_KV_WINDOW, and a run that still sets it would
-  // silently measure the windowless regime while its own logs claim otherwise,
-  // so it is a hard error rather than an ignored variable.
+  // LLAMA_KV_WINDOW belonged to the removed V residual-window experiment. S4's
+  // K residual window is sized by group_size, not by this variable, so a run
+  // that still exports it would silently measure a different configuration
+  // while its logs claim otherwise. Hard error rather than ignored.
   const char* window_env = std::getenv("LLAMA_KV_WINDOW");
   CHECK(window_env == nullptr)
       << "LLAMA_KV_WINDOW=" << window_env
-      << " is no longer supported: the 4-bit V residual window was removed, and the KV cache "
-         "is now the quantized pool alone (kv_quant 5 stores K int8 and V int4). Unset it — "
-         "any value here, including 0, is a leftover.";
+      << " is no longer supported: the removed V residual window has no replacement, and "
+         "S4's K residual window is controlled by LLAMA_KV_GROUP_SIZE. Unset it — any value "
+         "here, including 0, is a leftover.";
 
   if (paged_) {
     // Paged layout: [num_layers, num_blocks, block_size, kv_dim]. One block
@@ -105,6 +122,40 @@ KVManager::KVManager(int num_layers, int max_batch, int max_seq_len, int kv_dim,
 #endif
   }
 
+  // Resolve the S4 grouping. The defaults are chosen so that a default
+  // configuration is always valid: group_size == block_size makes every
+  // physical page exactly one quantization group, and channel_group is 32 when
+  // the head is a multiple of it (the served head sizes are 64 and 128),
+  // otherwise the whole head is one group.
+  if (quantized()) {
+    const int resolved_group =
+        group_size > 0 ? group_size : grouping_from_env("LLAMA_KV_GROUP_SIZE");
+    const int resolved_channel =
+        channel_group > 0 ? channel_group : grouping_from_env("LLAMA_KV_CHANNEL_GROUP");
+    CHECK(kv_head_num_ > 0 && kv_dim_ % kv_head_num_ == 0)
+        << "S4 K quantization needs kv_dim divisible by kv_head_num, got kv_dim=" << kv_dim_
+        << " kv_head_num=" << kv_head_num_;
+    const int head_size = kv_dim_ / kv_head_num_;
+    group_size_ = resolved_group > 0 ? resolved_group : block_size_;
+    // Default to 8 channels per scale pair: the PPL sweep on Qwen3-4B
+    // (32x4096-equivalent sample) put it closest to BF16, while 32 was
+    // measurably coarser. head_size is a multiple of 8 on every paged
+    // geometry, so 8 always divides.
+    channel_group_ = resolved_channel > 0
+                         ? resolved_channel
+                         : (head_size % 8 == 0 ? 8 : head_size);
+    CHECK(group_size_ % 4 == 0 && block_size_ % group_size_ == 0)
+        << "S4 group_size=" << group_size_ << " must be a multiple of 4 dividing block_size="
+        << block_size_ << " (LLAMA_KV_GROUP_SIZE)";
+    CHECK(channel_group_ % 4 == 0 && head_size % channel_group_ == 0)
+        << "S4 channel_group=" << channel_group_
+        << " must be a multiple of 4 dividing head_size=" << head_size
+        << " (LLAMA_KV_CHANNEL_GROUP)";
+    CHECK(kv_dim_ % 2 == 0) << "4-bit K/V need an even kv_dim, got " << kv_dim_;
+    groups_per_block_ = block_size_ / group_size_;
+    channel_groups_ = kv_dim_ / channel_group_;
+  }
+
   // All CUDA kernels (scatter / attention / decode) address the cache as
   // raw bf16, so allocate BF16 on CUDA and keep FP32 only on the CPU path
   // (whose FP32 fallback kernels read float pointers). This halves KV
@@ -120,32 +171,30 @@ KVManager::KVManager(int num_layers, int max_batch, int max_seq_len, int kv_dim,
     // + pos_in_block * row_bytes + d
     // d-innermost within a page: the flash-decoding kernels walk consecutive
     // positions contiguously, crossing page boundaries through block_table.
-    // Quantized, the same shape in int8 (half the bytes) — the addressing
-    // arithmetic is unchanged, only the element size and the load width are.
-    //
-    // The V pool is the same int8 dtype with row_bytes = kv_dim/2: dim d lives
-    // in byte d/2, low nibble for even d. The last dim is the discriminator the
-    // kernels read the width from, so it is set here and nowhere else.
+    // Quantized, both pools are int8 with row_bytes = kv_dim/2: dim d lives in
+    // byte d/2, the low nibble for even d. The last dim is the width the
+    // kernels read back, so it is set here and nowhere else.
     const base::DataType cached_dtype =
         quantized() ? base::DataType::kDataTypeInt8 : kv_dtype;
-    const int value_row_bytes = quantized() ? kv_dim_ / 2 : kv_dim_;
-    if (quantized()) {
-      CHECK(kv_dim_ % 2 == 0)
-          << "4-bit V needs an even kv_dim (two values per byte), got " << kv_dim_;
-    }
-    key_cache_ = tensor::Tensor(cached_dtype, num_layers_, num_blocks_, block_size_, kv_dim_,
+    const int row_elements = quantized() ? kv_dim_ / 2 : kv_dim_;
+    key_cache_ = tensor::Tensor(cached_dtype, num_layers_, num_blocks_, block_size_, row_elements,
                                 true, alloc);
     value_cache_ = tensor::Tensor(cached_dtype, num_layers_, num_blocks_, block_size_,
-                                  value_row_bytes, true, alloc);
+                                  row_elements, true, alloc);
 
-    // Scale pools, one fp32 per (layer, block, kv_head, pos_in_block). Only
-    // allocated when quantized; the addressing (and why pos is the innermost
-    // dim) is documented on the members in the header.
+    // S4 metadata pools (see the layout note on the members). Only allocated
+    // when quantized.
     if (quantized()) {
       key_scale_cache_ = tensor::Tensor(base::DataType::kDataTypeFp32, num_layers_, num_blocks_,
-                                        kv_head_num_, block_size_, true, alloc);
+                                        groups_per_block_, channel_groups_, true, alloc);
+      key_zero_cache_ = tensor::Tensor(base::DataType::kDataTypeFp32, num_layers_, num_blocks_,
+                                       groups_per_block_, channel_groups_, true, alloc);
       value_scale_cache_ = tensor::Tensor(base::DataType::kDataTypeFp32, num_layers_,
                                           num_blocks_, kv_head_num_, block_size_, true, alloc);
+      value_zero_cache_ = tensor::Tensor(base::DataType::kDataTypeFp32, num_layers_,
+                                         num_blocks_, kv_head_num_, block_size_, true, alloc);
+      key_residual_cache_ = tensor::Tensor(base::DataType::kDataTypeBF16, num_layers_, max_batch_,
+                                           group_size_, kv_dim_, true, alloc);
     }
   } else {
     // Head-dim-contiguous layout: cache[layer][slot][d][pos], position
@@ -162,9 +211,12 @@ KVManager::KVManager(int num_layers, int max_batch, int max_seq_len, int kv_dim,
   // later as a CUDA illegal address (or a null-pointer memcpy on CPU), with
   // nothing pointing at the pool size or the knobs that control it. Fail at
   // construction instead, with the numbers needed to size it down.
-  const bool scales_ok =
-      (!quantized() || (!key_scale_cache_.is_empty() && !value_scale_cache_.is_empty()));
-  if (key_cache_.is_empty() || value_cache_.is_empty() || !scales_ok) {
+  const bool metadata_ok =
+      !quantized() ||
+      (!key_scale_cache_.is_empty() && !key_zero_cache_.is_empty() &&
+       !value_scale_cache_.is_empty() && !value_zero_cache_.is_empty() &&
+       !key_residual_cache_.is_empty());
+  if (key_cache_.is_empty() || value_cache_.is_empty() || !metadata_ok) {
     const double pool_gb =
         static_cast<double>(pool_bytes()) / (1024.0 * 1024.0 * 1024.0);
     LOG(FATAL) << "KV pool allocation failed: tried to allocate " << pool_gb << " GB ("
@@ -173,8 +225,10 @@ KVManager::KVManager(int num_layers, int max_batch, int max_seq_len, int kv_dim,
                << " kv_dim=" << kv_dim_
                << (paged_ ? " block_size=" + std::to_string(block_size_) : std::string())
                << (quantized() ? " kv_quant=" + std::to_string(kv_quant_) +
-                                         " (K int8 + V int4, V row packed to kv_dim/2 bytes, "
-                                         "plus the two scale pools)"
+                                         " (S4: K/V int4 packed to kv_dim/2 bytes, K "
+                                         "group_size=" + std::to_string(group_size_) +
+                                         " channel_group=" + std::to_string(channel_group_) +
+                                         ", plus the scale/zero and K-residual pools)"
                                : std::string())
                << "). Lower max_batch / max_seq_len (or the driver's --gpu-mem-fraction) "
                   "and retry.";
@@ -183,14 +237,17 @@ KVManager::KVManager(int num_layers, int max_batch, int max_seq_len, int kv_dim,
 
 long long KVManager::pool_bytes() const {
   // Derived from the dims, so a failed (empty) allocation still reports the
-  // size that was attempted — see the constructor's failure message. The scale
-  // pools are included: they are real cache memory (~1.5% of the int8 pool at
-  // block_size=16, and a driver sizing the pool from the KV dtype alone would
-  // be wrong by exactly that much).
+  // size that was attempted — see the constructor's failure message. The S4
+  // metadata pools are included: they are real cache memory (scale/zero plus
+  // the BF16 residual window), and a driver sizing the pool from the packed
+  // K/V rows alone would understate it by exactly that much.
   return static_cast<long long>(key_cache_.byte_size()) +
          static_cast<long long>(value_cache_.byte_size()) +
          static_cast<long long>(key_scale_cache_.byte_size()) +
-         static_cast<long long>(value_scale_cache_.byte_size());
+         static_cast<long long>(key_zero_cache_.byte_size()) +
+         static_cast<long long>(value_scale_cache_.byte_size()) +
+         static_cast<long long>(value_zero_cache_.byte_size()) +
+         static_cast<long long>(key_residual_cache_.byte_size());
 }
 
 int KVManager::allocate() {

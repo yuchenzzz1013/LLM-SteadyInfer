@@ -61,15 +61,16 @@ struct BatchScratch {
   tensor::Tensor partial_batch;
   // Device copies of the per-token inputs (CUDA graph path reads these).
   // block_table_cu is [batch, block_table_stride]: slot ids (continuous
-  // layout) or physical block ids per position (paged layout).
-  tensor::Tensor tokens_cu, positions_cu, block_table_cu;
+  // layout) or physical block ids per position (paged layout). kv_slots_cu is
+  // the sequence slot of each row, used only by S4's K residual window.
+  tensor::Tensor tokens_cu, positions_cu, block_table_cu, kv_slots_cu;
 
   // Host staging at stable addresses (CUDA graph path writes new values here
-  // before each launch; the token / position H2D uploads are captured graph
-  // nodes). The block table is NOT staged here: its live width changes every
-  // step (see decode_step), so it is uploaded outside the capture straight
-  // into block_table_cu.
-  tensor::Tensor input_ids, positions, input_token_num;
+  // before each launch; the token / position / kv-slot H2D uploads are
+  // captured graph nodes). The block table is NOT staged here: its live width
+  // changes every step (see decode_step), so it is uploaded outside the
+  // capture straight into block_table_cu.
+  tensor::Tensor input_ids, positions, kv_slots, input_token_num;
 
   // Allocate (or keep, when sizes already match) every buffer above.
   // dtype selects the activation element type: kDataTypeBF16 on CUDA models
@@ -109,6 +110,14 @@ struct CudaGraphDecodeEntry {
   // the KVManager of the Scheduler that captured the graph.
   const void* captured_key_scale_ptr = nullptr;
   const void* captured_value_scale_ptr = nullptr;
+  // S4 metadata baked into the same graph: the zero-point pools, the BF16 K
+  // residual window, and the sequence-slot table. They all belong to the
+  // Scheduler's KVManager / staging, so a rebuilt Scheduler invalidates them
+  // exactly like the caches above.
+  const void* captured_key_zero_ptr = nullptr;
+  const void* captured_value_zero_ptr = nullptr;
+  const void* captured_key_residual_ptr = nullptr;
+  const void* captured_kv_slots_ptr = nullptr;
   int32_t captured_key_slots = 0;
   int32_t captured_key_seq_len = 0;
   // Paged-layout geometry baked into the graph (continuous: 0 / 1).
@@ -359,12 +368,18 @@ class Model {
   // In scratch mode the block table is NOT uploaded here: decode_step owns
   // that upload (outside the capture, at the live width).
   // key_scale / value_scale: per-(token, kv head) int8 dequantization scales
-  //   [num_layers, num_blocks, kv_head_num, block_size] fp32 from the
-  //   KVManager, required exactly when the corresponding cache is an int8 pool
-  //   (KVManager::kv_quant) and nullptr for the default bf16 cache — the paged
-  //   attention kernels select their read path on the pool dtype and reject a
-  //   dtype/scale mismatch up front. Ignored by the CPU and continuous-layout
-  //   paths, which have no quantized cache.
+  //   S4 metadata from the KVManager, required as a package exactly when the
+  //   caches are int4 (KVManager::kv_quant) and empty/nullptr for the default
+  //   bf16 cache — the paged attention kernels select their read path on the
+  //   pool dtype and reject a partial package up front:
+  //     key_scale / key_zero   [L, B, groups_per_block, channel_groups] fp32
+  //     value_scale / value_zero [L, B, kv_head_num, block_size] fp32
+  //     key_residual           [L, max_batch, group_size, kv_dim] bf16
+  //     kv_slots               [batch] int32 (one sequence slot per row)
+  //   The grouping is derived from the metadata tensors themselves (their last
+  //   dimensions), so there is no separate knob that could drift from them.
+  //   Ignored by the CPU and continuous-layout paths, which have no quantized
+  //   cache.
   virtual base::Status forward_batch(
       const tensor::Tensor& input_ids,
       const tensor::Tensor& positions,
@@ -379,7 +394,11 @@ class Model {
       BatchScratch* scratch = nullptr,
       int32_t table_cols = 0,
       const tensor::Tensor* key_scale = nullptr,
-      const tensor::Tensor* value_scale = nullptr) const = 0;
+      const tensor::Tensor* value_scale = nullptr,
+      const tensor::Tensor* key_zero = nullptr,
+      const tensor::Tensor* value_zero = nullptr,
+      const tensor::Tensor* key_residual = nullptr,
+      const tensor::Tensor* kv_slots = nullptr) const = 0;
 
   // Decode step with a CUDA-Graph pool: the first call for a given batch size
   // captures the decode kernels into a graph; subsequent calls only stage the
@@ -401,7 +420,11 @@ class Model {
                                    tensor::Tensor& logits,
                                    int32_t table_cols = 0,
                                    const tensor::Tensor* key_scale = nullptr,
-                                   const tensor::Tensor* value_scale = nullptr);
+                                   const tensor::Tensor* value_scale = nullptr,
+                                   const tensor::Tensor* key_zero = nullptr,
+                                   const tensor::Tensor* value_zero = nullptr,
+                                   const tensor::Tensor* key_residual = nullptr,
+                                   const tensor::Tensor* kv_slots = nullptr);
 
   // Cumulative CUDA-graph capture accounting of the decode path (see
   // GraphStats). Counters are never reset implicitly: a driver that measures a
@@ -425,7 +448,8 @@ class Model {
   int32_t layer_num() const { return config_ ? config_->layer_num_ : 0; }
   int32_t kv_dim() const { return config_ ? config_->kv_dim_ : 0; }
   // KV head count (kv_dim = kv_head_num * head_size). The KV pool needs it to
-  // size the int8 scale pools, which hold one scale per (token, kv head).
+  // size the S4 metadata pools (K per token group/channel group, V per
+  // token/kv head).
   int32_t kv_head_num() const { return config_ ? config_->kv_head_num_ : 0; }
   int32_t hidden_dim() const { return config_ ? config_->dim_ : 0; }
   int32_t vocab_size() const { return config_ ? config_->vocab_size_ : 0; }

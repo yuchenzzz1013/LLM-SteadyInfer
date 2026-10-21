@@ -135,7 +135,7 @@ int main(int argc, char* argv[]) {
                  " [--mode decode|chunked] [--chunk-size 512]"
                  " [--kv-quant 0|1] [--model-type qwen3|qwen2|llama]"
                  " [--csv out.csv] [--tag label]\n"
-                 "  --kv-quant: 0=off, 1=K int8 + V int4 (默认读环境变量 LLAMA_KV_QUANT)\n"
+                 "  --kv-quant: 0=off, 6=S4 (默认读环境变量 LLAMA_KV_QUANT)\n"
                  "  --mode decode: 逐 token decode 驱动(每位置都有 NLL);\n"
                  "         chunked: 生产混合步形,每 chunk 只对末位置的 decode 行算 NLL\n";
     return -1;
@@ -171,8 +171,8 @@ int main(int argc, char* argv[]) {
   // 掩码在 KVManager 的构造里也会校验,但那要等模型加载完之后;一次 typo 就是
   // 一次白跑,所以在解析处先拒绝(与 online/offline 同一口径)。只认 0 和 1:
   // 2/3/4 三条臂已随掩码收敛删除,把它们当别名会跑出一个没人能归因的数。
-  if (a.kv_quant != -1 && a.kv_quant != 0 && a.kv_quant != scheduler::kKvQuantK8V4) {
-    std::cerr << "参数非法: --kv-quant 必须是 0(off)或 1(K int8 + V int4),"
+  if (a.kv_quant != -1 && a.kv_quant != 0 && a.kv_quant != scheduler::kKvQuantS4) {
+    std::cerr << "参数非法: --kv-quant 必须是 0(off)或 6(S4),"
                  "或 -1(= 读 LLAMA_KV_QUANT);得到 "
               << a.kv_quant << "\n";
     return -1;
@@ -293,7 +293,13 @@ int main(int argc, char* argv[]) {
       base::PinnedCPUDeviceAllocatorFactory::get_instance());
   // 逐行独立:每行有自己的一维输入张量和 block table 行。
   // decode_step 读的是这两个 host tensor 的前 num_seq 个元素 / 前
-  // num_seq*table_stride 个元素,所以这里按行连续排布。
+  // num_seq*table_stride 个元素,所以这里按行连续排布。  // S4 residual-window index: one sequence slot per batch row. Filled per
+  // step from the block-table row ids this driver owns.
+  tensor::Tensor host_kv_slots =
+      tensor::Tensor(base::DataType::kDataTypeInt32, std::max(num_seq, a.chunk_size), true,
+                     host_alloc);
+  if (host_kv_slots.is_empty()) LOG(FATAL) << "S4 kv_slots staging allocation failed";
+
   tensor::Tensor host_input_ids(base::DataType::kDataTypeInt32, num_seq, true, host_alloc);
   tensor::Tensor host_positions(base::DataType::kDataTypeInt32, num_seq, true, host_alloc);
   tensor::Tensor host_block_table(base::DataType::kDataTypeInt32, num_seq, table_stride, true,
@@ -419,12 +425,20 @@ int main(int argc, char* argv[]) {
           in_view.reshape({len});
           pos_view.reshape({len});
           bt_view.reshape({len, table_stride});
+          const bool s4 = kv.quantized();
+          tensor::Tensor slots_view = host_kv_slots;
+          slots_view.reshape({len});
+          for (int i = 0; i < len; ++i) slots_view.index<int32_t>(i) = rows[r];
           auto dst = model->forward_batch(in_view, pos_view, bt_view, kv.key_cache(),
                                           kv.value_cache(), c_logits_row,
                                           /*need_logits=*/true, /*num_decode_rows=*/1,
                                           &c_seq_row_start_dev, /*num_prefill_seqs=*/1, nullptr,
                                           table_cols, &kv.key_scale_cache(),
-                                          &kv.value_scale_cache());
+                                          &kv.value_scale_cache(),
+                                          s4 ? &kv.key_zero_cache() : nullptr,
+                                          s4 ? &kv.value_zero_cache() : nullptr,
+                                          s4 ? &kv.key_residual_cache() : nullptr,
+                                          s4 ? &slots_view : nullptr);
           if (!dst) {
             LOG(FATAL) << "chunked forward_batch 失败 @seq=" << r << " chunk=" << ci << ": "
                        << dst.get_err_code();
@@ -459,9 +473,17 @@ int main(int argc, char* argv[]) {
         }
         // 活跃 block 表列数:所有行都在位置 t,列 = t / block_size + 1。
         const int table_cols = std::min(t / a.block_size + 1, table_stride);
+        const bool s4 = kv.quantized();
+        tensor::Tensor slots_view = host_kv_slots;
+        slots_view.reshape({num_seq});
+        for (int r = 0; r < num_seq; ++r) slots_view.index<int32_t>(r) = rows[r];
         auto dst = model->decode_step(host_input_ids, host_positions, host_block_table,
                                       kv.key_cache(), kv.value_cache(), logits, table_cols,
-                                      &kv.key_scale_cache(), &kv.value_scale_cache());
+                                      &kv.key_scale_cache(), &kv.value_scale_cache(),
+                                      s4 ? &kv.key_zero_cache() : nullptr,
+                                      s4 ? &kv.value_zero_cache() : nullptr,
+                                      s4 ? &kv.key_residual_cache() : nullptr,
+                                      s4 ? &slots_view : nullptr);
         if (!dst) LOG(FATAL) << "decode_step 失败 @" << t << ": " << dst.get_err_code();
 
         // 这一步的同步是正确性要求,不是保守起见:

@@ -92,7 +92,7 @@ void print_usage(const char* prog) {
       << "  --max-batch <N>      调度器槽位数(默认 1);KV 池按 max_batch x max_seq_len\n"
       << "                       整块预分配,想多占显存可以调大\n"
       << "  --gpu-mem-fraction <f>  KV 池最多占空闲显存的比例(默认 0.9)\n"
-      << "  --kv-quant <0|1>        KV 量化(0=off,1=K int8 + V int4;默认读\n"
+      << "  --kv-quant <0|6>        KV 量化(0=off,6=S4;默认读\n"
       << "                          LLAMA_KV_QUANT)\n"
       << "  --max-new-tokens <N> 每轮最大生成长度(默认 1024)\n"
       << "  --questions <q1|q2>  非交互模式:用 | 分隔多个问题,依次提问后退出\n"
@@ -106,7 +106,7 @@ void print_usage(const char* prog) {
       << "  /clear                         清空记忆\n"
       << "  exit | quit                    退出\n\n"
       << "环境变量:\n"
-      << "  LLAMA_KV_QUANT <0|1>           KV 量化(等价于 --kv-quant,命令行优先)\n";
+      << "  LLAMA_KV_QUANT <0|6>           KV 量化(等价于 --kv-quant,命令行优先)\n";
 }
 
 // std::stoi / std::stod throw on bad input — report and exit instead of aborting.

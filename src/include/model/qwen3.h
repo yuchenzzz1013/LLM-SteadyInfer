@@ -78,7 +78,11 @@ class Qwen3Model : public Model {
       BatchScratch* scratch = nullptr,
       int32_t table_cols = 0,
       const tensor::Tensor* key_scale = nullptr,
-      const tensor::Tensor* value_scale = nullptr) const override;
+      const tensor::Tensor* value_scale = nullptr,
+      const tensor::Tensor* key_zero = nullptr,
+      const tensor::Tensor* value_zero = nullptr,
+      const tensor::Tensor* key_residual = nullptr,
+      const tensor::Tensor* kv_slots = nullptr) const override;
 
   op::EmbeddingOutput embedding(const std::vector<int>& tokens) const override;
 

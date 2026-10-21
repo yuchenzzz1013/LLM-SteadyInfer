@@ -821,7 +821,11 @@ base::Status LLamaModel::forward_batch(
     BatchScratch* scratch,
     int32_t table_cols,
     const tensor::Tensor* key_scale,
-    const tensor::Tensor* value_scale) const {
+    const tensor::Tensor* value_scale,
+    const tensor::Tensor* key_zero,
+    const tensor::Tensor* value_zero,
+    const tensor::Tensor* key_residual,
+    const tensor::Tensor* kv_slots) const {
   if (input_ids.is_empty()) {
     return base::error::InvalidArgument("The input_ids tensor is empty.");
   }
@@ -834,6 +838,10 @@ base::Status LLamaModel::forward_batch(
   const tensor::Tensor k_no_scale;
   const tensor::Tensor& k_scale = key_scale != nullptr ? *key_scale : k_no_scale;
   const tensor::Tensor& v_scale = value_scale != nullptr ? *value_scale : k_no_scale;
+  const tensor::Tensor& k_zero = key_zero != nullptr ? *key_zero : k_no_scale;
+  const tensor::Tensor& v_zero = value_zero != nullptr ? *value_zero : k_no_scale;
+  const tensor::Tensor& k_residual = key_residual != nullptr ? *key_residual : k_no_scale;
+  const tensor::Tensor& slots = kv_slots != nullptr ? *kv_slots : k_no_scale;
   // Rows that need logits: the leading decode rows (see Model::forward_batch).
   // num_decode_rows == 0 means "the whole batch is decode rows" — the
   // decode_step / single-sequence callers that predate the split.
@@ -849,7 +857,14 @@ base::Status LLamaModel::forward_batch(
   int32_t table_stride = cache_dims.table_stride;
   int32_t num_slots = cache_dims.paged ? 0 : num_blocks;
   int32_t max_seq_len = cache_dims.max_seq_len;
-  CHECK_EQ(key_cache.get_dim(cache_dims.paged ? 3 : 2), kv_dim);
+  // S4 packs two 4-bit values per byte, so the quantized K row is kv_dim/2
+  // bytes. Every other reader derives the logical width from kv_dim; this is
+  // the one place the pool's physical width is accepted.
+  const int32_t cache_row = key_cache.get_dim(cache_dims.paged ? 3 : 2);
+  CHECK(cache_row == kv_dim ||
+        (key_cache.data_type() == base::DataType::kDataTypeInt8 && cache_row == kv_dim / 2))
+      << "KV cache row is " << cache_row << " elements but kv_dim=" << kv_dim
+      << " (an int4 pool stores kv_dim/2 packed bytes per row)";
 
   // Allocate intermediate batch tensors
   std::shared_ptr<base::DeviceAllocator> alloc;
@@ -977,6 +992,29 @@ base::Status LLamaModel::forward_batch(
     }
   }
 
+  // S4: the K residual window is indexed by sequence slot. In the decode-graph
+  // path `slots` is host staging and the H2D below is a captured upload node
+  // (stable address); the prefill path receives the scheduler's device tensor
+  // directly, so it needs no copy.
+  tensor::Tensor kv_slots_dev;
+  if (device_type_ == base::DeviceType::kDeviceCUDA && !slots.is_empty()) {
+    if (slots.device_type() == base::DeviceType::kDeviceCUDA) {
+      // The scheduler's per-step prefill upload, already on the device.
+      kv_slots_dev = slots;
+    } else if (scratch) {
+      // Decode-graph path: host staging at a stable address, so the H2D is
+      // captured as an upload node and re-read on every replay.
+      cudaMemcpyAsync(scratch->kv_slots_cu.ptr<int32_t>(), slots.ptr<int32_t>(),
+                      batch * sizeof(int32_t), cudaMemcpyHostToDevice, cuda_config_->stream);
+      kv_slots_dev = scratch->kv_slots_cu;
+    } else {
+      // Direct path (graphs disabled): upload like positions/block_table.
+      kv_slots_dev = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc);
+      cudaMemcpyAsync(kv_slots_dev.ptr<int32_t>(), slots.ptr<int32_t>(),
+                      batch * sizeof(int32_t), cudaMemcpyHostToDevice, cuda_config_->stream);
+    }
+  }
+
   // Bounds check once for the whole batch (host tensors only — the graph path
   // validates its staged inputs in decode_step).
   if (positions.device_type() == base::DeviceType::kDeviceCPU) {
@@ -1047,15 +1085,47 @@ base::Status LLamaModel::forward_batch(
                                    cuda_config_->stream);
 
 #ifdef USE_PAGED_ATTENTION
-      // Write this layer's K/V rows into each sequence's paged cache blocks
-      // (layout [layers, num_blocks, block_size, kv_dim], addressed through
-      // the block table).
-      kernel::paged_kv_scatter_cu(key_batch, key_cache, k_scale, block_table_cu, positions_cu,
-                                  kv_dim, config_->kv_head_num_, num_blocks, block_size, layer_idx,
-                                  cuda_config_->stream);
-      kernel::paged_kv_scatter_cu(val_batch, value_cache, v_scale, block_table_cu, positions_cu,
-                                  kv_dim, config_->kv_head_num_, num_blocks, block_size, layer_idx,
-                                  cuda_config_->stream);
+      // S4 writes: K is scattered into the BF16 residual window and, when a
+      // row completes a group, quantized back into the int4 pool; V is
+      // quantized immediately (it has no residual window). A bf16 cache keeps
+      // the raw scatter for both halves. The grouping is read back from the
+      // metadata tensors, so there is no separate knob that could drift.
+      const bool kv_quantized = key_cache.data_type() == base::DataType::kDataTypeInt8;
+      const int32_t q_groups_per_block = kv_quantized ? k_scale.get_dim(2) : 1;
+      const int32_t q_group_size = kv_quantized ? block_size / q_groups_per_block : 0;
+      const int32_t q_channel_groups = kv_quantized ? k_scale.get_dim(3) : 1;
+      const int32_t q_channel_group = kv_quantized ? kv_dim / q_channel_groups : 0;
+      const int32_t q_residual_batch = kv_quantized ? k_residual.get_dim(1) : 0;
+      if (kv_quantized) {
+        // Quantize completed groups FIRST: group tokens that belong to this
+        // step are read from key_batch, and the residual ring (which only has
+        // group_size slots per sequence) is still intact for tokens from
+        // earlier steps. The scatter below then writes this step's rows.
+        // num_decode_rows == 0 is ambiguous by API: it means "no split, the
+        // whole batch is decode rows" for the legacy single-sequence callers,
+        // but the Scheduler also passes 0 for a PURE PREFILL step (with a
+        // non-null row map). Disambiguate on the row map, not on the count:
+        // with prefill rows present, 0 really means zero decode rows.
+        const int32_t decode_rows =
+            (seq_row_start != nullptr && num_prefill_seqs > 0) ? num_decode_rows : batch;
+        kernel::paged_kv_group_quantize_cu(key_batch, k_residual, key_cache, k_scale, k_zero,
+                                           block_table_cu, kv_slots_dev, positions_cu,
+                                           seq_row_start, decode_rows, num_prefill_seqs, kv_dim,
+                                           q_residual_batch, q_group_size, q_channel_group,
+                                           q_channel_groups, num_blocks, block_size, layer_idx,
+                                           cuda_config_->stream);
+        kernel::paged_kv_residual_scatter_cu(key_batch, k_residual, kv_slots_dev, positions_cu,
+                                             seq_row_start, decode_rows, num_prefill_seqs, kv_dim,
+                                             q_residual_batch, q_group_size, layer_idx,
+                                             cuda_config_->stream);
+      } else {
+        kernel::paged_kv_scatter_cu(key_batch, key_cache, k_scale, k_zero, block_table_cu,
+                                    positions_cu, kv_dim, config_->kv_head_num_, num_blocks,
+                                    block_size, layer_idx, cuda_config_->stream);
+      }
+      kernel::paged_kv_scatter_cu(val_batch, value_cache, v_scale, v_zero, block_table_cu,
+                                  positions_cu, kv_dim, config_->kv_head_num_, num_blocks,
+                                  block_size, layer_idx, cuda_config_->stream);
 
       // f. MHA: Paged Flash Decoding — split-KV pass + reduce pass, one
       // launch pair per layer for the whole batch.
@@ -1063,7 +1133,8 @@ base::Status LLamaModel::forward_batch(
           config_->head_num_, layer_idx, num_blocks, block_size, kv_dim, config_->kv_head_num_,
           config_->head_size_, num_decode_rows, seq_row_start, num_prefill_seqs, positions_cu,
           block_table_cu, q_batch, partial_batch, mha_out_batch, key_cache, value_cache, k_scale,
-          v_scale, cuda_config_.get());
+          v_scale, k_zero, v_zero, k_residual, kv_slots_dev, q_group_size, q_channel_group,
+          cuda_config_.get());
 #else
       // Write this layer's K/V rows into each sequence's KV cache slot
       // (head-dim-contiguous layout: cache[layer][slot][d][pos]).

@@ -42,18 +42,30 @@ LLM-SteadyInfer 是一个基于 **C++ / CUDA C++** 实现的轻量级大语言�
   - 采用 Flash Decoding 风格 Split-KV 并行与 Online Softmax
   - 支持 Partial Attention Merge 优化长序列 Decode
 
-- **量化（KV Cache K int8 + V int4）**
-  - 只有一个量化形态：K 存 INT8（每值一字节）、V 存 INT4（每值半字节,每字节两个
-    4-bit 值,qmax=7,V 池行宽 kv_dim/2）;两半永远同时量化,所以这不是掩码而是一个
-    开关:`0=off / 1=K int8 + V int4`。FP32 scale、粒度 per-(token, kv head),
-    随 KV 写入 scatter 进 scale 池
+- **KV 量化（S4：K int4 分组 + BF16 残差窗口, V int4 非对称）**
+  - 只有一个量化形态，开关是 `LLAMA_KV_QUANT=0`（off）或 `6`（S4）。
+  - K、V 都以 INT4 存储（每字节两个值，行宽 `kv_dim/2`）。
+  - **K**：非对称量化，scale/zero-point 粒度 per-(token group, channel group)。
+    最近 `group_size` 个 token 的 K 以 BF16 保存在残差池；一组写满后整组量化为
+    INT4 并回写。`channel_group` 默认 8，`group_size` 默认等于 block size。
+  - **V**：非对称量化，scale/zero-point 粒度 per-(token, kv head)，写出即量化，
+    没有残差窗口。
+  - 分组可由 `LLAMA_KV_GROUP_SIZE` / `LLAMA_KV_CHANNEL_GROUP` 调整；旧取值
+    `1/2/3/4/5` 现在直接 FATAL（旧的 K int8 + V int4 形态已整体删除）。
+  - 解量化统一为 `x = (q - zero) * scale`，`q ∈ [0,15]`。
   - 实测（Qwen3-4B / ShareGPT / 32 并发 × 4096 上下文 / block size 16 / A100,
     单遍 PPL 共 131040 token;PASS 为 4096 步 decode 的累计秒数;
+    S4 用默认 `group_size=16, channel_group=8`):
 
     | kv_quant | KV 池 | 压缩比 | PASS (s) | PPL | ΔPPL |
     | --- | --- | --- | --- | --- | --- |
-    | 0（BF16） | 18.00 GB | 1.00× | 80.9 | 14.614163 | 基准 |
-    | 1（K int8 + V int4） | 7.03 GB | 2.56× | 77.6 | 14.633198 | +0.130% |
+    | 0（BF16） | 18.00 GB | 1.00× | 79.6 | 14.614163 | 基准 |
+    | 6（S4） | 5.10 GB | 3.53× | 190.8 | 14.707136 | +0.636% |
+
+  - 注意：S4 的 decode 比 BF16 慢（INT4 没有 dp4a 可用，K/V 需要逐值展开）。
+    收益在显存/容量，不在延迟。
+  - 贪心逐位一致性验证（T7）：Qwen3-4B 上 5 条 prompt × 48 token 当前
+    1/5 完全一致；其余从第 6–27 个 token 开始分叉。门禁**未达标**。
 
 
 

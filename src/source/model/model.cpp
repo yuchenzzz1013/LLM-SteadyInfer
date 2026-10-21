@@ -73,6 +73,9 @@ void BatchScratch::ensure(int32_t batch, int32_t hidden_dim, int32_t dim, int32_
                               base::CPUDeviceAllocatorFactory::get_instance());
   input_ids = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc_host);
   positions = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc_host);
+  // S4's K residual window is indexed by sequence slot; the slot of each batch
+  // row is staged like positions so the upload node is captured once.
+  kv_slots = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc_host);
   input_token_num = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true,
                                    base::CPUDeviceAllocatorFactory::get_instance());
 
@@ -97,6 +100,7 @@ void BatchScratch::ensure(int32_t batch, int32_t hidden_dim, int32_t dim, int32_
         true, alloc);
     tokens_cu = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc);
     positions_cu = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc);
+    kv_slots_cu = tensor::Tensor(base::DataType::kDataTypeInt32, batch, true, alloc);
     block_table_cu = tensor::Tensor(base::DataType::kDataTypeInt32, batch, block_table_stride,
                                     true, alloc);
   }
@@ -110,21 +114,29 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
                                 tensor::Tensor& logits,
                                 int32_t table_cols,
                                 const tensor::Tensor* key_scale,
-                                const tensor::Tensor* value_scale) {
+                                const tensor::Tensor* value_scale,
+                                const tensor::Tensor* key_zero,
+                                const tensor::Tensor* value_zero,
+                                const tensor::Tensor* key_residual,
+                                const tensor::Tensor* kv_slots) {
   const bool use_graph = device_type_ == base::DeviceType::kDeviceCUDA && use_cuda_graphs_;
   if (!use_graph) {
     // Pure decode: every row is a decode row (num_decode_rows == batch), no prefill
     // row map is needed.
     return forward_batch(input_ids, positions, block_table, key_cache, value_cache, logits,
                          true, input_ids.get_dim(0), nullptr, 0, nullptr, table_cols, key_scale,
-                         value_scale);
+                         value_scale, key_zero, value_zero, key_residual, kv_slots);
   }
 
   const int32_t batch = input_ids.get_dim(0);
   // use_graph implies a CUDA device, so under USE_PAGED_ATTENTION this is the
   // paged layout; the resolver centralizes the interpretation for both paths.
   const KVCacheDims dims = resolve_kv_cache_dims(key_cache, block_table, device_type_);
-  const int32_t kv_dim = key_cache.get_dim(dims.paged ? 3 : 2);
+  // S4 stores the int4 K node packed (kv_dim/2 bytes per row); every scratch
+  // size below is in LOGICAL dims, so unpack the physical width here.
+  const int32_t kv_row = key_cache.get_dim(dims.paged ? 3 : 2);
+  const int32_t kv_dim =
+      key_cache.data_type() == base::DataType::kDataTypeInt8 ? kv_row * 2 : kv_row;
   const int32_t table_stride = dims.table_stride;
   const int32_t num_slots = dims.paged ? 0 : dims.num_blocks;
   const int32_t max_seq_len = dims.max_seq_len;
@@ -199,8 +211,16 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
   // captured "upload nodes" and each graph replay re-reads the fresh host data.
   tensor::Tensor& stage_ids = entry->scratch->input_ids;
   tensor::Tensor& stage_pos = entry->scratch->positions;
+  tensor::Tensor& stage_slots = entry->scratch->kv_slots;
   std::memcpy(stage_ids.ptr<int32_t>(), input_ids.ptr<int32_t>(), batch * sizeof(int32_t));
   std::memcpy(stage_pos.ptr<int32_t>(), positions.ptr<int32_t>(), batch * sizeof(int32_t));
+  // S4's residual window is indexed by sequence slot. Staged at a stable host
+  // address like positions, so the H2D is a captured upload node and a replay
+  // reads the fresh slots. bf16 caches pass no slots and skip the copy.
+  const bool s4 = kv_slots != nullptr && !kv_slots->is_empty();
+  if (s4) {
+    std::memcpy(stage_slots.ptr<int32_t>(), kv_slots->ptr<int32_t>(), batch * sizeof(int32_t));
+  }
 
   // Block table: uploaded here, on the stream, BEFORE any capture or replay —
   // not staged into the graph. Its live width is ceil(max_position /
@@ -230,7 +250,8 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
     if (no_graph) {
       return forward_batch(stage_ids, stage_pos, block_table, key_cache, value_cache,
                            entry->logits_view, true, batch, nullptr, 0,
-                           entry->scratch.get(), table_cols, key_scale, value_scale);
+                           entry->scratch.get(), table_cols, key_scale, value_scale,
+                           key_zero, value_zero, key_residual, s4 ? &stage_slots : nullptr);
     }
   }
 
@@ -242,6 +263,19 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
   const void* value_scale_ptr = (value_scale != nullptr && !value_scale->is_empty())
                                     ? value_scale->get_buffer()->ptr()
                                     : nullptr;
+  // S4 metadata pointers baked into the graph (all null for a bf16 cache).
+  const void* key_zero_ptr =
+      (key_zero != nullptr && !key_zero->is_empty()) ? key_zero->get_buffer()->ptr() : nullptr;
+  const void* value_zero_ptr = (value_zero != nullptr && !value_zero->is_empty())
+                                   ? value_zero->get_buffer()->ptr()
+                                   : nullptr;
+  const void* key_residual_ptr = (key_residual != nullptr && !key_residual->is_empty())
+                                     ? key_residual->get_buffer()->ptr()
+                                     : nullptr;
+  // The slot table lives in this entry's stable device staging, so its
+  // address cannot go stale; it is snapshotted for symmetry and to catch a
+  // scratch re-allocation that would invalidate the captured upload node.
+  const void* kv_slots_ptr = s4 ? entry->scratch->kv_slots_cu.get_buffer()->ptr() : nullptr;
   // Validate the Scheduler-owned pointers baked into the graph at capture
   // time. KV caches and the logits buffer belong to the Scheduler instance;
   // after the Scheduler is destroyed and a new one created (benchmark
@@ -254,6 +288,10 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
        entry->captured_logits_ptr != logits.get_buffer()->ptr() ||
        entry->captured_key_scale_ptr != key_scale_ptr ||
        entry->captured_value_scale_ptr != value_scale_ptr ||
+       entry->captured_key_zero_ptr != key_zero_ptr ||
+       entry->captured_value_zero_ptr != value_zero_ptr ||
+       entry->captured_key_residual_ptr != key_residual_ptr ||
+       entry->captured_kv_slots_ptr != kv_slots_ptr ||
        entry->captured_key_slots != num_slots ||
        entry->captured_key_seq_len != max_seq_len ||
        entry->captured_key_blocks != dims.num_blocks ||
@@ -290,12 +328,14 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
                    << "); falling back to direct decode for batch=" << batch;
       return forward_batch(stage_ids, stage_pos, block_table, key_cache, value_cache,
                            entry->logits_view, true, batch, nullptr, 0,
-                           entry->scratch.get(), table_cols, key_scale, value_scale);
+                           entry->scratch.get(), table_cols, key_scale, value_scale,
+                           key_zero, value_zero, key_residual, s4 ? &stage_slots : nullptr);
     }
 
     auto status = forward_batch(stage_ids, stage_pos, block_table, key_cache, value_cache,
-                                entry->logits_view, true, batch, nullptr, 0,
-                           entry->scratch.get(), table_cols, key_scale, value_scale);
+                           entry->logits_view, true, batch, nullptr, 0,
+                           entry->scratch.get(), table_cols, key_scale, value_scale,
+                           key_zero, value_zero, key_residual, s4 ? &stage_slots : nullptr);
     cudaGraph_t graph = nullptr;
     cap_err = cudaStreamEndCapture(stream, &graph);
     if (cap_err != cudaSuccess || !status || graph == nullptr) {
@@ -311,7 +351,8 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
                    << "; falling back to direct decode.";
       return forward_batch(stage_ids, stage_pos, block_table, key_cache, value_cache,
                            entry->logits_view, true, batch, nullptr, 0,
-                           entry->scratch.get(), table_cols, key_scale, value_scale);
+                           entry->scratch.get(), table_cols, key_scale, value_scale,
+                           key_zero, value_zero, key_residual, s4 ? &stage_slots : nullptr);
     }
 
     cap_err = cudaGraphInstantiate(&entry->exec, graph, 0);
@@ -322,7 +363,8 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
                    << "); falling back to direct decode for batch=" << batch;
       return forward_batch(stage_ids, stage_pos, block_table, key_cache, value_cache,
                            entry->logits_view, true, batch, nullptr, 0,
-                           entry->scratch.get(), table_cols, key_scale, value_scale);
+                           entry->scratch.get(), table_cols, key_scale, value_scale,
+                           key_zero, value_zero, key_residual, s4 ? &stage_slots : nullptr);
     }
     graph_stats_.captures++;
     graph_stats_.capture_ms += std::chrono::duration<double, std::milli>(
@@ -334,6 +376,10 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
     entry->captured_logits_ptr = logits.get_buffer()->ptr();
     entry->captured_key_scale_ptr = key_scale_ptr;
     entry->captured_value_scale_ptr = value_scale_ptr;
+    entry->captured_key_zero_ptr = key_zero_ptr;
+    entry->captured_value_zero_ptr = value_zero_ptr;
+    entry->captured_key_residual_ptr = key_residual_ptr;
+    entry->captured_kv_slots_ptr = kv_slots_ptr;
     entry->captured_key_slots = num_slots;
     entry->captured_key_seq_len = max_seq_len;
     entry->captured_key_blocks = dims.num_blocks;
@@ -366,7 +412,8 @@ base::Status Model::decode_step(const tensor::Tensor& input_ids,
   // Capture attempts exhausted: direct batched forward with the stable scratch.
   return forward_batch(stage_ids, stage_pos, block_table, key_cache, value_cache,
                        entry->logits_view, true, batch, nullptr, 0, entry->scratch.get(),
-                       table_cols, key_scale, value_scale);
+                       table_cols, key_scale, value_scale, key_zero, value_zero, key_residual,
+                       s4 ? &stage_slots : nullptr);
 }
 
 base::ModelType Model::model_type() const { return model_type_; }

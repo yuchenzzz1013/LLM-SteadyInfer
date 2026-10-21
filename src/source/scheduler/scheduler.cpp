@@ -181,10 +181,16 @@ Scheduler::Scheduler(std::shared_ptr<model::Model> model,
   host_positions_ = tensor::Tensor(base::DataType::kDataTypeInt32, host_rows, true, host_alloc);
   host_block_table_ = tensor::Tensor(base::DataType::kDataTypeInt32, host_rows,
                                      kv_manager_->max_blocks_per_seq(), true, host_alloc);
+  // S4 residual-window index: one sequence slot per batch row. Empty tensor
+  // for a bf16 cache (never read, and the model skips its upload).
+  if (kv_manager_->quantized()) {
+    host_kv_slots_ = tensor::Tensor(base::DataType::kDataTypeInt32, host_rows, true, host_alloc);
+  }
   seq_row_start_host_ = tensor::Tensor(base::DataType::kDataTypeInt32, host_rows + 2, true,
                                        host_alloc);
   if (host_input_ids_.is_empty() || host_positions_.is_empty() ||
-      host_block_table_.is_empty() || seq_row_start_host_.is_empty()) {
+      host_block_table_.is_empty() || seq_row_start_host_.is_empty() ||
+      (kv_manager_->quantized() && host_kv_slots_.is_empty())) {
     LOG(FATAL) << "[SCHED] Failed to allocate the pinned batch staging buffers ("
                << host_rows << " rows)";
   }
@@ -624,6 +630,10 @@ void Scheduler::truncate_sequence(Sequence& seq, int keep_blocks) {
       seq.num_generated_tokens = keep_gen;
     }
   }
+  // Rolls the S4 counters back with the blocks: the retained KV ends on a
+  // block boundary and every complete block is made of complete groups, so the
+  // residual window is empty after a cut.
+  seq.sync_kv_quant_state(kv_manager_->group_size());
   seq.state = SeqState::PREEMPTED;
 #ifndef NDEBUG
   VLOG(1) << "[SCHED] preempted seq id=" << seq.id
@@ -781,6 +791,7 @@ std::vector<Scheduler::BatchRow> Scheduler::build_batch_rows() {
       if (seq.next_prefill_chunk_start >= seq.num_prompt_tokens) {
         seq.is_prefill_complete = true;
       }
+      seq.sync_kv_quant_state(kv_manager_->group_size());
       return true;
     };
 
@@ -951,8 +962,12 @@ void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
   tensor::Tensor input_ids = host_input_ids_;
   tensor::Tensor positions = host_positions_;
   tensor::Tensor block_table = host_block_table_;
+  tensor::Tensor kv_slots = host_kv_slots_;
   input_ids.reshape({batch});
   positions.reshape({batch});
+  if (kv_manager_->quantized()) {
+    kv_slots.reshape({batch});
+  }
   // block_table: per-row physical block ids (paged) or slot ids (continuous).
 #ifdef USE_PAGED_ATTENTION
   block_table.reshape({batch, table_stride});
@@ -965,6 +980,9 @@ void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
     const BatchRow& r = *ordered[i];
     input_ids.index<int32_t>(i) = r.token_id;
     positions.index<int32_t>(i) = r.position;
+    if (kv_manager_->quantized()) {
+      host_kv_slots_.index<int32_t>(i) = r.seq->kv_slot_id;
+    }
 #ifdef USE_PAGED_ATTENTION
     kv_manager_->block_allocator()->copy_block_table_row(
         r.seq->kv_slot_id, block_table.ptr<int32_t>() + static_cast<int64_t>(i) * table_stride,
@@ -1041,12 +1059,16 @@ void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
                                nullptr, logits_ptr);
     logits_view.set_device_type(model_->device_type());
 
+    const tensor::Tensor* kv_slots_ptr = kv_manager_->quantized() ? &kv_slots : nullptr;
     auto status = model_->decode_step(input_ids, positions, block_table,
                                       kv_manager_->key_cache(),
                                       kv_manager_->value_cache(),
                                       logits_view, table_cols,
                                       &kv_manager_->key_scale_cache(),
-                                      &kv_manager_->value_scale_cache());
+                                      &kv_manager_->value_scale_cache(),
+                                      &kv_manager_->key_zero_cache(),
+                                      &kv_manager_->value_zero_cache(),
+                                      &kv_manager_->key_residual_cache(), kv_slots_ptr);
     auto h_launched = std::chrono::steady_clock::now();
     if (!status) {
       force_finish_all("batch decode failed");
@@ -1080,6 +1102,7 @@ void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
       seq->last_token_time = now;
       seq->generated_tokens.push_back(next_tokens[i]);
       seq->num_generated_tokens++;
+      seq->sync_kv_quant_state(kv_manager_->group_size());
     }
     if (hostlog && hostlog_count++ < 3000) {
       auto h_bookkept = std::chrono::steady_clock::now();
@@ -1101,13 +1124,17 @@ void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
     // head entirely. The attention layer splits the two row ranges internally
     // (decode kernel / prefill kernel) — one forward pass, weights read once.
     const bool need_logits = num_decode_rows > 0;
+    const tensor::Tensor* kv_slots_ptr = kv_manager_->quantized() ? &kv_slots : nullptr;
     auto status = model_->forward_batch(input_ids, positions, block_table,
                                         kv_manager_->key_cache(),
                                         kv_manager_->value_cache(),
                                         logits_, need_logits, num_decode_rows,
                                         seq_row_start_ptr, num_prefill_seqs, nullptr, table_cols,
                                         &kv_manager_->key_scale_cache(),
-                                        &kv_manager_->value_scale_cache());
+                                        &kv_manager_->value_scale_cache(),
+                                        &kv_manager_->key_zero_cache(),
+                                        &kv_manager_->value_zero_cache(),
+                                        &kv_manager_->key_residual_cache(), kv_slots_ptr);
     if (!status) {
       force_finish_all("batch prefill failed");
       return;
@@ -1158,6 +1185,7 @@ void Scheduler::execute_batch(const std::vector<BatchRow>& rows) {
         seq->last_token_time = now;
         seq->generated_tokens.push_back(next_tokens[i]);
         seq->num_generated_tokens++;
+        seq->sync_kv_quant_state(kv_manager_->group_size());
       }
     }
   }

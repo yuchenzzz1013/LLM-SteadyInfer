@@ -84,8 +84,8 @@ struct Args {
   // A/B;需要按线上 serving 口径跑时用 --prefix-cache 1 打开。
   int prefix_cache = 0;
 
-  // KV 量化掩码 (scheduler::KvQuant): 0=off, 1=K int8, 2=V int8, 3=K+V int8,
-  // 4=V int4, 5=K int8+V int4;
+  // KV 量化 (scheduler::KvQuant): 0=off, 6=S4 (K int4 分组 + BF16 残差,
+  // V int4 非对称); 旧 mask 取值 1/2/3/4/5 现在都会 FATAL。
   // -1 = 读 LLAMA_KV_QUANT 环境变量(与 Scheduler 的默认解析一致)。
   int kv_quant = -1;
 };
@@ -143,8 +143,8 @@ static Args parse_args(int argc, char** argv) {
   // 掩码写错(比如按开关的思路写 7)不能在 KVManager 的 CHECK 里才炸:那时模型
   // 都加载完了。这里直接拒绝,顺带把编码再讲一遍。只认 0 和 1 —— 2/3/4 三条臂
   // 已随掩码收敛删除,当别名用会跑出一个没人能归因的数。
-  if (a.kv_quant != -1 && a.kv_quant != 0 && a.kv_quant != scheduler::kKvQuantK8V4) {
-    LOG(FATAL) << "--kv-quant 必须是 0(off) 或 1(K int8 + V int4),或 -1(= 读 "
+  if (a.kv_quant != -1 && a.kv_quant != 0 && a.kv_quant != scheduler::kKvQuantS4) {
+    LOG(FATAL) << "--kv-quant 必须是 0(off) 或 6(S4: K int4 分组+残差窗口, V int4 非对称),或 -1(= 读 "
                   "LLAMA_KV_QUANT)。得到: "
                << a.kv_quant;
   }
@@ -194,7 +194,7 @@ static void print_usage(const char* prog) {
       << "                         问题,命中率极低,开着只会把已完成请求的 prompt 块\n"
       << "                         钉在池里并计入哈希开销;要看净收益用\n"
       << "                         prefix_caching_benchmark 的 A/B\n"
-      << "  --kv-quant <0|1>       KV Cache 量化:0=off,1=K int8 + V int4\n"
+      << "  --kv-quant <0|6>       KV Cache 量化:0=off,6=S4(K int4 分组+残差, V int4 非对称)\n"
       << "                         (默认 -1 = 读 LLAMA_KV_QUANT 环境变量)。仅 Paged\n"
       << "                         CUDA 布局,KV 池压到约 1/3、精度见 README 的「量化」\n"
       << "  --output-csv <path>    结果 CSV 路径(默认 results/metrics.csv)\n";
@@ -209,7 +209,7 @@ struct RunMetrics {
   int num_requests = 0, submitted = 0, completed = 0, rejected = 0, dropped = 0;
   // 压测配置(写进 CSV,保证一行结果自带复现所需的口径参数)
   int max_batch = 0, max_gen = 0, block_size = 0;
-  int kv_quant = 0;  // 生效的量化掩码(0=off, 1=K int8 + V int4)
+  int kv_quant = 0;  // 生效的量化值(0=off, 6=S4)
   // 正式窗口内的 CUDA graph 捕获开销(预热后清零)
   long long graph_captures = 0, graph_evictions = 0;
   double graph_capture_ms = 0;

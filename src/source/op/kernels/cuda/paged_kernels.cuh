@@ -33,25 +33,61 @@ inline bool paged_decode_geometry_ok(int32_t head_size, int32_t table_stride, in
 // One block per batch row; positions are per-token (prefill rows and decode
 // rows are both single-token rows after the scheduler flattens chunks).
 //
-// Two write paths, selected by dst_cache's dtype (see KVManager::kv_quant):
-//   bf16 pool  — raw element copy; dst_scale is unused and must be empty.
-//   int8 pool  — symmetric per-(token, kv head) quantization; dst_scale is the
-//                fp32 pool [num_layers, num_blocks, kv_head_num, block_size]
-//                that receives one scale per written row, at
-//                [layer][block][head][pos % block_size]. amax is taken over the
-//                head's dims, so the reduction spans lanes: one warp per
-//                (row, kv head), lane l owning head dims [l*4, l*4+4) — the
-//                same 4-contiguous-dims layout the attention kernels read back
-//                with. kv_head_num therefore has to be passed in (head_size is
-//                kv_dim / kv_head_num).
-// The quantizing path requires (head_size & 3) == 0 — guaranteed by
-// paged_decode_geometry_ok (head_size % 8 == 0) for every geometry the paged
-// decode path accepts.
+// Two write paths, selected by dst_cache's dtype:
+//   bf16 pool — raw element copy; dst_scale/dst_zero are unused and must be
+//               empty. Both K and V take this path in the baseline.
+//   int4 pool — S4 V write (asymmetric): one (scale, zero) per (token, kv
+//               head) into [num_layers, num_blocks, kv_head_num, block_size],
+//               at [layer][block][head][pos % block_size]. The reduction spans
+//               lanes: one warp per (row, kv head), lane l owning head dims
+//               [l*4, l*4+4) — the layout the attention readers unpack.
+// K does NOT use this wrapper when quantized: its write is the two-step
+// residual scatter + group quantize below.
+// The quantizing path requires (head_size & 3) == 0.
 void paged_kv_scatter_cu(const tensor::Tensor& src, tensor::Tensor& dst_cache,
-                         const tensor::Tensor& dst_scale, const tensor::Tensor& block_table,
-                         const tensor::Tensor& positions, int32_t kv_dim, int32_t kv_head_num,
-                         int32_t num_blocks, int32_t block_size, int32_t layer_idx,
-                         void* stream);
+                         const tensor::Tensor& dst_scale, const tensor::Tensor& dst_zero,
+                         const tensor::Tensor& block_table, const tensor::Tensor& positions,
+                         int32_t kv_dim, int32_t kv_head_num, int32_t num_blocks,
+                         int32_t block_size, int32_t layer_idx, void* stream);
+
+// S4 K write, step 1: copy each row's K into the BF16 residual window
+//   residual[layer][slot][pos % group_size][d] = src[b][d].
+// kv_slots[b] is the sequence slot the row belongs to (the batch row is not a
+// stable identity across steps, the slot is).
+void paged_kv_residual_scatter_cu(const tensor::Tensor& src, const tensor::Tensor& residual,
+                                  const tensor::Tensor& kv_slots,
+                                  const tensor::Tensor& positions,
+                                  const tensor::Tensor* seq_row_start, int32_t num_decode_rows,
+                                  int32_t num_prefill_seqs, int32_t kv_dim, int32_t max_batch,
+                                  int32_t group_size, int32_t layer_idx, void* stream);
+
+// S4 K write, step 2: for every batch row whose position completes a group
+// ((pos+1) % group_size == 0), quantize that group and write it into the
+// packed K pool plus one (scale, zero) per (token group, channel group). The
+// grid is (channel_groups, batch): rows that do not complete a group exit
+// immediately, so the launch geometry is independent of the step's positions
+// and stays valid inside a captured CUDA graph.
+//
+// This runs BEFORE paged_kv_residual_scatter_cu. Group tokens that belong to
+// the current step are read from `src` (the freshly projected K rows); only
+// tokens from earlier steps come from the residual ring. That ordering is
+// what keeps a later group in a long prefill chunk from overwriting an
+// earlier group before it is quantized.
+// seq_row_start/num_decode_rows/num_prefill_seqs locate the current step's
+// prefill rows; pass seq_row_start == nullptr (and num_decode_rows == batch)
+// for a pure decode step.
+// Requires group_size | block_size and channel_group | kv_dim.
+void paged_kv_group_quantize_cu(const tensor::Tensor& src, const tensor::Tensor& residual,
+                                const tensor::Tensor& dst_cache,
+                                const tensor::Tensor& dst_scale,
+                                const tensor::Tensor& dst_zero,
+                                const tensor::Tensor& block_table,
+                                const tensor::Tensor& kv_slots, const tensor::Tensor& positions,
+                                const tensor::Tensor* seq_row_start, int32_t num_decode_rows,
+                                int32_t num_prefill_seqs, int32_t kv_dim, int32_t max_batch,
+                                int32_t group_size, int32_t channel_group,
+                                int32_t channel_groups, int32_t num_blocks, int32_t block_size,
+                                int32_t layer_idx, void* stream);
 
 // Batched decode / chunked-prefill MHA over the paged cache (Flash Decoding):
 // one split-KV launch pair per layer for the whole batch. Identical grid /
@@ -68,12 +104,21 @@ void paged_kv_scatter_cu(const tensor::Tensor& src, tensor::Tensor& dst_cache,
 //                bf16 elements. A buffer that is too small fails the call
 //                instead of silently computing garbage.
 //   mha_out      [batch, dim]
-//   key/value_cache [num_layers, num_blocks, block_size, kv_dim]
-//   key/value_scale [num_layers, num_blocks, kv_head_num, block_size] fp32, the
-//                per-(token, kv head) dequantization scales. Required (and
-//                non-empty) exactly when the corresponding cache is int8; an
-//                empty tensor means "bf16 pool", and a mismatch between the
-//                two is rejected up front rather than read as garbage.
+//   key/value_cache [num_layers, num_blocks, block_size, kv_dim] bf16, or the
+//                same shape with a kv_dim/2-byte int4 row when quantized.
+//   key_scale/key_zero [num_layers, num_blocks, groups_per_block,
+//                channel_groups] fp32, per (token group, channel group).
+//   value_scale/value_zero [num_layers, num_blocks, kv_head_num, block_size]
+//                fp32, per (token, kv head).
+//   key_residual [num_layers, max_batch, group_size, kv_dim] bf16, the K of the
+//                current, not-yet-quantized group.
+//   kv_slots     [batch] int32, the sequence slot of each row (residual index).
+// For a row at position pos, tokens [0, B) with
+// B = ((pos + 1) / group_size) * group_size come from the packed pools; tokens
+// [B, pos] read K from the residual window and V from the packed pool (V has
+// no residual). All of these tensors are required exactly when the caches are
+// int8; empty tensors mean "bf16 pool". A mismatch is rejected up front rather
+// than read as garbage.
 void paged_attention_cu_batch(int32_t head_num, int32_t layer_idx, int32_t num_blocks,
                               int32_t block_size, int32_t kv_dim, int32_t kv_head_num,
                               int32_t head_size, const tensor::Tensor& positions,
@@ -81,7 +126,11 @@ void paged_attention_cu_batch(int32_t head_num, int32_t layer_idx, int32_t num_b
                               tensor::Tensor& score_batch, const tensor::Tensor& mha_out,
                               const tensor::Tensor& key_cache, const tensor::Tensor& value_cache,
                               const tensor::Tensor& key_scale, const tensor::Tensor& value_scale,
-                              CudaConfig* config);
+                              const tensor::Tensor& key_zero, const tensor::Tensor& value_zero,
+                              const tensor::Tensor& key_residual, const tensor::Tensor& kv_slots,
+                              const tensor::Tensor* seq_row_start, int32_t num_decode_rows,
+                              int32_t num_prefill_seqs, int32_t group_size,
+                              int32_t channel_group, CudaConfig* config);
 
 // ========== Mixed decode + prefill dispatch ==========
 // One attention call for a batch whose first num_decode_rows rows are decode
@@ -109,7 +158,10 @@ void paged_attention_dispatch(int32_t head_num, int32_t layer_idx, int32_t num_b
                               const tensor::Tensor& query_batch, tensor::Tensor& score_batch,
                               const tensor::Tensor& mha_out, const tensor::Tensor& key_cache,
                               const tensor::Tensor& value_cache, const tensor::Tensor& key_scale,
-                              const tensor::Tensor& value_scale, CudaConfig* config);
+                              const tensor::Tensor& value_scale, const tensor::Tensor& key_zero,
+                              const tensor::Tensor& value_zero,
+                              const tensor::Tensor& key_residual, const tensor::Tensor& kv_slots,
+                              int32_t group_size, int32_t channel_group, CudaConfig* config);
 
 }  // namespace kernel
 #endif

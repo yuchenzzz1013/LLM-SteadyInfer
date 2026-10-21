@@ -8,36 +8,32 @@
 
 namespace scheduler {
 
-// How the KV cache is quantized. There is exactly one quantized shape left:
-// K at 8 bits per value (one value per byte) and V at 4 bits per value (two
-// values per byte, symmetric around zero, per-(token, kv head) fp32 scale),
-// with the V pool row kv_dim/2 bytes long. Both halves are always quantized
-// together, so this is a switch rather than a mask — and it is spelled 1, the
-// way a switch is.
+// How the KV cache is quantized. There is exactly one quantized shape:
+// S4 — both K and V at 4 bits per value (two values per byte), asymmetric
+// around a zero point. V is quantized immediately per (token, kv head); K is
+// quantized per (token group, channel group) after a full group of
+// `group_size` successive tokens has accumulated, while the most recent
+// group's K is held in a BF16 residual pool. The residual window is what lets
+// K keep per-channel-group statistics without re-reading the already-quantized
+// prefix, and it is the reason the K pool alone is not a complete cache.
 //
-// The number is where the old bitmask left off rather than a fresh coinage:
-// 1 was "K only" and 5 was "K int8 + V int4" while the mask existed, and 5 is
-// what every log and reproduce command in results/ says. Both digits still
-// select this arm (see kv_quant_from_env), so an old command line keeps
-// working — but a script that exported 1 expecting K-only now gets K and V
-// quantized, which is the one spelling whose meaning changed.
-//
-// K has no 4-bit mode: a K error moves the softmax itself, which no downstream
-// scaling can undo, so K stays at 8 bits while V — whose error only scales the
-// weighted sum after the softmax — takes the aggressive mode.
+// Both halves are always quantized together, so this is a switch rather than a
+// mask. The spelling is 6: the old mask's 1/5 selected the removed
+// K-int8+V-int4 shape, and those values are now hard errors (see
+// kv_quant_from_env) so a stale command line cannot silently measure a
+// different precision.
 enum KvQuant : int {
   kKvQuantNone = 0,  // bf16 pool
-  kKvQuantK8V4 = 1,  // K int8 + V int4
+  kKvQuantS4 = 6,    // K int4 (grouped, with BF16 residual) + V int4
 };
 
-// LLAMA_KV_QUANT — "0"/"off" (default, unset) / "1"/"kv4"/"k+v4" (and the old
-// spelling "5", which selected exactly this arm before the mask collapsed).
+// LLAMA_KV_QUANT — "0"/"off" (default, unset) / "6"/"s4".
 // Anything else is a LOG(FATAL): a typo silently leaving quantization off would
 // look like "no speedup and no PPL change", which is the most expensive
-// possible way to find the mistake. The removed arms' other spellings ("2",
-// "3", "4", "k", "v", "v4", "kv", …) are an error rather than an alias, for the
-// same reason — a run that quietly means a different precision produces a
-// number nobody can attribute.
+// possible way to find the mistake. In particular the removed shape's
+// spellings ("1", "5") and the never-existing mask arms ("2", "3", "4") are
+// errors rather than aliases: a run that quietly means a different precision
+// produces a number nobody can attribute.
 int kv_quant_from_env();
 
 class KVManager {
@@ -46,23 +42,27 @@ class KVManager {
   // device: decides the layout — CUDA (+USE_PAGED_ATTENTION) gets the paged
   //   layout [num_layers, num_blocks, block_size, kv_dim], everything else
   //   keeps the continuous layout [num_layers, max_batch, kv_dim, max_seq_len].
-  // kv_head_num: number of KV heads (kv_dim = kv_head_num * head_size). Only
-  //   needed by the int8 path, whose per-(token, kv_head) scales are stored
-  //   one per head; the bf16 pool is head-agnostic.
+  // kv_head_num: number of KV heads (kv_dim = kv_head_num * head_size). Used
+  //   by the S4 path for the V scale/zero pools (per token and kv head) and to
+  //   validate the K channel group.
   // block_size: physical block size of the paged pool (default 16). Only used
   //   in paged mode, where the constructor CHECKs it is a power of two >= 4
   //   dividing 256 (kernel geometry).
-  // kv_quant: whether to store the cache quantized (KvQuant: 0 or 5). Only the
+  // kv_quant: whether to store the cache quantized (KvQuant: 0 or 6). Only the
   //   paged CUDA layout can be quantized — the continuous layout puts the token
   //   index in the last (fastest) dim, so a per-token scale would be a strided
   //   access — and asking for it anywhere else is a LOG(FATAL) rather than a
   //   silent fallback to bf16.
+  // group_size / channel_group: S4 grouping (0 = resolve from
+  //   LLAMA_KV_GROUP_SIZE / LLAMA_KV_CHANNEL_GROUP, then to the defaults).
+  //   group_size must divide block_size and be a multiple of 4; channel_group
+  //   must divide head_size and be a multiple of 4. Both are validated here.
   // The constructor LOG(FATAL)s if the pool tensors fail to allocate, so a
   // successful construction guarantees a usable KV pool.
   KVManager(int num_layers, int max_batch, int max_seq_len, int kv_dim, int kv_head_num,
             std::shared_ptr<base::DeviceAllocator> alloc,
             base::DeviceType device, int block_size = 16,
-            int kv_quant = kKvQuantNone);
+            int kv_quant = kKvQuantNone, int group_size = 0, int channel_group = 0);
 
   // Slot/row API. Identical semantics in both modes: a "slot" is one
   // block-table row (paged) == one slot (continuous). allocate() reserves a
@@ -88,31 +88,56 @@ class KVManager {
   int num_blocks() const { return num_blocks_; }
   bool is_paged() const { return paged_; }
 
-  // Bytes of the preallocated K + V pool (both modes), INCLUDING the int8
-  // scale pools when quantized. This is the memory the cache really occupies
-  // from construction on — a driver that prints a token-count estimate should
-  // print this instead of recomputing it.
+  // Bytes of the preallocated K + V pool (both modes), INCLUDING the S4
+  // scale / zero / K-residual pools when quantized. This is the memory the
+  // cache really occupies from construction on — a driver that prints a
+  // token-count estimate should print this instead of recomputing it.
   long long pool_bytes() const;
 
-  // int8 dequantization scales, one fp32 per (block, kv_head, pos_in_block) —
-  // see the layout note on the members. Empty tensors unless quantized().
+  // S4 dequantization pools. Empty tensors unless quantized().
   //
-  // These are SEPARATE pools rather than one combined tensor so that the two
-  // halves keep their own allocation and addressing: K's scale is consumed by
-  // the score, V's by the weighted sum, and folding them into one tensor would
-  // only make the two readers agree on a layout neither of them wants.
+  //   key_scale_cache_ / key_zero_cache_
+  //       [num_layers, num_blocks, groups_per_block, channel_groups] fp32,
+  //       per (token group, channel group). groups_per_block is
+  //       block_size / group_size, so every scale belongs to exactly one
+  //       physical page and prefix-cache sharing carries it automatically.
+  //   value_scale_cache_ / value_zero_cache_
+  //       [num_layers, num_blocks, kv_head_num, block_size] fp32,
+  //       per (token, kv head) — V has no residual window, so every cached
+  //       token owns a scale/zero from the moment it is written.
+  //   key_residual_cache_
+  //       [num_layers, max_batch, group_size, kv_dim] bf16, indexed by the
+  //       sequence's block-table row (slot), `pos % group_size`, and dim.
+  //       Only the current, not-yet-complete group is meaningful; a completed
+  //       group's int4 copy in key_cache_ is authoritative for reads.
+  //
+  // They are SEPARATE pools rather than packed views so that each reader keeps
+  // the addressing it wants: K's scale is consumed per 4 lane dims, V's per
+  // token, and the residual pool is bf16.
   tensor::Tensor& key_scale_cache() { return key_scale_cache_; }
   tensor::Tensor& value_scale_cache() { return value_scale_cache_; }
+  tensor::Tensor& key_zero_cache() { return key_zero_cache_; }
+  tensor::Tensor& value_zero_cache() { return value_zero_cache_; }
+  tensor::Tensor& key_residual_cache() { return key_residual_cache_; }
   const tensor::Tensor& key_scale_cache() const { return key_scale_cache_; }
   const tensor::Tensor& value_scale_cache() const { return value_scale_cache_; }
+  const tensor::Tensor& key_zero_cache() const { return key_zero_cache_; }
+  const tensor::Tensor& value_zero_cache() const { return value_zero_cache_; }
+  const tensor::Tensor& key_residual_cache() const { return key_residual_cache_; }
+
+  // S4 grouping, resolved and validated by the constructor. 0/0 when the
+  // cache is not quantized.
+  int group_size() const { return group_size_; }
+  int channel_group() const { return channel_group_; }
+  int channel_groups() const { return channel_groups_; }
+  int groups_per_block() const { return groups_per_block_; }
 
   int kv_quant() const { return kv_quant_; }
-  // One test, not three: with a single quantized shape, "is K int8", "is V
-  // quantized" and "is V 4-bit" are the same question (see the KvQuant note).
-  // The attention kernels still detect the widths from the pools' own last dims
-  // (see kv_pool_is_v4 in the CUDA kernels) rather than from a flag threaded
-  // through every call — the shape is the one thing that follows the tensor
-  // everywhere — so this predicate is only about the pool the manager built.
+  // One test: with a single quantized shape, "is K int4", "is V int4" and
+  // "does this cache carry a residual window" are the same question (see the
+  // KvQuant note). The attention kernels select their compile-time QUANT arm
+  // on the pools' dtype, which is the one thing that follows a tensor into
+  // every call.
   bool quantized() const { return kv_quant_ != kKvQuantNone; }
 
   tensor::Tensor& key_cache() { return key_cache_; }
@@ -131,28 +156,40 @@ class KVManager {
   int max_blocks_per_seq_ = 1;  // paged: table width; continuous: 1
   bool paged_ = false;
   int kv_quant_ = kKvQuantNone;
+  int group_size_ = 0;      // tokens per K quantization group (divides block_size)
+  int channel_group_ = 0;   // K dims per scale/zero (divides head_size)
+  int channel_groups_ = 0;  // kv_dim / channel_group
+  int groups_per_block_ = 0;  // block_size / group_size
 
   // Paged layout: [num_layers, num_blocks, block_size, kv_dim].
   // Continuous layout: [num_layers, max_batch, kv_dim, max_seq_len].
-  // Quantized (paged only) the same paged shape in int8 — except V's, whose
-  // last dim is kv_dim/2 (two 4-bit values per byte). The last dim is what the
-  // kernels read the width back from; it must stay the ONLY place the V pool's
-  // width is expressed.
+  // Quantized (paged only) both pools are int8 packed rows: dim d lives in
+  // byte d/2, the low nibble for even d. K and V therefore have the same
+  // kv_dim/2-byte row and the same reader geometry; only their scale/zero
+  // granularity differs.
   tensor::Tensor key_cache_;
   tensor::Tensor value_cache_;
 
-  // int8 scale pools: [num_layers, num_blocks, kv_head_num, block_size] fp32,
-  // indexed by the SAME physical block id the block table yields, so a block
-  // shared through the prefix cache carries its scales with it and no extra
-  // refcounting is needed.
+  // S4 K scales (see the accessor note for the layouts). Indexed by the SAME
+  // physical block id the block table yields, so a block shared through the
+  // prefix cache carries its scales with it and no extra refcounting is
+  // needed. For K the inner dims are (token group in block, channel group):
+  // a decode position group of 4 always lies in one token group (group_size
+  // is a multiple of 4), and each lane owns one channel group, so a lane
+  // resolves its scale with two integer divides which the compiler folds once
+  // group_size / channel_group are runtime kernel arguments.
   //
-  // Pos is the innermost dim (not kv_head, which would mirror the KV layout
-  // more literally) because the decode kernel walks positions for ONE kv head
-  // at a time in groups of 4: this layout makes a group's 4 scales one
-  // contiguous, 16-byte-aligned float4 — a single load — while the mirrored
-  // layout would make them a 4-way strided gather.
+  // V scale/zero keep pos as the innermost dim, mirroring the old layout: the
+  // decode kernel walks 4 positions of one kv head at a time, making the four
+  // floats one 16-byte-aligned float4 load.
   tensor::Tensor key_scale_cache_;
+  tensor::Tensor key_zero_cache_;
   tensor::Tensor value_scale_cache_;
+  tensor::Tensor value_zero_cache_;
+
+  // BF16 K residual window: [num_layers, max_batch, group_size, kv_dim],
+  // indexed by the sequence's block-table row (slot), pos % group_size, dim.
+  tensor::Tensor key_residual_cache_;
 
   std::vector<bool> slot_busy_;               // continuous layout only
   std::unique_ptr<BlockAllocator> block_allocator_;

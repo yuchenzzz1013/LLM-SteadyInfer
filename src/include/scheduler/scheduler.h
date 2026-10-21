@@ -36,9 +36,9 @@ class Scheduler {
   //   batches (see retire_finished). 0 keeps everything (only for short
   //   deterministic runs). Benchmarks pass their request count so their
   //   per-request statistics always cover the whole run.
-  //   kv_quant: KV-cache quantization (scheduler::KvQuant: 0 = off, 1 = K int8
-  //     + V int4), or -1 to resolve from LLAMA_KV_QUANT. Paged CUDA pools only;
-  //     anything else is rejected by KVManager.
+  //   kv_quant: KV-cache quantization (scheduler::KvQuant: 0 = off, 6 = S4),
+  //     or -1 to resolve from LLAMA_KV_QUANT. Paged CUDA pools only; anything
+  //     else is rejected by KVManager.
   Scheduler(std::shared_ptr<model::Model> model,
             int max_batch_size,
             int max_seq_len,
@@ -196,6 +196,11 @@ class Scheduler {
   tensor::Tensor host_input_ids_;    // [row_cap] int32, pinned on CUDA
   tensor::Tensor host_positions_;    // [row_cap] int32, pinned on CUDA
   tensor::Tensor host_block_table_;  // [row_cap, table_stride] int32, pinned on CUDA
+  // S4's K residual window is indexed by sequence slot (kv_slot_id), which is
+  // not recoverable from the block table (prefill rows of one sequence repeat
+  // it). One int32 per row, staged and uploaded exactly like positions; only
+  // populated/uploaded when the KV cache is quantized.
+  tensor::Tensor host_kv_slots_;     // [row_cap] int32, pinned on CUDA
   // Prefill row map for mixed steps: seq_row_start[i] is the first batch row of
   // the i-th prefill sequence (prefill rows are contiguous per sequence), the
   // last entry is the batch size (sentinel). The attention layer dispatches the
