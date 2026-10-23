@@ -159,7 +159,10 @@ __device__ __forceinline__ void load_bf16_chunk4(float* dst, const __nv_bfloat16
 // the affine transform into its weight accumulator, so the per-value subtract
 // and multiply are not paid here.
 __device__ __forceinline__ void load_i4_raw_chunk4(float* dst, const int8_t* cache, int64_t off) {
-  const uint32_t raw = *reinterpret_cast<const uint16_t*>(cache + (off >> 1));
+  // __ldg: these pools are read-only for the whole step, and the explicit
+  // read-only load keeps the int4 arm on the same non-coherent path the bf16
+  // arm's uint2 loads already use.
+  const uint32_t raw = __ldg(reinterpret_cast<const uint16_t*>(cache + (off >> 1)));
   dst[0] = static_cast<float>(raw & 0xfu);
   dst[1] = static_cast<float>((raw >> 4) & 0xfu);
   dst[2] = static_cast<float>((raw >> 8) & 0xfu);
@@ -179,6 +182,18 @@ __device__ __forceinline__ void load_i4_tile_raw_chunk4(float* dst, const int8_t
   dst[1] = static_cast<float>((raw >> 4) & 0xfu);
   dst[2] = static_cast<float>((raw >> 8) & 0xfu);
   dst[3] = static_cast<float>((raw >> 12) & 0xfu);
+}
+
+// Warm the L2 for a packed K/V row that the next online-softmax step will
+// read. The int4 decode walk is latency-bound — four 64B requests per
+// 4-position step and a compute phase long enough that the loads for the next
+// step are not in flight — so having them resident by the time they are
+// consumed removes most of the exposed HBM latency. No destination register
+// is reserved, which matters because this instantiation sits at the 128-reg
+// occupancy cliff.
+__device__ __forceinline__ void prefetch_l2(const void* p) {
+  const unsigned long long addr = __cvta_generic_to_global(p);
+  asm volatile("prefetch.global.L2 [%0];" ::"l"(addr));
 }
 
 __device__ __forceinline__ void stage_i4_row_chunk(int8_t* tile_dst, const int8_t* cache,
@@ -749,14 +764,17 @@ __global__ void paged_kv_residual_scatter_kernel_bf16(
       }
     }
   }
-  const int boundary = ((last_pos + 1) / group_size) * group_size;
+  // group_size is a power of two (it is a multiple of 4 dividing the
+  // power-of-two block_size); mask instead of a runtime divide/modulo.
+  const int group_mask = group_size - 1;
+  const int boundary = (last_pos + 1) & ~group_mask;
   if (pos < boundary) {
     return;
   }
   const int slot = kv_slots[b];
   const int64_t base =
       ((static_cast<int64_t>(layer_idx) * max_batch + slot) * group_size +
-       (pos % group_size)) *
+       (pos & group_mask)) *
       kv_dim;
   const __nv_bfloat16* src_row = src + static_cast<int64_t>(b) * kv_dim;
   if ((kv_dim & 3) == 0) {
@@ -802,7 +820,10 @@ __global__ void paged_kv_group_quantize_kernel_bf16(
   // loops its channel groups here; rows that do not exit after two loads.
   const int b = blockIdx.x;
   const int pos = positions[b];
-  if ((pos + 1) % group_size != 0) return;
+  // group_size is a power of two — see the residual scatter.
+  const int group_mask = group_size - 1;
+  const int group_shift = 31 - __clz(group_size);
+  if ((pos + 1) & group_mask) return;
   const int slot = kv_slots[b];
   const int base_pos = pos + 1 - group_size;
   const int32_t* table_row = block_table + static_cast<int64_t>(b) * table_stride;
@@ -854,7 +875,7 @@ __global__ void paged_kv_group_quantize_kernel_bf16(
       return __bfloat162float(src[static_cast<int64_t>(row) * kv_dim + d]);
     }
     return __bfloat162float(
-        residual[residual_base + static_cast<int64_t>(p % group_size) * kv_dim + d]);
+        residual[residual_base + static_cast<int64_t>(p & group_mask) * kv_dim + d]);
   };
 
   // One warp per channel group, no block-wide reductions: a 128-thread block
@@ -871,14 +892,28 @@ __global__ void paged_kv_group_quantize_kernel_bf16(
     const int d_end = min(d0 + channel_group, kv_dim);
     const int cg_width = d_end - d0;
 
+    // Flatten the (token, dim) plane of this channel group and walk it with
+    // all 32 lanes: the removed loop nested a stride-32 dim walk inside a
+    // group_size walk, which left only cg_width lanes (~8) active and made
+    // the completing-row burst the dominant S4 write cost. cg_width is a
+    // power of two (channel_group divides the power-of-two kv_dim and is a
+    // multiple of 4), so the index split is a shift. min/max is exact, so
+    // the different reduction order is numerically identical.
+    // channel_group is only required to be a multiple of 4 dividing kv_dim, so
+    // keep a non-power-of-two fallback even though the defaults are powers of
+    // two (the condition is uniform across the warp).
+    const bool cg_pow2 = (cg_width & (cg_width - 1)) == 0;
+    const int cg_shift = cg_pow2 ? (31 - __clz(cg_width)) : 0;
+    const int cg_mask = cg_width - 1;
+    const int values = group_size * cg_width;
     float mn = FLT_MAX;
     float mx = -FLT_MAX;
-    for (int j = 0; j < group_size; ++j) {
-      for (int c = lane; c < cg_width; c += 32) {
-        const float v = value_at(base_pos + j, d0 + c);
-        mn = fminf(mn, v);
-        mx = fmaxf(mx, v);
-      }
+    for (int idx = lane; idx < values; idx += 32) {
+      const int pj = cg_pow2 ? (idx >> cg_shift) : (idx / cg_width);
+      const int dc = cg_pow2 ? (idx & cg_mask) : (idx % cg_width);
+      const float v = value_at(base_pos + pj, d0 + dc);
+      mn = fminf(mn, v);
+      mx = fmaxf(mx, v);
     }
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
@@ -894,7 +929,7 @@ __global__ void paged_kv_group_quantize_kernel_bf16(
     const int64_t scale_idx =
         ((static_cast<int64_t>(layer_idx) * num_blocks + block_id) *
              (block_size / group_size) +
-         off / group_size) *
+         (off >> group_shift)) *
             channel_groups +
         cg;
     if (lane == 0) {
@@ -903,16 +938,22 @@ __global__ void paged_kv_group_quantize_kernel_bf16(
     }
 
     // Pack adjacent dims into one byte: dim d lives in byte d/2, low nibble
-    // for even d. cg_width is a multiple of 4, hence even.
-    for (int by = lane; by < (cg_width >> 1); by += 32) {
-      const int local_d = d0 + 2 * by;
-      for (int j = 0; j < group_size; ++j) {
-        const int p = base_pos + j;
-        const int q0 = s4_quantize(value_at(p, local_d), inv_scale, zero);
-        const int q1 = s4_quantize(value_at(p, local_d + 1), inv_scale, zero);
-        const int64_t elem = page_base + static_cast<int64_t>(off + j) * kv_dim + local_d;
-        dst[elem >> 1] = static_cast<int8_t>(q0 | (q1 << 4));
-      }
+    // for even d. Same flattened walk as the min/max pass: each lane owns one
+    // (token, dim-pair) byte, so every lane is active for the 64-byte group
+    // instead of four lanes walking group_size tokens each.
+    const int bytes_per_cg = (group_size * cg_width) >> 1;
+    const int pairs = cg_width >> 1;
+    const int pair_shift = cg_pow2 ? (cg_shift - 1) : 0;
+    const int pair_mask = pairs - 1;
+    for (int idx = lane; idx < bytes_per_cg; idx += 32) {
+      const int j = cg_pow2 ? (idx >> pair_shift) : (idx / pairs);
+      const int pair = cg_pow2 ? (idx & pair_mask) : (idx % pairs);
+      const int local_d = d0 + (pair << 1);
+      const int p = base_pos + j;
+      const int q0 = s4_quantize(value_at(p, local_d), inv_scale, zero);
+      const int q1 = s4_quantize(value_at(p, local_d + 1), inv_scale, zero);
+      const int64_t elem = page_base + static_cast<int64_t>(off + j) * kv_dim + local_d;
+      dst[elem >> 1] = static_cast<int8_t>(q0 | (q1 << 4));
     }
   }
 }
@@ -1084,8 +1125,14 @@ void paged_kv_group_quantize_cu(const tensor::Tensor& src, const tensor::Tensor&
 // of mantissa on every split before the combine, which is exactly the
 // precision the online softmax is meant to preserve. The fp32 rows are 2x the
 // bf16 element count, which is what the callers size score_batch for.
+// Two CTAs/SM is what the arm split exists to protect: the S4 metadata
+// pushes the G=4 instantiation to 141 regs, and at 256 threads that flips
+// A100 residency from 2 CTAs (16 warps/SM) to 1 (8 warps/SM) — measured as a
+// 2.4x decode regression. Capping it at 128 costs 24B of spill and restores
+// the second CTA. G=8 needs ~190 regs even in the bf16 arm (165), so it stays
+// at one CTA rather than spilling hundreds of bytes to chase the same limit.
 template <int G, int CHUNKS, bool QUANT>
-__global__ void __launch_bounds__(256, 1) paged_attn_split_kernel_bf16(
+__global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_attn_split_kernel_bf16(
     const int32_t* __restrict__ positions, int32_t batch, const int32_t* __restrict__ block_table,
     int32_t table_stride, int32_t num_blocks, int32_t block_size, int32_t block_shift,
     int32_t layer_idx, int32_t dim, const __nv_bfloat16* __restrict__ query,
@@ -1170,6 +1217,14 @@ __global__ void __launch_bounds__(256, 1) paged_attn_split_kernel_bf16(
   // both arms: S4 dequantizes K/V while loading them, so the score is an
   // ordinary fp32 dot in the quantized instantiation too.
   float q[G][CHUNKS * kVec];
+  // Define every q slot up front: with an uneven GQA split the loop below
+  // loads only heads_here heads, and the sum(q) hoist would otherwise read
+  // registers that were never written.
+#pragma unroll
+  for (int i = 0; i < G; ++i) {
+#pragma unroll
+    for (int c = 0; c < CHUNKS * kVec; ++c) q[i][c] = 0.f;
+  }
   const int64_t q_row = static_cast<int64_t>(b) * dim + static_cast<int64_t>(my_begin) * head_size;
 #pragma unroll
   for (int i = 0; i < G; ++i) {
@@ -1189,6 +1244,21 @@ __global__ void __launch_bounds__(256, 1) paged_attn_split_kernel_bf16(
       q[i][c * kVec + 2] = __bfloat162float(h[1].x) * scale;
       q[i][c * kVec + 3] = __bfloat162float(h[1].y) * scale;
     }
+  }
+
+  // sum(q) per head is loop-invariant: hoist it out of the per-group walk.
+  // The association matches the previous in-loop expression exactly, so the
+  // K zero-point term is bit-identical.
+  float sumq_i[G];
+#pragma unroll
+  for (int i = 0; i < G; ++i) {
+    float sq = q[i][0] + q[i][1] + q[i][2] + q[i][3];
+#pragma unroll
+    for (int c = 1; c < CHUNKS; ++c) {
+      const int o = c * kVec;
+      sq += q[i][o + 0] + q[i][o + 1] + q[i][o + 2] + q[i][o + 3];
+    }
+    sumq_i[i] = sq;
   }
 
   float m_i[G];  // online flash statistics, warp-uniform per head
@@ -1241,8 +1311,14 @@ __global__ void __launch_bounds__(256, 1) paged_attn_split_kernel_bf16(
       }
     }
   }
+  // group_size divides the power-of-two block_size and is a multiple of 4, so
+  // it is itself a power of two: shifts/masks replace the runtime integer
+  // divide and modulo the compiler would otherwise emit in the inner loop
+  // (five full divide sequences per 4-position step, measured in SASS).
+  const int group_shift = QUANT ? (31 - __clz(group_size)) : 0;
+  const int group_mask = QUANT ? (group_size - 1) : 0;
   const int boundary =
-      QUANT ? min(((last_pos + 1) / group_size) * group_size, pos + 1) : 0;
+      QUANT ? min((last_pos + 1) & ~group_mask, pos + 1) : 0;
   const int groups_per_block = QUANT ? (block_size / group_size) : 1;
   const int channel_groups = QUANT ? (kv_dim / channel_group) : 1;
   const int lane_cg = QUANT ? ((static_cast<int>(kv_head_off) + d0) / channel_group) : 0;
@@ -1263,6 +1339,26 @@ __global__ void __launch_bounds__(256, 1) paged_attn_split_kernel_bf16(
 #pragma unroll
     for (int j = 0; j < kGroup; ++j) row[j] = row0 + static_cast<int64_t>(j) * kv_dim;
 
+    if constexpr (QUANT) {
+      // Prefetch the next 4-position group while this one is computed. One
+      // lane issues the requests: the pool halves the element offset, and a
+      // 128B L2 line started at the head slice covers the whole slice.
+      const int next_gpos = gpos + kGroup;
+      if (lane == 0 && next_gpos + kGroup <= end && next_gpos + kGroup <= boundary) {
+        const int32_t npg = __ldg(table_row + (next_gpos >> block_shift));
+        const int noff = next_gpos & (block_size - 1);
+        const int64_t next_base =
+            (layer_base >> 1) + static_cast<int64_t>(npg) * (block_size * kv_dim >> 1) +
+            (kv_head_off >> 1) + static_cast<int64_t>(noff) * (kv_dim >> 1);
+        const int64_t row_bytes = kv_dim >> 1;
+#pragma unroll
+        for (int j = 0; j < kGroup; ++j) {
+          prefetch_l2(key_cache_i4 + next_base + static_cast<int64_t>(j) * row_bytes);
+          prefetch_l2(value_cache_i4 + next_base + static_cast<int64_t>(j) * row_bytes);
+        }
+      }
+    }
+
     float ks = 1.f;
     float kz = 0.f;
     float vs[kGroup];
@@ -1272,7 +1368,7 @@ __global__ void __launch_bounds__(256, 1) paged_attn_split_kernel_bf16(
       // boundary is a multiple of kGroup, so no step straddles it.
       if (gpos < boundary) {
         const int64_t kidx = key_meta_layer_base +
-                             (static_cast<int64_t>(pg) * groups_per_block + off / group_size) *
+                             (static_cast<int64_t>(pg) * groups_per_block + (off >> group_shift)) *
                                  channel_groups +
                              lane_cg;
         ks = __ldg(key_scale + kidx);
@@ -1314,7 +1410,7 @@ __global__ void __launch_bounds__(256, 1) paged_attn_split_kernel_bf16(
             // K of the incomplete tail group comes from the BF16 residual
             // window; V below still comes from the packed pool (V is
             // quantized immediately, with no residual).
-            const int rp = (gpos + j) % group_size;
+            const int rp = (gpos + j) & group_mask;
             const int64_t roff = residual_layer_base +
                                  static_cast<int64_t>(slot) * group_size * kv_dim +
                                  static_cast<int64_t>(rp) * kv_dim + kv_head_off + d0 + c * 128;
@@ -1336,12 +1432,7 @@ __global__ void __launch_bounds__(256, 1) paged_attn_split_kernel_bf16(
       //   sum_d q_d*(code_d - zero)*scale = scale*(dot - zero * sum_d q_d),
       // so the zero-point term multiplies sum(q), NOT sum(code). q is fixed
       // across the four positions, so this is hoisted out of the j loop.
-      float sumq = q[i][0] + q[i][1] + q[i][2] + q[i][3];
-#pragma unroll
-      for (int c = 1; c < CHUNKS; ++c) {
-        const int o = c * kVec;
-        sumq += q[i][o + 0] + q[i][o + 1] + q[i][o + 2] + q[i][o + 3];
-      }
+      const float sumq = sumq_i[i];
 #pragma unroll
       for (int j = 0; j < kGroup; ++j) {
         float dot = q[i][0] * kf[j][0] + q[i][1] * kf[j][1] + q[i][2] * kf[j][2] +
@@ -1416,7 +1507,8 @@ __global__ void __launch_bounds__(256, 1) paged_attn_split_kernel_bf16(
       vz = __ldg(value_zero + srow);
       if (gpos < boundary) {
         const int64_t kidx = key_meta_layer_base +
-                             (static_cast<int64_t>(pg) * groups_per_block + poff / group_size) *
+                             (static_cast<int64_t>(pg) * groups_per_block +
+                              (poff >> group_shift)) *
                                  channel_groups +
                              lane_cg;
         ks = __ldg(key_scale + kidx);
@@ -1438,7 +1530,7 @@ __global__ void __launch_bounds__(256, 1) paged_attn_split_kernel_bf16(
         if (gpos < boundary) {
           load_i4_raw_chunk4(kf + c * kVec, key_cache_i4, row + c * 128);
         } else {
-          const int rp = gpos % group_size;
+          const int rp = gpos & group_mask;
           const int64_t roff = residual_layer_base +
                                static_cast<int64_t>(slot) * group_size * kv_dim +
                                static_cast<int64_t>(rp) * kv_dim + kv_head_off + d0 + c * 128;
@@ -1460,12 +1552,7 @@ __global__ void __launch_bounds__(256, 1) paged_attn_split_kernel_bf16(
         dot += q[i][o + 0] * kf[o + 0] + q[i][o + 1] * kf[o + 1] + q[i][o + 2] * kf[o + 2] +
                q[i][o + 3] * kf[o + 3];
       }
-      float sumq = q[i][0] + q[i][1] + q[i][2] + q[i][3];
-#pragma unroll
-      for (int c = 1; c < CHUNKS; ++c) {
-        const int o = c * kVec;
-        sumq += q[i][o + 0] + q[i][o + 1] + q[i][o + 2] + q[i][o + 3];
-      }
+      const float sumq = sumq_i[i];
       float s = (QUANT && gpos < boundary) ? (dot - kz * sumq) * ks : dot;
 #pragma unroll
       for (int off = 16; off; off >>= 1) s += __shfl_xor_sync(0xffffffffu, s, off);
@@ -1767,8 +1854,10 @@ void paged_attention_cu_batch(int32_t head_num, int32_t layer_idx, int32_t num_b
 // log-sum-exp on top, which is exact only up to the fp32 rounding of one
 // rescale, so mixed steps stay within a few ulps of an unsplit run — every
 // sampled token was unchanged across both paths (verify_tokens A/B).
+// Same residency contract as the decode kernel: the S4 arm of G=4 used 143
+// regs (127 in bf16) and silently dropped the prefill CTA to one per SM.
 template <int G, bool QUANT>
-__global__ void paged_prefill_kernel_bf16(
+__global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_prefill_kernel_bf16(
     const int32_t* __restrict__ positions, const int32_t* __restrict__ seq_row_start,
     const int32_t* __restrict__ block_table, int32_t table_stride, int32_t num_blocks,
     int32_t block_size, int32_t block_shift, int32_t layer_idx, int32_t dim,
@@ -1847,6 +1936,9 @@ __global__ void paged_prefill_kernel_bf16(
   const int heads_here = head_end - head_begin;
 
   float q[G][kVec];
+  float sumq_i[G];  // loop-invariant per-head sum(q), as in the decode kernel
+#pragma unroll
+  for (int i = 0; i < G; ++i) sumq_i[i] = 0.f;
   if (active) {
 #pragma unroll
     for (int i = 0; i < G; ++i) {
@@ -1859,6 +1951,7 @@ __global__ void paged_prefill_kernel_bf16(
       q[i][1] = __bfloat162float(h[0].y) * scale;
       q[i][2] = __bfloat162float(h[1].x) * scale;
       q[i][3] = __bfloat162float(h[1].y) * scale;
+      sumq_i[i] = q[i][0] + q[i][1] + q[i][2] + q[i][3];
     }
   }
 
@@ -1892,9 +1985,13 @@ __global__ void paged_prefill_kernel_bf16(
   // Same rule as the decode kernel: the boundary is the whole sequence
   // chunk's quantized length, clamped to this row's causal prefix. Groups
   // completed anywhere in this chunk are in the int4 pool before attention.
+  // group_size is a power of two (see the decode kernel), so the inner-loop
+  // group index uses a shift and the ring index a mask.
+  const int group_shift = QUANT ? (31 - __clz(group_size)) : 0;
+  const int group_mask = QUANT ? (group_size - 1) : 0;
   const int boundary =
       (QUANT && active)
-          ? min(((positions[row_end - 1] + 1) / group_size) * group_size, positions[my_row] + 1)
+          ? min((positions[row_end - 1] + 1) & ~group_mask, positions[my_row] + 1)
           : 0;
   const int groups_per_block = QUANT ? (block_size / group_size) : 1;
   const int channel_groups = QUANT ? (kv_dim / channel_group) : 1;
@@ -1981,7 +2078,7 @@ __global__ void paged_prefill_kernel_bf16(
           if (!residual_k) {
             const int64_t kidx = key_meta_layer_base +
                                  (static_cast<int64_t>(s_pg[sp]) * groups_per_block +
-                                  ((p & (block_size - 1)) / group_size)) *
+                                  ((p & (block_size - 1)) >> group_shift)) *
                                      channel_groups +
                                  lane_cg;
             ks = __ldg(key_scale + kidx);
@@ -1994,7 +2091,7 @@ __global__ void paged_prefill_kernel_bf16(
           // read once per (position, lane) and reused across the head loop.
           if constexpr (QUANT) {
             if (residual_k) {
-              const int rp = (p + j) % group_size;
+              const int rp = (p + j) & group_mask;
               const int64_t roff = residual_layer_base +
                                    static_cast<int64_t>(rp) * kv_dim + kv_head_off + lane * kVec;
               load_bf16_chunk4(kf[j], key_residual, roff);
@@ -2011,7 +2108,7 @@ __global__ void paged_prefill_kernel_bf16(
         for (int i = 0; i < G; ++i) {
           if (i >= heads_here) break;
           float s[kGroup];
-          const float sumq = q[i][0] + q[i][1] + q[i][2] + q[i][3];
+          const float sumq = sumq_i[i];
 #pragma unroll
           for (int j = 0; j < kGroup; ++j) {
             const float dot = q[i][0] * kf[j][0] + q[i][1] * kf[j][1] + q[i][2] * kf[j][2] +
@@ -2078,14 +2175,14 @@ __global__ void paged_prefill_kernel_bf16(
         float kza = 0.f;
         if constexpr (QUANT) {
           if (p >= boundary) {
-            const int rp = p % group_size;
+            const int rp = p & group_mask;
             const int64_t roff = residual_layer_base +
                                  static_cast<int64_t>(rp) * kv_dim + kv_head_off + lane * kVec;
             load_bf16_chunk4(kf, key_residual, roff);
           } else {
             const int64_t kidx = key_meta_layer_base +
                                  (static_cast<int64_t>(s_pg[sp]) * groups_per_block +
-                                  ((p & (block_size - 1)) / group_size)) *
+                                  ((p & (block_size - 1)) >> group_shift)) *
                                      channel_groups +
                                  lane_cg;
             ksa = __ldg(key_scale + kidx);
@@ -2101,7 +2198,7 @@ __global__ void paged_prefill_kernel_bf16(
         for (int i = 0; i < G; ++i) {
           if (i >= heads_here) break;
           float dot = q[i][0] * kf[0] + q[i][1] * kf[1] + q[i][2] * kf[2] + q[i][3] * kf[3];
-          const float sumq = q[i][0] + q[i][1] + q[i][2] + q[i][3];
+          const float sumq = sumq_i[i];
           float s = (QUANT && p < boundary) ? (dot - kza * sumq) * ksa : dot;
 #pragma unroll
           for (int off = 16; off; off >>= 1) {
