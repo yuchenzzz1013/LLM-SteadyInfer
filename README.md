@@ -59,18 +59,35 @@ LLM-SteadyInfer 是一个基于 **C++ / CUDA C++** 实现的轻量级大语言�
 
     | kv_quant | KV 池 | 压缩比 | PASS (s) | PPL | ΔPPL |
     | --- | --- | --- | --- | --- | --- |
-    | 0（BF16） | 18.00 GB | 1.00× | 81.5 | 14.614163 | 基准 |
-    | 6（S4） | 5.10 GB | 3.53× | 110.0 | 14.707136 | +0.636% |
+    | 0（BF16） | 18.00 GB | 1.00× | 76.6 | 14.614276 | 基准 |
+    | 6（S4） | 5.10 GB | 3.53× | 79.6 | 14.687720 | +0.503% |
 
-  - 注意：S4 的 decode 仍比 BF16 慢（约 1.35×）：INT4 没有 dp4a 可用，
-    K/V 需要逐值展开，S4 在长上下文下是指令吞吐受限，而 BF16 是 HBM
-    带宽受限。收益在显存/容量（3.53×），不在延迟。
-    早期版本曾慢到 2.37×（190.5s），根因是 S4 kernel 的 141 regs/线程
-    跨过 256 线程的 128-reg 门槛、occupancy 从 2 CTA/SM 掉到 1；
-    已用 `__launch_bounds__(256, 2)` 并配套降低读路径指令数修复，
-    详见 `pr.md`。
-  - 贪心逐位一致性验证（T7）：Qwen3-4B 上 5 条 prompt × 48 token 当前
-    1/5 完全一致；其余从第 6–27 个 token 开始分叉。门禁**未达标**。
+    chunked prefill（32 并发 × 4096、chunk 512，单遍共 224 个打分位置）：
+
+    | kv_quant | PASS (s) | PPL |
+    | --- | --- | --- |
+    | 0（BF16） | 29.6 | 16.749046 |
+    | 6（S4） | 39.9 | 16.760719 |
+
+  - S4 decode 已从早期版本的 2.37× 降到与 BF16 基本持平（本次实测 +3.9%）。
+    关键是 decode 读路径不再逐值解量化：
+    - q 每 split 量化为 int8（per head/chunk/lane），K 的 4 个 nibble 用两次
+      掩码 + 一次 PRMT 展成 4 个 int8 字节，K·q 是一条 dp4a；
+      per-channel-group 仿射直接作用在整数点积上，跨 lane 求和用一条
+      `redux.sync.add.s32`（Q18 定点）。旧路径的 4×FFMA + 5×SHFL + 5×FADD
+      被替换掉。
+    - 打包区间与 BF16 残差尾部拆成两个编译期特化循环；`head_size == 128`
+      再走 FULL 特化，热循环里没有 active-lane 谓词。
+    - softmax 把 log2e 与 Q18 因子折进 q，用 `ex2.approx` 直接算 base-2
+      指数；页级 metadata 基准（以及 `group_size == block_size` 时的 K
+      scale 对）每页解析一次。
+    - prefill 的 int4 tile staging 从 2B 逐值搬运改为 8B 向量，decode 的
+      K 组量化器用 512 线程打满完成组的并行度。
+  - 剩余差距主要来自 V：V 的权重是浮点，无法被整数点积吸收，仍要逐值展开
+    int4。收益仍在显存/容量（3.53×）；decode 延迟已接近 BF16，chunked
+    prefill 仍有约 1.34× 的差距。
+  - q 侧 int8 量化 + 定点规约会改变逐位路径，S4 与 BF16 不再保证 token 级
+    一致；质量门禁改用 PPL（decode +0.50%，chunked +0.07%）。
 
 
 

@@ -29,6 +29,19 @@
 // lost ~7% throughput with quantization off — the switch was numerically
 // transparent but not performance transparent.
 //
+// The packed K arm does not dequantize K at all. q is quantized once per split
+// to int8 per (head, chunk, lane), K's four codes are expanded to four int8
+// bytes with two masks and one PRMT, and the score's integer dot is one dp4a.
+// The per-channel-group affine is applied to that integer dot (it is a
+// lane-local coefficient), and the cross-lane sum is one integer
+// redux.sync.add — five shuffle steps and five adds were the single largest
+// instruction block in the old loop. The four positions of a step, the page's
+// metadata bases and (when group_size covers the page) the K scale pair are
+// hoisted; the residual tail runs as a second specialization of the same body
+// so the packed loop has no residual code in it. V still dequantizes per value
+// (its affine is folded into the weight, which no integer dot can absorb), and
+// is the remaining structural cost of the int4 cache.
+//
 // All q/k/v/output caches are raw bfloat16 (CUDA __nv_bfloat16, bit-compatible
 // with the uint16_t host representation). Internal score / softmax / output
 // arithmetic runs in float: the operands are exact bf16 values (products of
@@ -49,6 +62,7 @@
 #include <cstdlib>
 #include <map>
 #include <vector>
+#include <type_traits>
 #include <cuda_bf16.h>
 #include <cub/cub.cuh>
 #include "mha_kernel.cuh"
@@ -120,31 +134,11 @@ static bool check_kv_pools(const tensor::Tensor& key_cache, const tensor::Tensor
 // S4 codes are UNSIGNED [0, 15]: the asymmetry lives in the zero point, so a
 // nibble must not be sign-extended. (The removed symmetric arm stored -8..7;
 // reading these codes that way folds every value >= 8 by -16.)
-__device__ __forceinline__ float i4_nibble_to_float(uint32_t n) {
-  return static_cast<float>(n & 0xfu);
-}
-
-// Dequantize one 4-dim chunk: x = (q - zero) * scale.
-__device__ __forceinline__ void load_i4_chunk4(float* dst, const int8_t* cache, float scale,
-                                               float zero, int64_t off) {
-  const uint32_t raw = *reinterpret_cast<const uint16_t*>(cache + (off >> 1));
-  dst[0] = (i4_nibble_to_float(raw & 0xfu) - zero) * scale;
-  dst[1] = (i4_nibble_to_float((raw >> 4) & 0xfu) - zero) * scale;
-  dst[2] = (i4_nibble_to_float((raw >> 8) & 0xfu) - zero) * scale;
-  dst[3] = (i4_nibble_to_float((raw >> 12) & 0xfu) - zero) * scale;
-}
-
-// Same chunk from a prefill smem tile, where the packed row starts at the tile
-// row base (so only the element offset inside the row is halved).
-__device__ __forceinline__ void load_i4_tile_chunk4(float* dst, const int8_t* tile_row,
-                                                    float scale, float zero, int32_t elem_off) {
-  const uint32_t raw = *reinterpret_cast<const uint16_t*>(tile_row + (elem_off >> 1));
-  dst[0] = (i4_nibble_to_float(raw & 0xfu) - zero) * scale;
-  dst[1] = (i4_nibble_to_float((raw >> 4) & 0xfu) - zero) * scale;
-  dst[2] = (i4_nibble_to_float((raw >> 8) & 0xfu) - zero) * scale;
-  dst[3] = (i4_nibble_to_float((raw >> 12) & 0xfu) - zero) * scale;
-}
-
+//
+// The affine (x = (q - zero) * scale) is never applied per value on the packed
+// K arm: it is a lane-local coefficient on the integer dp4a result. The
+// value-side lookup below is the only place that materializes dequantized
+// codes, and it folds the affine into the weight accumulator instead.
 __device__ __forceinline__ void load_bf16_chunk4(float* dst, const __nv_bfloat16* cache,
                                                  int64_t off) {
   const uint2 raw = *reinterpret_cast<const uint2*>(cache + off);
@@ -175,6 +169,15 @@ __device__ __forceinline__ void load_i4_raw_chunk4(float* dst, const int8_t* cac
 // tile; `off` is the SOURCE element offset into the packed pool.
 // Raw codes from a packed smem tile (the value-side reader folds the affine
 // into its weight, exactly like load_i4_raw_chunk4 on the global path).
+// Packed-tile counterpart of load_i4_codes4: same nibble expansion for the
+// prefill compute loop's dp4a operand.
+__device__ __forceinline__ int load_i4_tile_codes4(const int8_t* tile_row, int32_t elem_off) {
+  const uint32_t raw = *reinterpret_cast<const uint16_t*>(tile_row + (elem_off >> 1));
+  const uint32_t lo = raw & 0x0f0fu;
+  const uint32_t hi = (raw >> 4) & 0x0f0fu;
+  return static_cast<int>(__byte_perm(lo, hi, 0x5140));
+}
+
 __device__ __forceinline__ void load_i4_tile_raw_chunk4(float* dst, const int8_t* tile_row,
                                                         int32_t elem_off) {
   const uint32_t raw = *reinterpret_cast<const uint16_t*>(tile_row + (elem_off >> 1));
@@ -182,6 +185,29 @@ __device__ __forceinline__ void load_i4_tile_raw_chunk4(float* dst, const int8_t
   dst[1] = static_cast<float>((raw >> 4) & 0xfu);
   dst[2] = static_cast<float>((raw >> 8) & 0xfu);
   dst[3] = static_cast<float>((raw >> 12) & 0xfu);
+}
+
+// Load one 4-dim int4 chunk as four int8 lanes packed into one 32-bit word
+// (byte d = code for dim d), the operand shape dp4a wants. The two nibble
+// masks and one byte permute replace four extract+I2F pairs, and the code
+// value (0..15) is a valid signed int8, so the K dot becomes one dp4a.
+__device__ __forceinline__ int load_i4_codes4(const int8_t* cache, int64_t off) {
+  const uint32_t raw = __ldg(reinterpret_cast<const uint16_t*>(cache + (off >> 1)));
+  const uint32_t lo = raw & 0x0f0fu;
+  const uint32_t hi = (raw >> 4) & 0x0f0fu;
+  // Selector nibbles (low to high) 0,4,1,5: lo.b0, hi.b0, lo.b1, hi.b1,
+  // i.e. the dim order n0,n1,n2,n3 that pack_i8x4 builds on the q side.
+  return static_cast<int>(__byte_perm(lo, hi, 0x5140));
+}
+
+// Pack four int8 values (each already in [-127, 127]) in dim order. Used once
+// per (head, chunk) when the query is quantized for dp4a.
+__device__ __forceinline__ int pack_i8x4(int a, int b, int c, int d) {
+  const uint32_t w = (static_cast<uint32_t>(a) & 0xffu) |
+                     ((static_cast<uint32_t>(b) & 0xffu) << 8) |
+                     ((static_cast<uint32_t>(c) & 0xffu) << 16) |
+                     ((static_cast<uint32_t>(d) & 0xffu) << 24);
+  return static_cast<int>(w);
 }
 
 // Warm the L2 for a packed K/V row that the next online-softmax step will
@@ -196,10 +222,33 @@ __device__ __forceinline__ void prefetch_l2(const void* p) {
   asm volatile("prefetch.global.L2 [%0];" ::"l"(addr));
 }
 
-__device__ __forceinline__ void stage_i4_row_chunk(int8_t* tile_dst, const int8_t* cache,
-                                                   int64_t off) {
-  *reinterpret_cast<uint16_t*>(tile_dst) =
-      *reinterpret_cast<const uint16_t*>(cache + (off >> 1));
+// Warp-wide fp32 sum through one integer redux instruction. The five-step
+// shfl butterfly it replaces costs ten instructions (5 SHFL + 5 FADD) per
+// score; redux.sync.add.s32 is one instruction on sm_80 and is exact for the
+// integer payload. Values are converted to Q18 fixed point (step 3.8e-6) and
+// back, so the result differs from the float sum only by the per-lane rounding
+// of a value that already carries bf16 input error. Scores are O(10), and the
+// int32 accumulator over 32 lanes stays six orders of magnitude away from
+// overflow even for a 2000-unit score.
+constexpr float kFixedScale = 262144.0f;               // 2^18
+constexpr float kFixedInvScale = 1.0f / kFixedScale;
+constexpr float kLog2e = 1.4426950408889634f;          // exp(x) == exp2(x * kLog2e)
+
+// Hardware ex2. fast_exp2() (without -use_fast_math) adds a subnormal range check
+// and two predicated rescale multiplies per call; the softmax exponent never
+// needs that (m is the running max, so the argument is <= 0). ex2.approx is
+// the same approximation __expf uses, with ~2^-22 relative error.
+__device__ __forceinline__ float fast_exp2(float x) {
+  float r;
+  asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x));
+  return r;
+}
+
+// The caller already folded kFixedScale into q (once per split), so `x` is
+// the Q18-scaled partial sum and the conversion is a single F2I.
+__device__ __forceinline__ float warp_sum_q18(float x) {
+  const int sum = __reduce_add_sync(0xffffffffu, __float2int_rn(x));
+  return static_cast<float>(sum) * kFixedInvScale;
 }
 
 // ========== Dynamic shared-memory opt-in ==========
@@ -1070,9 +1119,11 @@ void paged_kv_group_quantize_cu(const tensor::Tensor& src, const tensor::Tensor&
   const int32_t table_stride = block_table.get_dim(1);
   // One block per row; it loops channel groups only when the row completes a
   // group. (A channel_groups-wide grid made every no-op row far too expensive
-  // on the decode path.)
+  // on the decode path.) The idle path is a couple of loads, so the block is
+  // sized for the completing-row burst instead: 16 warps split the 128
+  // channel groups four ways versus the original 4.
   const dim3 grid(static_cast<unsigned>(batch));
-  const dim3 block(128);
+  const dim3 block(512);
   int8_t* dst = const_cast<int8_t*>(dst_cache.ptr<int8_t>());
   float* scale = const_cast<float*>(dst_scale.ptr<float>());
   float* zero = const_cast<float*>(dst_zero.ptr<float>());
@@ -1131,7 +1182,14 @@ void paged_kv_group_quantize_cu(const tensor::Tensor& src, const tensor::Tensor&
 // 2.4x decode regression. Capping it at 128 costs 24B of spill and restores
 // the second CTA. G=8 needs ~190 regs even in the bf16 arm (165), so it stays
 // at one CTA rather than spilling hundreds of bytes to chase the same limit.
-template <int G, int CHUNKS, bool QUANT>
+//
+// FULL marks the instantiations whose head_size is exactly CHUNKS * 128, i.e.
+// every lane owns 4 live dims. The generic instantiation predicates every K/V
+// load and accumulator on `active`, and initializes the inactive chunks'
+// registers to zero; on the served head_size == 128 geometry that is a pure
+// (and sizable) instruction tax in the inner loop, so the launcher selects the
+// FULL arm whenever the geometry allows it.
+template <int G, int CHUNKS, bool QUANT, bool FULL>
 __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_attn_split_kernel_bf16(
     const int32_t* __restrict__ positions, int32_t batch, const int32_t* __restrict__ block_table,
     int32_t table_stride, int32_t num_blocks, int32_t block_size, int32_t block_shift,
@@ -1161,7 +1219,10 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_attn_split_kernel
   if (b >= batch) return;
   const int kv_head = row_group - b * kv_head_num;
   const int pos = positions[b];
-  const float scale = 1.f / sqrtf(static_cast<float>(head_size));
+  // q carries the softmax scale, the log2 base conversion and the Q18 factor
+  // of the warp reduction, so each score reaches redux.sync already scaled and
+  // no per-score exponent multiply is needed.
+  const float scale = (1.f / sqrtf(static_cast<float>(head_size))) * kLog2e * kFixedScale;
 
   // The q heads reading this kv head are [head_begin, head_end): the inverse
   // of the head_offset = head * kv_head_num / head_num mapping used per head,
@@ -1182,7 +1243,7 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_attn_split_kernel
   bool active[CHUNKS];
 #pragma unroll
   for (int c = 0; c < CHUNKS; ++c) {
-    active[c] = (c * 128 + d0) < head_size;
+    active[c] = FULL || (c * 128 + d0) < head_size;
   }
 
   const int seq = pos + 1;
@@ -1201,7 +1262,9 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_attn_split_kernel
       float* row = empty + static_cast<int64_t>(i) * num_splits * (head_size + 4);
 #pragma unroll
       for (int c = 0; c < CHUNKS; ++c) {
-        if (active[c]) {
+        if constexpr (FULL) {
+          *reinterpret_cast<float4*>(row + c * 128 + d0) = make_float4(0.f, 0.f, 0.f, 0.f);
+        } else if (active[c]) {
           *reinterpret_cast<float4*>(row + c * 128 + d0) = make_float4(0.f, 0.f, 0.f, 0.f);
         }
       }
@@ -1213,38 +1276,41 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_attn_split_kernel
     return;
   }
 
-  // fp32 q with the softmax scale folded in. The same representation serves
-  // both arms: S4 dequantizes K/V while loading them, so the score is an
-  // ordinary fp32 dot in the quantized instantiation too.
+  // fp32 q with the softmax scale folded in. In the quantized instantiation
+  // this vector serves only the BF16 residual tail and the sub-4-position
+  // tail; the packed K arm quantizes it to int8 (qcodes + qscale) and runs the
+  // dot as dp4a. q is therefore reloaded (16B per head, L1-resident) before
+  // the residual tail instead of staying live across the hot loop, which keeps
+  // the instantiation under the 128-register occupancy cliff.
   float q[G][CHUNKS * kVec];
-  // Define every q slot up front: with an uneven GQA split the loop below
-  // loads only heads_here heads, and the sum(q) hoist would otherwise read
-  // registers that were never written.
-#pragma unroll
-  for (int i = 0; i < G; ++i) {
-#pragma unroll
-    for (int c = 0; c < CHUNKS * kVec; ++c) q[i][c] = 0.f;
-  }
   const int64_t q_row = static_cast<int64_t>(b) * dim + static_cast<int64_t>(my_begin) * head_size;
-#pragma unroll
-  for (int i = 0; i < G; ++i) {
-    if (i >= heads_here) break;
-#pragma unroll
-    for (int c = 0; c < CHUNKS; ++c) {
-      const int d = c * 128 + d0;
-      if (!active[c]) {
-        for (int v = 0; v < kVec; ++v) q[i][c * kVec + v] = 0.f;
-        continue;
-      }
-      const uint2 raw =
-          *reinterpret_cast<const uint2*>(query + q_row + static_cast<int64_t>(i) * head_size + d);
-      const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&raw);
-      q[i][c * kVec + 0] = __bfloat162float(h[0].x) * scale;
-      q[i][c * kVec + 1] = __bfloat162float(h[0].y) * scale;
-      q[i][c * kVec + 2] = __bfloat162float(h[1].x) * scale;
-      q[i][c * kVec + 3] = __bfloat162float(h[1].y) * scale;
+  auto load_q = [&]() {
+    for (int i = heads_here; i < G; ++i) {
+      for (int c = 0; c < CHUNKS * kVec; ++c) q[i][c] = 0.f;
     }
-  }
+#pragma unroll
+    for (int i = 0; i < G; ++i) {
+      if (i >= heads_here) break;
+#pragma unroll
+      for (int c = 0; c < CHUNKS; ++c) {
+        const int d = c * 128 + d0;
+        if constexpr (!FULL) {
+          if (!active[c]) {
+            for (int v = 0; v < kVec; ++v) q[i][c * kVec + v] = 0.f;
+            continue;
+          }
+        }
+        const uint2 raw = __ldg(
+            reinterpret_cast<const uint2*>(query + q_row + static_cast<int64_t>(i) * head_size + d));
+        const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&raw);
+        q[i][c * kVec + 0] = __bfloat162float(h[0].x) * scale;
+        q[i][c * kVec + 1] = __bfloat162float(h[0].y) * scale;
+        q[i][c * kVec + 2] = __bfloat162float(h[1].x) * scale;
+        q[i][c * kVec + 3] = __bfloat162float(h[1].y) * scale;
+      }
+    }
+  };
+  load_q();
 
   // sum(q) per head is loop-invariant: hoist it out of the per-group walk.
   // The association matches the previous in-loop expression exactly, so the
@@ -1259,6 +1325,35 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_attn_split_kernel
       sq += q[i][o + 0] + q[i][o + 1] + q[i][o + 2] + q[i][o + 3];
     }
     sumq_i[i] = sq;
+  }
+
+  // dp4a operands: q quantized to int8 per (head, chunk, lane) and the scale
+  // that maps an integer dot back to the Q18/log2 score domain. The scale is
+  // per lane, so the K affine (which is per channel group and therefore per
+  // lane as well) is applied to the integer dot before the warp reduction.
+  int qcodes[QUANT ? G : 1][QUANT ? CHUNKS : 1];
+  float qscale_i[QUANT ? G : 1][QUANT ? CHUNKS : 1];
+  if constexpr (QUANT) {
+#pragma unroll
+    for (int i = 0; i < G; ++i) {
+      if (i >= heads_here) break;
+#pragma unroll
+      for (int c = 0; c < CHUNKS; ++c) {
+        const int o = c * kVec;
+        float mx = fabsf(q[i][o + 0]);
+        mx = fmaxf(mx, fabsf(q[i][o + 1]));
+        mx = fmaxf(mx, fabsf(q[i][o + 2]));
+        mx = fmaxf(mx, fabsf(q[i][o + 3]));
+        const float qs = mx > 0.f ? mx * (1.f / 127.f) : 1.f;
+        const float inv = 1.f / qs;
+        const int c0 = max(-127, min(127, __float2int_rn(q[i][o + 0] * inv)));
+        const int c1 = max(-127, min(127, __float2int_rn(q[i][o + 1] * inv)));
+        const int c2 = max(-127, min(127, __float2int_rn(q[i][o + 2] * inv)));
+        const int c3 = max(-127, min(127, __float2int_rn(q[i][o + 3] * inv)));
+        qcodes[i][c] = pack_i8x4(c0, c1, c2, c3);
+        qscale_i[i][c] = qs;
+      }
+    }
   }
 
   float m_i[G];  // online flash statistics, warp-uniform per head
@@ -1329,17 +1424,22 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_attn_split_kernel
   const int64_t residual_layer_base =
       QUANT ? static_cast<int64_t>(layer_idx) * residual_batch * group_size * kv_dim : 0;
 
-  int64_t row[kGroup];
-  int gpos = begin;
-  for (; gpos + kGroup <= end; gpos += kGroup) {
-    const int32_t pg = __ldg(table_row + (gpos >> block_shift));
-    const int off = gpos & (block_size - 1);
-    const int64_t row0 = layer_base + static_cast<int64_t>(pg) * (block_size * kv_dim) +
-                         kv_head_off + static_cast<int64_t>(off) * kv_dim + d0;
+  // One 4-position online-softmax step. K_POOL is a compile-time flag: the
+  // quantized prefix and the BF16 residual tail are walked by two separate
+  // loops so the hot (packed) loop carries no residual load, no residual
+  // address math and no per-load "which arm?" predicate. Both loops share
+  // this body, so the arithmetic of a step is identical in the two ranges.
+  auto process_group = [&](int gpos, int off, int64_t row_page, int64_t srow_page, float ks,
+                           float kz, auto k_pool_tag) {
+    constexpr bool K_POOL = decltype(k_pool_tag)::value;
+    int64_t row[kGroup];
+    // The page base and the K group's (scale, zero) are loop-invariant over
+    // the steps of one physical page and are hoisted by the dispatch below.
+    const int64_t row0 = row_page + static_cast<int64_t>(off) * kv_dim;
 #pragma unroll
     for (int j = 0; j < kGroup; ++j) row[j] = row0 + static_cast<int64_t>(j) * kv_dim;
 
-    if constexpr (QUANT) {
+    if constexpr (QUANT && K_POOL) {
       // Prefetch the next 4-position group while this one is computed. One
       // lane issues the requests: the pool halves the element offset, and a
       // 128B L2 line started at the head slice covers the whole slice.
@@ -1359,27 +1459,16 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_attn_split_kernel
       }
     }
 
-    float ks = 1.f;
-    float kz = 0.f;
     float vs[kGroup];
     float vz[kGroup];
     if constexpr (QUANT) {
       // The whole 4-position step is either quantized or residual: the
       // boundary is a multiple of kGroup, so no step straddles it.
-      if (gpos < boundary) {
-        const int64_t kidx = key_meta_layer_base +
-                             (static_cast<int64_t>(pg) * groups_per_block + (off >> group_shift)) *
-                                 channel_groups +
-                             lane_cg;
-        ks = __ldg(key_scale + kidx);
-        kz = __ldg(key_zero + kidx);
-      }
-      const int64_t srow = value_meta_layer_base +
-                           (static_cast<int64_t>(pg) * kv_head_num + kv_head) * block_size + off;
+      const int64_t srow = srow_page + off;
       // The pos index is the innermost V-metadata dimension and gpos is
       // 4-aligned, so these are one 16-byte-aligned float4 each.
-      const float4 ts = *reinterpret_cast<const float4*>(value_scale + srow);
-      const float4 tz = *reinterpret_cast<const float4*>(value_zero + srow);
+      const float4 ts = __ldg(reinterpret_cast<const float4*>(value_scale + srow));
+      const float4 tz = __ldg(reinterpret_cast<const float4*>(value_zero + srow));
       vs[0] = ts.x;
       vs[1] = ts.y;
       vs[2] = ts.z;
@@ -1392,33 +1481,38 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_attn_split_kernel
 
     float v_reg[kGroup][CHUNKS * kVec];
     float kf[kGroup][CHUNKS * kVec];
+    int kcodes[kGroup][QUANT ? CHUNKS : 1];
 #pragma unroll
     for (int j = 0; j < kGroup; ++j) {
 #pragma unroll
       for (int c = 0; c < CHUNKS; ++c) {
-        if (!active[c]) {
-          for (int v = 0; v < kVec; ++v) {
-            kf[j][c * kVec + v] = 0.f;
-            v_reg[j][c * kVec + v] = 0.f;
+        if constexpr (!FULL) {
+          if (!active[c]) {
+            for (int v = 0; v < kVec; ++v) {
+              kf[j][c * kVec + v] = 0.f;
+              v_reg[j][c * kVec + v] = 0.f;
+            }
+            if constexpr (QUANT) kcodes[j][c] = 0;
+            continue;
           }
-          continue;
         }
-        if constexpr (QUANT) {
-          if (gpos < boundary) {
-            load_i4_raw_chunk4(kf[j] + c * kVec, key_cache_i4, row[j] + c * 128);
-          } else {
-            // K of the incomplete tail group comes from the BF16 residual
-            // window; V below still comes from the packed pool (V is
-            // quantized immediately, with no residual).
-            const int rp = (gpos + j) & group_mask;
-            const int64_t roff = residual_layer_base +
-                                 static_cast<int64_t>(slot) * group_size * kv_dim +
-                                 static_cast<int64_t>(rp) * kv_dim + kv_head_off + d0 + c * 128;
-            load_bf16_chunk4(kf[j] + c * kVec, key_residual, roff);
-          }
-          load_i4_raw_chunk4(v_reg[j] + c * kVec, value_cache_i4, row[j] + c * 128);
+        if constexpr (QUANT && K_POOL) {
+          kcodes[j][c] = load_i4_codes4(key_cache_i4, row[j] + c * 128);
+        } else if constexpr (QUANT) {
+          // K of the incomplete tail group comes from the BF16 residual
+          // window; V below still comes from the packed pool (V is
+          // quantized immediately, with no residual).
+          const int rp = (gpos + j) & group_mask;
+          const int64_t roff = residual_layer_base +
+                               static_cast<int64_t>(slot) * group_size * kv_dim +
+                               static_cast<int64_t>(rp) * kv_dim + kv_head_off + d0 + c * 128;
+          load_bf16_chunk4(kf[j] + c * kVec, key_residual, roff);
         } else {
           load_bf16_chunk4(kf[j] + c * kVec, key_cache, row[j] + c * 128);
+        }
+        if constexpr (QUANT) {
+          load_i4_raw_chunk4(v_reg[j] + c * kVec, value_cache_i4, row[j] + c * 128);
+        } else {
           load_bf16_chunk4(v_reg[j] + c * kVec, value_cache, row[j] + c * 128);
         }
       }
@@ -1427,42 +1521,54 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_attn_split_kernel
     for (int i = 0; i < G; ++i) {
       if (i >= heads_here) break;
       float s[kGroup];
-      const bool k_from_pool = QUANT && (gpos < boundary);
       // sum(q) over this lane's dims: the affine is
       //   sum_d q_d*(code_d - zero)*scale = scale*(dot - zero * sum_d q_d),
       // so the zero-point term multiplies sum(q), NOT sum(code). q is fixed
       // across the four positions, so this is hoisted out of the j loop.
+      // Integer-dot affine: score = ks*(qscale*sum_dot - kz*sumq). Both
+      // coefficients are per lane, so the affine lands before the reduction.
       const float sumq = sumq_i[i];
+      float aff[CHUNKS];
+      float cterm = 0.f;
+      if constexpr (QUANT && K_POOL) {
+        cterm = ks * kz * sumq;
+#pragma unroll
+        for (int c = 0; c < CHUNKS; ++c) aff[c] = ks * qscale_i[i][c];
+      }
 #pragma unroll
       for (int j = 0; j < kGroup; ++j) {
-        float dot = q[i][0] * kf[j][0] + q[i][1] * kf[j][1] + q[i][2] * kf[j][2] +
-                    q[i][3] * kf[j][3];
+        if constexpr (QUANT && K_POOL) {
+          float sp = -cterm;
 #pragma unroll
-        for (int c = 1; c < CHUNKS; ++c) {
-          const int o = c * kVec;
-          dot += q[i][o + 0] * kf[j][o + 0] + q[i][o + 1] * kf[j][o + 1] +
-                 q[i][o + 2] * kf[j][o + 2] + q[i][o + 3] * kf[j][o + 3];
+          for (int c = 0; c < CHUNKS; ++c) {
+            const int di = __dp4a(qcodes[i][c], kcodes[j][c], 0);
+            sp += aff[c] * static_cast<float>(di);
+          }
+          s[j] = sp;
+        } else {
+          float dot = q[i][0] * kf[j][0] + q[i][1] * kf[j][1] + q[i][2] * kf[j][2] +
+                      q[i][3] * kf[j][3];
+#pragma unroll
+          for (int c = 1; c < CHUNKS; ++c) {
+            const int o = c * kVec;
+            dot += q[i][o + 0] * kf[j][o + 0] + q[i][o + 1] * kf[j][o + 1] +
+                   q[i][o + 2] * kf[j][o + 2] + q[i][o + 3] * kf[j][o + 3];
+          }
+          s[j] = dot;
         }
-        // Raw int4 codes: the affine is per lane (one channel group), so it
-        // lands here, before the cross-lane reduction. bf16/residual K needs
-        // neither term.
-        s[j] = k_from_pool ? (dot - kz * sumq) * ks : dot;
       }
-      // Independent across j, so the four reductions overlap.
+      // One redux.sync per score (see warp_sum_q18). The four are independent.
 #pragma unroll
-      for (int j = 0; j < kGroup; ++j) {
-#pragma unroll
-        for (int off = 16; off; off >>= 1) s[j] += __shfl_xor_sync(0xffffffffu, s[j], off);
-      }
+      for (int j = 0; j < kGroup; ++j) s[j] = warp_sum_q18(s[j]);
       float m_new = m_i[i];
 #pragma unroll
       for (int j = 0; j < kGroup; ++j) m_new = fmaxf(m_new, s[j]);
-      const float alpha = __expf(m_i[i] - m_new);
+      const float alpha = fast_exp2(m_i[i] - m_new);
       float l_new = l_i[i] * alpha;
       float p[kGroup];
 #pragma unroll
       for (int j = 0; j < kGroup; ++j) {
-        p[j] = __expf(s[j] - m_new);
+        p[j] = fast_exp2(s[j] - m_new);
         l_new += p[j];
       }
       // V's affine transform is folded into the weight: w_j = p_j * scale_j,
@@ -1489,6 +1595,71 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_attn_split_kernel
       corr_i[i] = corr_i[i] * alpha + corr_add;
       m_i[i] = m_new;
       l_i[i] = l_new;
+    }
+  };
+
+  int gpos = begin;
+  if constexpr (QUANT) {
+    // [begin, boundary) is int4 K; [boundary, end) is the BF16 residual
+    // window. `boundary` is kGroup-aligned, so no 4-position step straddles
+    // the two arms. On a long decode split the packed range is all but the
+    // last one or two steps.
+    //
+    // Steps are grouped by physical page: the page base, the V metadata base
+    // and (when group_size covers the page) the K scale pair are identical
+    // for all steps of a page, so they are resolved once per page instead of
+    // once per 4 positions.
+    const int packed_end = min(end, boundary);
+    while (gpos + kGroup <= packed_end) {
+      const int32_t pg = __ldg(table_row + (gpos >> block_shift));
+      const int off0 = gpos & (block_size - 1);
+      const int steps =
+          min((block_size - off0) / kGroup, (packed_end - gpos) / kGroup);
+      const int64_t row_page =
+          layer_base + static_cast<int64_t>(pg) * (block_size * kv_dim) + kv_head_off + d0;
+      const int64_t srow_page = value_meta_layer_base +
+                                (static_cast<int64_t>(pg) * kv_head_num + kv_head) * block_size;
+      float ks = 1.f;
+      float kz = 0.f;
+      int last_group = -1;
+      for (int s = 0; s < steps; ++s, gpos += kGroup) {
+        const int off = off0 + s * kGroup;
+        const int group = off >> group_shift;
+        if (group != last_group) {
+          const int64_t kidx =
+              key_meta_layer_base +
+              (static_cast<int64_t>(pg) * groups_per_block + group) * channel_groups + lane_cg;
+          ks = __ldg(key_scale + kidx);
+          kz = __ldg(key_zero + kidx);
+          last_group = group;
+        }
+        process_group(gpos, off, row_page, srow_page, ks, kz,
+                      std::integral_constant<bool, true>{});
+      }
+    }
+    // The residual loop is the only consumer of the fp32 q in this arm.
+    load_q();
+    for (; gpos + kGroup <= end; gpos += kGroup) {
+      const int32_t pg = __ldg(table_row + (gpos >> block_shift));
+      const int off = gpos & (block_size - 1);
+      const int64_t row_page =
+          layer_base + static_cast<int64_t>(pg) * (block_size * kv_dim) + kv_head_off + d0;
+      const int64_t srow_page = value_meta_layer_base +
+                                (static_cast<int64_t>(pg) * kv_head_num + kv_head) * block_size;
+      process_group(gpos, off, row_page, srow_page, 1.f, 0.f,
+                    std::integral_constant<bool, false>{});
+    }
+  } else {
+    while (gpos + kGroup <= end) {
+      const int32_t pg = __ldg(table_row + (gpos >> block_shift));
+      const int off0 = gpos & (block_size - 1);
+      const int steps = min((block_size - off0) / kGroup, (end - gpos) / kGroup);
+      const int64_t row_page =
+          layer_base + static_cast<int64_t>(pg) * (block_size * kv_dim) + kv_head_off + d0;
+      for (int s = 0; s < steps; ++s, gpos += kGroup) {
+        process_group(gpos, off0 + s * kGroup, row_page, 0, 1.f, 0.f,
+                      std::integral_constant<bool, true>{});
+      }
     }
   }
   for (; gpos < end; ++gpos) {
@@ -1554,11 +1725,10 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_attn_split_kernel
       }
       const float sumq = sumq_i[i];
       float s = (QUANT && gpos < boundary) ? (dot - kz * sumq) * ks : dot;
-#pragma unroll
-      for (int off = 16; off; off >>= 1) s += __shfl_xor_sync(0xffffffffu, s, off);
+      s = warp_sum_q18(s);
       const float m_new = fmaxf(m_i[i], s);
-      const float alpha = __expf(m_i[i] - m_new);
-      const float pr = __expf(s - m_new);
+      const float alpha = fast_exp2(m_i[i] - m_new);
+      const float pr = fast_exp2(s - m_new);
       l_i[i] = l_i[i] * alpha + pr;
       // Same folded affine as the group loop.
       float w = pr;
@@ -1588,7 +1758,11 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_attn_split_kernel
     for (int c = 0; c < CHUNKS * kVec; ++c) acc[i][c] -= corr_i[i];
 #pragma unroll
     for (int c = 0; c < CHUNKS; ++c) {
-      if (active[c]) {
+      if constexpr (FULL) {
+        const int o = c * kVec;
+        *reinterpret_cast<float4*>(out_partial + c * 128 + d0) =
+            make_float4(acc[i][o + 0], acc[i][o + 1], acc[i][o + 2], acc[i][o + 3]);
+      } else if (active[c]) {
         const int o = c * kVec;
         *reinterpret_cast<float4*>(out_partial + c * 128 + d0) =
             make_float4(acc[i][o + 0], acc[i][o + 1], acc[i][o + 2], acc[i][o + 3]);
@@ -1636,7 +1810,7 @@ __global__ void paged_attn_split_combine_kernel_bf16(const float* __restrict__ p
     const float* ps = base + static_cast<int64_t>(s) * (head_size + 4);
     // Empty splits carry m = -FLT_MAX, so w underflows to exactly 0 and the
     // slot drops out of both sums.
-    const float w = __expf(ps[head_size] - m);
+    const float w = fast_exp2(ps[head_size] - m);
     l += w * ps[head_size + 1];
     if (d < head_size) {
       o += w * __ldg(ps + d);
@@ -1664,7 +1838,7 @@ static int block_shift_for(int32_t block_size) {
 // the arm split: the bf16 callers reach only the QUANT false instantiations,
 // which carry no int4 code.
 template <bool QUANT>
-static void launch_paged_attn_split(int32_t heads_per_warp, int32_t chunks, unsigned grid,
+static void launch_paged_attn_split(int32_t heads_per_warp, int32_t chunks, bool full, unsigned grid,
                                     const int32_t* positions, int32_t batch,
                                     const int32_t* block_table, int32_t table_stride,
                                     int32_t num_blocks, int32_t block_size, int32_t block_shift,
@@ -1680,27 +1854,34 @@ static void launch_paged_attn_split(int32_t heads_per_warp, int32_t chunks, unsi
                                     int32_t head_size, int32_t num_splits, int32_t head_groups,
                                     int32_t residual_batch, int32_t group_size,
                                     int32_t channel_group, cudaStream_t stream) {
-#define LAUNCH_PAGED_SPLIT(G, C)                                                                \
-  paged_attn_split_kernel_bf16<G, C, QUANT><<<grid, 256, 0, stream>>>(                      \
+#define LAUNCH_PAGED_SPLIT(G, C, F)                                                             \
+  paged_attn_split_kernel_bf16<G, C, QUANT, F><<<grid, 256, 0, stream>>>(                  \
       positions, batch, block_table, table_stride, num_blocks, block_size, block_shift,         \
       layer_idx, dim, query, partials, key_cache, value_cache, key_cache_i4, value_cache_i4,    \
       key_scale, key_zero, value_scale, value_zero, key_residual, kv_slots, seq_row_start,    \
       num_decode_rows, num_prefill_seqs, kv_dim, kv_head_num, head_num, head_size, num_splits, \
       head_groups, residual_batch, group_size, channel_group)
-  if (chunks == 1) {
-    switch (heads_per_warp) {
-      case 1: LAUNCH_PAGED_SPLIT(1, 1); break;
-      case 2: LAUNCH_PAGED_SPLIT(2, 1); break;
-      case 4: LAUNCH_PAGED_SPLIT(4, 1); break;
-      default: LAUNCH_PAGED_SPLIT(8, 1); break;
-    }
-  } else {
-    switch (heads_per_warp) {
-      case 1: LAUNCH_PAGED_SPLIT(1, 2); break;
-      case 2: LAUNCH_PAGED_SPLIT(2, 2); break;
-      default: LAUNCH_PAGED_SPLIT(4, 2); break;
-    }
+#define DISPATCH_PAGED_SPLIT(F)                                                                 \
+  if (chunks == 1) {                                                                            \
+    switch (heads_per_warp) {                                                                   \
+      case 1: LAUNCH_PAGED_SPLIT(1, 1, F); break;                                               \
+      case 2: LAUNCH_PAGED_SPLIT(2, 1, F); break;                                               \
+      case 4: LAUNCH_PAGED_SPLIT(4, 1, F); break;                                               \
+      default: LAUNCH_PAGED_SPLIT(8, 1, F); break;                                              \
+    }                                                                                           \
+  } else {                                                                                      \
+    switch (heads_per_warp) {                                                                   \
+      case 1: LAUNCH_PAGED_SPLIT(1, 2, F); break;                                               \
+      case 2: LAUNCH_PAGED_SPLIT(2, 2, F); break;                                               \
+      default: LAUNCH_PAGED_SPLIT(4, 2, F); break;                                              \
+    }                                                                                           \
   }
+  if (full) {
+    DISPATCH_PAGED_SPLIT(true)
+  } else {
+    DISPATCH_PAGED_SPLIT(false)
+  }
+#undef DISPATCH_PAGED_SPLIT
 #undef LAUNCH_PAGED_SPLIT
 }
 
@@ -1750,6 +1931,9 @@ void paged_attention_cu_batch(int32_t head_num, int32_t layer_idx, int32_t num_b
   // extreme GQA ratio) are covered by several warps over the same split, so
   // the K/V row they share is still loaded once per warp.
   const int32_t warp_cap = chunks == 1 ? 8 : 4;
+  // Every lane is live only when head_size spans the whole CHUNKS*128 tile;
+  // otherwise the kernel must predicate the tail lanes.
+  const bool full = head_size == chunks * 128;
   int32_t heads_per_warp = 1;
   while (heads_per_warp * 2 <= head_group && heads_per_warp * 2 <= warp_cap) {
     heads_per_warp *= 2;
@@ -1807,7 +1991,7 @@ void paged_attention_cu_batch(int32_t head_num, int32_t layer_idx, int32_t num_b
   const int32_t residual_batch = kq ? key_residual.get_dim(1) : 0;
 
 #define PAGED_SPLIT_ARGS                                                                          \
-  heads_per_warp, chunks, grid, positions.ptr<int32_t>(), batch, block_table.ptr<int32_t>(),      \
+  heads_per_warp, chunks, full, grid, positions.ptr<int32_t>(), batch, block_table.ptr<int32_t>(),\
       table_stride, num_blocks, block_size, block_shift, layer_idx, dim, query, partials, kcache, \
       vcache, kcache_i4, vcache_i4, kscale, kzero, vscale, vzero, kresidual, slots, row_start,    \
       num_decode_rows, num_prefill_seqs, kv_dim, kv_head_num, head_num, head_size, num_splits,    \
@@ -1874,7 +2058,12 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_prefill_kernel_bf
   constexpr int kTileKv = 64;   // KV rows staged per tile
   constexpr int kLoadVec = 8;   // bf16 per loader vector (16B, one uint4)
   constexpr int kChunks = 128 / kLoadVec;  // loader vectors per row (head_size == 128)
-  constexpr int kInt4Vec = 4;   // dims per loader vector in a packed int4 row (2B)
+  // int4 staging moves one 8B vector per thread (16 packed dims). The int4
+  // alias of the tile has a 136B row stride (a multiple of 8 but not of 16),
+  // so 16B vectors would be misaligned on odd rows; 8B is the widest safe
+  // transaction. It still cuts the staging instruction count 4x versus the
+  // original 2B loads.
+  constexpr int kInt4Vec = 16;  // dims per loader vector in a packed int4 row (8B)
   constexpr int kInt4Chunks = 128 / kInt4Vec;  // ... same row, int4 arm
   constexpr int kPad = 136;     // 136 * 2B = 272B: rows stay 16B aligned
   __shared__ __align__(16) __nv_bfloat16 s_k[kTileKv][kPad];
@@ -1928,14 +2117,22 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_prefill_kernel_bf
   __syncthreads();
   const int tiles = (s_max_pos + kTileKv - 1) / kTileKv;
 
-  const float scale = 1.f / sqrtf(static_cast<float>(head_size));
+  // Same folded scale as the decode kernel: softmax base 2 and the Q18
+  // factor of the warp reduction live in q.
+  const float scale = (1.f / sqrtf(static_cast<float>(head_size))) * kLog2e * kFixedScale;
   // q heads served by this kv head; G may exceed the exact group size when
   // head_num is not a multiple of kv_head_num (head_num=36 / 8 -> 5,5,4,...).
   const int head_begin = (kv_head * head_num + kv_head_num - 1) / kv_head_num;
   const int head_end = ((kv_head + 1) * head_num + kv_head_num - 1) / kv_head_num;
   const int heads_here = head_end - head_begin;
 
-  float q[G][kVec];
+  // The quantized arm keeps q as int8 codes + a per-lane scale and rebuilds
+  // the fp32 values only in the BF16 residual branches (the packed K dot is a
+  // dp4a). Holding both representations live across the tile loop spills on
+  // the 128-register occupancy cliff. The BF16 arm keeps the fp32 vector.
+  float q[QUANT ? 1 : G][kVec];
+  int qcodes[QUANT ? G : 1];
+  float qscale_i[QUANT ? G : 1];
   float sumq_i[G];  // loop-invariant per-head sum(q), as in the decode kernel
 #pragma unroll
   for (int i = 0; i < G; ++i) sumq_i[i] = 0.f;
@@ -1945,13 +2142,31 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_prefill_kernel_bf
       if (i >= heads_here) break;
       const __nv_bfloat16* q_head =
           query + static_cast<int64_t>(my_row) * dim + (head_begin + i) * head_size + lane * kVec;
-      const uint2 raw = *reinterpret_cast<const uint2*>(q_head);
+      const uint2 raw = __ldg(reinterpret_cast<const uint2*>(q_head));
       const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&raw);
-      q[i][0] = __bfloat162float(h[0].x) * scale;
-      q[i][1] = __bfloat162float(h[0].y) * scale;
-      q[i][2] = __bfloat162float(h[1].x) * scale;
-      q[i][3] = __bfloat162float(h[1].y) * scale;
-      sumq_i[i] = q[i][0] + q[i][1] + q[i][2] + q[i][3];
+      const float q0 = __bfloat162float(h[0].x) * scale;
+      const float q1 = __bfloat162float(h[0].y) * scale;
+      const float q2 = __bfloat162float(h[1].x) * scale;
+      const float q3 = __bfloat162float(h[1].y) * scale;
+      sumq_i[i] = q0 + q1 + q2 + q3;
+      if constexpr (QUANT) {
+        float mx = fabsf(q0);
+        mx = fmaxf(mx, fabsf(q1));
+        mx = fmaxf(mx, fabsf(q2));
+        mx = fmaxf(mx, fabsf(q3));
+        const float qs = mx > 0.f ? mx * (1.f / 127.f) : 1.f;
+        const float inv = 1.f / qs;
+        qcodes[i] = pack_i8x4(max(-127, min(127, __float2int_rn(q0 * inv))),
+                              max(-127, min(127, __float2int_rn(q1 * inv))),
+                              max(-127, min(127, __float2int_rn(q2 * inv))),
+                              max(-127, min(127, __float2int_rn(q3 * inv))));
+        qscale_i[i] = qs;
+      } else {
+        q[i][0] = q0;
+        q[i][1] = q1;
+        q[i][2] = q2;
+        q[i][3] = q3;
+      }
     }
   }
 
@@ -2034,7 +2249,8 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_prefill_kernel_bf
                             static_cast<int64_t>(gpos & (block_size - 1)) * kv_dim + kv_head_off +
                             ch;
         if constexpr (QUANT) {
-          stage_i4_row_chunk(&s_k4[r][ch >> 1], key_cache_i4, src);
+          *reinterpret_cast<uint2*>(&s_k4[r][ch >> 1]) =
+              *reinterpret_cast<const uint2*>(key_cache_i4 + (src >> 1));
         } else {
           *reinterpret_cast<uint4*>(&s_k[r][ch]) =
               *reinterpret_cast<const uint4*>(key_cache + src);
@@ -2051,7 +2267,8 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_prefill_kernel_bf
                             static_cast<int64_t>(gpos & (block_size - 1)) * kv_dim + kv_head_off +
                             ch;
         if constexpr (QUANT) {
-          stage_i4_row_chunk(&s_v4[r][ch >> 1], value_cache_i4, src);
+          *reinterpret_cast<uint2*>(&s_v4[r][ch >> 1]) =
+              *reinterpret_cast<const uint2*>(value_cache_i4 + (src >> 1));
         } else {
           *reinterpret_cast<uint4*>(&s_v[r][ch]) =
               *reinterpret_cast<const uint4*>(value_cache + src);
@@ -2064,43 +2281,44 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_prefill_kernel_bf
       const int p_end = min(tile_pos + kTileKv, limit);
       int p = tile_pos;
       // Complete groups of 4 positions: one rescale per group, exactly the
-      // walk the decode kernel makes over the same prefix.
-      for (; p + kGroup <= p_end; p += kGroup) {
+      // walk the decode kernel makes over the same prefix. As in the decode
+      // kernel the packed prefix and the BF16 residual tail run through two
+      // specializations of the same body, so the hot (packed) code carries no
+      // residual load, address math or predicate.
+      auto process_quad = [&](int p, auto k_pool_tag) {
+        constexpr bool K_POOL = decltype(k_pool_tag)::value;
         float kf[kGroup][kVec];
         float vf[kGroup][kVec];
+        int kc[kGroup];
         const int sp = p - tile_pos;
-        // The whole 4-position step is either packed or residual: the group
-        // boundary is a multiple of kGroup.
-        const bool residual_k = QUANT && (p >= boundary);
         float ks = 1.f;
         float kz = 0.f;
-        if constexpr (QUANT) {
-          if (!residual_k) {
-            const int64_t kidx = key_meta_layer_base +
-                                 (static_cast<int64_t>(s_pg[sp]) * groups_per_block +
-                                  ((p & (block_size - 1)) >> group_shift)) *
-                                     channel_groups +
-                                 lane_cg;
-            ks = __ldg(key_scale + kidx);
-            kz = __ldg(key_zero + kidx);
-          }
+        if constexpr (QUANT && K_POOL) {
+          const int64_t kidx = key_meta_layer_base +
+                               (static_cast<int64_t>(s_pg[sp]) * groups_per_block +
+                                ((p & (block_size - 1)) >> group_shift)) *
+                                   channel_groups +
+                               lane_cg;
+          ks = __ldg(key_scale + kidx);
+          kz = __ldg(key_zero + kidx);
         }
 #pragma unroll
         for (int j = 0; j < kGroup; ++j) {
           // The K/V slice of a kv head is shared by all G q heads, so it is
           // read once per (position, lane) and reused across the head loop.
-          if constexpr (QUANT) {
-            if (residual_k) {
-              const int rp = (p + j) & group_mask;
-              const int64_t roff = residual_layer_base +
-                                   static_cast<int64_t>(rp) * kv_dim + kv_head_off + lane * kVec;
-              load_bf16_chunk4(kf[j], key_residual, roff);
-            } else {
-              load_i4_tile_raw_chunk4(kf[j], s_k4[sp + j], lane * kVec);
-            }
-            load_i4_tile_raw_chunk4(vf[j], s_v4[sp + j], lane * kVec);
+          if constexpr (QUANT && K_POOL) {
+            kc[j] = load_i4_tile_codes4(s_k4[sp + j], lane * kVec);
+          } else if constexpr (QUANT) {
+            const int rp = (p + j) & group_mask;
+            const int64_t roff = residual_layer_base +
+                                 static_cast<int64_t>(rp) * kv_dim + kv_head_off + lane * kVec;
+            load_bf16_chunk4(kf[j], key_residual, roff);
           } else {
             load_bf16_chunk4(kf[j], s_k[sp + j], lane * kVec);
+          }
+          if constexpr (QUANT) {
+            load_i4_tile_raw_chunk4(vf[j], s_v4[sp + j], lane * kVec);
+          } else {
             load_bf16_chunk4(vf[j], s_v[sp + j], lane * kVec);
           }
         }
@@ -2109,33 +2327,46 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_prefill_kernel_bf
           if (i >= heads_here) break;
           float s[kGroup];
           const float sumq = sumq_i[i];
+          if constexpr (QUANT && K_POOL) {
+            const float aff = ks * qscale_i[i];
+            const float cterm = ks * kz * sumq;
 #pragma unroll
-          for (int j = 0; j < kGroup; ++j) {
-            const float dot = q[i][0] * kf[j][0] + q[i][1] * kf[j][1] + q[i][2] * kf[j][2] +
-                              q[i][3] * kf[j][3];
-            // Raw int4 codes: the affine is per lane (one channel group), so
-            // it lands here, before the cross-lane reduction. The zero term
-            // multiplies sum(q), not sum(code).
-            s[j] = residual_k ? dot : (dot - kz * sumq) * ks;
+            for (int j = 0; j < kGroup; ++j) {
+              s[j] = aff * static_cast<float>(__dp4a(qcodes[i], kc[j], 0)) - cterm;
+            }
+          } else if constexpr (QUANT) {
+            const int qc = qcodes[i];
+            const float qs = qscale_i[i];
+            const float qf0 = static_cast<float>(static_cast<int8_t>(qc & 0xff)) * qs;
+            const float qf1 = static_cast<float>(static_cast<int8_t>((qc >> 8) & 0xff)) * qs;
+            const float qf2 = static_cast<float>(static_cast<int8_t>((qc >> 16) & 0xff)) * qs;
+            const float qf3 = static_cast<float>(static_cast<int8_t>((qc >> 24) & 0xff)) * qs;
+#pragma unroll
+            for (int j = 0; j < kGroup; ++j) {
+              s[j] = qf0 * kf[j][0] + qf1 * kf[j][1] + qf2 * kf[j][2] + qf3 * kf[j][3];
+            }
+          } else {
+#pragma unroll
+            for (int j = 0; j < kGroup; ++j) {
+              s[j] = q[i][0] * kf[j][0] + q[i][1] * kf[j][1] + q[i][2] * kf[j][2] +
+                     q[i][3] * kf[j][3];
+            }
           }
 #pragma unroll
           for (int j = 0; j < kGroup; ++j) {
-#pragma unroll
-            for (int off = 16; off; off >>= 1) {
-              s[j] += __shfl_xor_sync(0xffffffffu, s[j], off);
-            }
+            s[j] = warp_sum_q18(s[j]);
           }
           float m_new = m_i[i];
 #pragma unroll
           for (int j = 0; j < kGroup; ++j) {
             m_new = fmaxf(m_new, s[j]);
           }
-          const float alpha = __expf(m_i[i] - m_new);
+          const float alpha = fast_exp2(m_i[i] - m_new);
           float l_new = l_i[i] * alpha;
           float pr[kGroup];
 #pragma unroll
           for (int j = 0; j < kGroup; ++j) {
-            pr[j] = __expf(s[j] - m_new);
+            pr[j] = fast_exp2(s[j] - m_new);
             l_new += pr[j];
           }
           // Fold V's affine into the weight (w = p*scale) and keep the
@@ -2164,6 +2395,20 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_prefill_kernel_bf
           m_i[i] = m_new;
           l_i[i] = l_new;
         }
+      };
+
+      if constexpr (QUANT) {
+        const int packed_p_end = min(p_end, boundary);
+        for (; p + kGroup <= packed_p_end; p += kGroup) {
+          process_quad(p, std::integral_constant<bool, true>{});
+        }
+        for (; p + kGroup <= p_end; p += kGroup) {
+          process_quad(p, std::integral_constant<bool, false>{});
+        }
+      } else {
+        for (; p + kGroup <= p_end; p += kGroup) {
+          process_quad(p, std::integral_constant<bool, true>{});
+        }
       }
       // Fewer than 4 positions left in this row's prefix (same tail as the
       // decode kernel's).
@@ -2171,6 +2416,7 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_prefill_kernel_bf
         const int sp = p - tile_pos;
         float kf[kVec];
         float vf[kVec];
+        int kc = 0;
         float ksa = 1.f;
         float kza = 0.f;
         if constexpr (QUANT) {
@@ -2187,7 +2433,7 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_prefill_kernel_bf
                                  lane_cg;
             ksa = __ldg(key_scale + kidx);
             kza = __ldg(key_zero + kidx);
-            load_i4_tile_raw_chunk4(kf, s_k4[sp], lane * kVec);
+            kc = load_i4_tile_codes4(s_k4[sp], lane * kVec);
           }
           load_i4_tile_raw_chunk4(vf, s_v4[sp], lane * kVec);
         } else {
@@ -2197,16 +2443,28 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_prefill_kernel_bf
 #pragma unroll
         for (int i = 0; i < G; ++i) {
           if (i >= heads_here) break;
-          float dot = q[i][0] * kf[0] + q[i][1] * kf[1] + q[i][2] * kf[2] + q[i][3] * kf[3];
           const float sumq = sumq_i[i];
-          float s = (QUANT && p < boundary) ? (dot - kza * sumq) * ksa : dot;
-#pragma unroll
-          for (int off = 16; off; off >>= 1) {
-            s += __shfl_xor_sync(0xffffffffu, s, off);
+          float s;
+          if constexpr (QUANT) {
+            if (p < boundary) {
+              s = (ksa * qscale_i[i]) * static_cast<float>(__dp4a(qcodes[i], kc, 0)) -
+                  ksa * kza * sumq;
+            } else {
+              const int qc = qcodes[i];
+              const float qs = qscale_i[i];
+              const float qf0 = static_cast<float>(static_cast<int8_t>(qc & 0xff)) * qs;
+              const float qf1 = static_cast<float>(static_cast<int8_t>((qc >> 8) & 0xff)) * qs;
+              const float qf2 = static_cast<float>(static_cast<int8_t>((qc >> 16) & 0xff)) * qs;
+              const float qf3 = static_cast<float>(static_cast<int8_t>((qc >> 24) & 0xff)) * qs;
+              s = qf0 * kf[0] + qf1 * kf[1] + qf2 * kf[2] + qf3 * kf[3];
+            }
+          } else {
+            s = q[i][0] * kf[0] + q[i][1] * kf[1] + q[i][2] * kf[2] + q[i][3] * kf[3];
           }
+          s = warp_sum_q18(s);
           const float m_new = fmaxf(m_i[i], s);
-          const float alpha = __expf(m_i[i] - m_new);
-          const float pr = __expf(s - m_new);
+          const float alpha = fast_exp2(m_i[i] - m_new);
+          const float pr = fast_exp2(s - m_new);
           l_i[i] = l_i[i] * alpha + pr;
           float w = pr;
           float corr_add = 0.f;
