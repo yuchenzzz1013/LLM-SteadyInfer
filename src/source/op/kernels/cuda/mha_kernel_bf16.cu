@@ -38,9 +38,13 @@
 // instruction block in the old loop. The four positions of a step, the page's
 // metadata bases and (when group_size covers the page) the K scale pair are
 // hoisted; the residual tail runs as a second specialization of the same body
-// so the packed loop has no residual code in it. V still dequantizes per value
-// (its affine is folded into the weight, which no integer dot can absorb), and
-// is the remaining structural cost of the int4 cache.
+// so the packed loop has no residual code in it. The prefill arm dequantizes
+// each V tile into bf16 once while staging it (4-bit codes are exact integers,
+// but (q - zero) * scale rounds, which is far below the quantization step),
+// so its compute loop matches the bf16 arm's inner loop. The decode arm has
+// no shared tile to amortize that against: it keeps the raw codes and folds
+// the V affine into the softmax weight, carrying the zero-point term as one
+// per-head scalar.
 //
 // All q/k/v/output caches are raw bfloat16 (CUDA __nv_bfloat16, bit-compatible
 // with the uint16_t host representation). Internal score / softmax / output
@@ -163,14 +167,9 @@ __device__ __forceinline__ void load_i4_raw_chunk4(float* dst, const int8_t* cac
   dst[3] = static_cast<float>((raw >> 12) & 0xfu);
 }
 
-// Stage one 4-element chunk of an int4 row into the prefill tile: the tile
-// keeps the packed bytes, the dequantization happens on the way out (see
-// paged_prefill_kernel_bf16). `tile_dst` is the chunk's byte address in the
-// tile; `off` is the SOURCE element offset into the packed pool.
-// Raw codes from a packed smem tile (the value-side reader folds the affine
-// into its weight, exactly like load_i4_raw_chunk4 on the global path).
-// Packed-tile counterpart of load_i4_codes4: same nibble expansion for the
-// prefill compute loop's dp4a operand.
+// Raw K codes from a packed smem tile (the reader applies the K affine to the
+// integer dp4a result, exactly like load_i4_codes4 on the global path): same
+// nibble expansion for the prefill compute loop's dp4a operand.
 __device__ __forceinline__ int load_i4_tile_codes4(const int8_t* tile_row, int32_t elem_off) {
   const uint32_t raw = *reinterpret_cast<const uint16_t*>(tile_row + (elem_off >> 1));
   const uint32_t lo = raw & 0x0f0fu;
@@ -178,13 +177,29 @@ __device__ __forceinline__ int load_i4_tile_codes4(const int8_t* tile_row, int32
   return static_cast<int>(__byte_perm(lo, hi, 0x5140));
 }
 
-__device__ __forceinline__ void load_i4_tile_raw_chunk4(float* dst, const int8_t* tile_row,
-                                                        int32_t elem_off) {
-  const uint32_t raw = *reinterpret_cast<const uint16_t*>(tile_row + (elem_off >> 1));
-  dst[0] = static_cast<float>(raw & 0xfu);
-  dst[1] = static_cast<float>((raw >> 4) & 0xfu);
-  dst[2] = static_cast<float>((raw >> 8) & 0xfu);
-  dst[3] = static_cast<float>((raw >> 12) & 0xfu);
+// Expand 16 packed codes (one 8B word) to 16 bf16 tile elements, applying the
+// row's affine on the way: (q - zero) * scale. The code is an exact small
+// integer, but `zero` is fractional, so the dequantized value is rounded to
+// bf16 here. The prefill CTA does this once per staged row, then reads the
+// tile exactly like the non-quantized arm; the alternative (keep raw codes
+// and fold `scale` into the softmax weight, carrying a per-head zero-point
+// correction) costs two extra flops per (position, q head) inside the hot
+// loop. The bf16 rounding is far below the 4-bit quantization step itself.
+__device__ __forceinline__ void expand_i4_16_to_bf16(__nv_bfloat16* dst, uint2 raw, float scale,
+                                                     float zero) {
+#pragma unroll
+  for (int w = 0; w < 2; ++w) {
+    const uint32_t v = w == 0 ? raw.x : raw.y;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const float a =
+          (static_cast<float>((v >> (8 * k)) & 0xfu) - zero) * scale;
+      const float b =
+          (static_cast<float>((v >> (8 * k + 4)) & 0xfu) - zero) * scale;
+      *reinterpret_cast<__nv_bfloat162*>(dst + 8 * w + 2 * k) =
+          __floats2bfloat162_rn(a, b);
+    }
+  }
 }
 
 // Load one 4-dim int4 chunk as four int8 lanes packed into one 32-bit word
@@ -666,6 +681,24 @@ __global__ void paged_kv_scatter_kernel_bf16(const __nv_bfloat16* src, __nv_bflo
 // value magnitude keep `zero` small enough to be subtracted without
 // cancellation: a floor of 1e-8 alone would make x / scale + zero lose all
 // precision for an ordinary large constant.
+// Order-preserving float <-> uint mapping for the warp min/max reductions.
+// `redux.sync.min/max.u32` is one instruction, while the five-step float
+// shuffle butterfly costs ten (SHFL + FMNMX per level) and is repeated once
+// per (token group, channel group) on the K write path. The mapping is
+// exact: rank(a) < rank(b) iff a < b for every pair of non-NaN floats (a
+// negative float's bits are inverted, a non-negative one only has its sign
+// flipped), so the reduced endpoints are bit-identical to the float ones.
+// KV values are model outputs, never NaN, which is the only case the mapping
+// does not order.
+__device__ __forceinline__ unsigned float_rank(float v) {
+  const unsigned u = __float_as_uint(v);
+  return u ^ ((0u - (u >> 31)) | 0x80000000u);
+}
+
+__device__ __forceinline__ float rank_float(unsigned r) {
+  return __uint_as_float((r & 0x80000000u) ? (r & 0x7fffffffu) : ~r);
+}
+
 __device__ __forceinline__ void s4_quant_params(float mn, float mx, float& scale, float& zero) {
   const float range = mx - mn;
   const float mag = fmaxf(fabsf(mn), fabsf(mx));
@@ -728,8 +761,8 @@ __global__ void paged_kv_scatter_v4_kernel_bf16(const __nv_bfloat16* __restrict_
   for (int head = warp; head < kv_head_num; head += n_warps) {
     const __nv_bfloat16* head_src = src_row + static_cast<int64_t>(head) * head_size;
     float val[2][4];
-    float vmin = FLT_MAX;
-    float vmax = -FLT_MAX;
+    unsigned rmin = 0xffffffffu;
+    unsigned rmax = 0u;
 #pragma unroll
     for (int c = 0; c < 2; ++c) {
       if (c >= n_chunks) break;
@@ -741,20 +774,22 @@ __global__ void paged_kv_scatter_v4_kernel_bf16(const __nv_bfloat16* __restrict_
       val[c][1] = __bfloat162float(h[0].y);
       val[c][2] = __bfloat162float(h[1].x);
       val[c][3] = __bfloat162float(h[1].y);
-      vmin = fminf(vmin, fminf(fminf(val[c][0], val[c][1]), fminf(val[c][2], val[c][3])));
-      vmax = fmaxf(vmax, fmaxf(fmaxf(val[c][0], val[c][1]), fmaxf(val[c][2], val[c][3])));
+#pragma unroll
+      for (int v = 0; v < 4; ++v) {
+        const unsigned rank = float_rank(val[c][v]);
+        rmin = min(rmin, rank);
+        rmax = max(rmax, rank);
+      }
     }
     // Lanes past a < 128-dim head must not contribute +/-FLT_MAX-like
     // sentinels to the other lanes' reduction.
     if (lane * 4 >= head_size) {
-      vmin = 0.f;
-      vmax = 0.f;
+      rmin = rmax = float_rank(0.f);
     }
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) {
-      vmin = fminf(vmin, __shfl_xor_sync(0xffffffffu, vmin, o));
-      vmax = fmaxf(vmax, __shfl_xor_sync(0xffffffffu, vmax, o));
-    }
+    rmin = __reduce_min_sync(0xffffffffu, rmin);
+    rmax = __reduce_max_sync(0xffffffffu, rmax);
+    const float vmin = rank_float(rmin);
+    const float vmax = rank_float(rmax);
     float scale = 0.f;
     float zero = 0.f;
     s4_quant_params(vmin, vmax, scale, zero);
@@ -955,23 +990,78 @@ __global__ void paged_kv_group_quantize_kernel_bf16(
     const int cg_shift = cg_pow2 ? (31 - __clz(cg_width)) : 0;
     const int cg_mask = cg_width - 1;
     const int values = group_size * cg_width;
-    float mn = FLT_MAX;
-    float mx = -FLT_MAX;
-    for (int idx = lane; idx < values; idx += 32) {
-      const int pj = cg_pow2 ? (idx >> cg_shift) : (idx / cg_width);
-      const int dc = cg_pow2 ? (idx & cg_mask) : (idx % cg_width);
-      const float v = value_at(base_pos + pj, d0 + dc);
-      mn = fminf(mn, v);
-      mx = fmaxf(mx, v);
-    }
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) {
-      mn = fminf(mn, __shfl_xor_sync(0xffffffffu, mn, o));
-      mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
-    }
+    // Fast path: each lane owns one 4-aligned run of `values` per quad, so
+    // the values loaded for the min/max pass stay in registers and the
+    // packing pass does not re-read them (the removed version walked the
+    // plane twice, once for min/max and once for the nibbles, through a
+    // branchy `value_at` per value). 8 quads = 32 floats per lane covers the
+    // served groupings (16 x 8, 16 x 32, 32 x 32); wider ones fall back.
+    constexpr int kMaxQuads = 8;
+    const int quads = (values + 127) >> 7;
+    const bool fast = cg_pow2 && quads <= kMaxQuads;
+    float vals[kMaxQuads][4];
     float scale = 0.f;
     float zero = 0.f;
-    s4_quant_params(mn, mx, scale, zero);
+    if (fast) {
+      unsigned rmin = 0xffffffffu;
+      unsigned rmax = 0u;
+#pragma unroll
+      for (int q = 0; q < kMaxQuads; ++q) {
+        if (q >= quads) break;
+        const int base = q * 128 + lane * 4;
+        if (base >= values) break;
+        const int j = base >> cg_shift;
+        const int dc = base & cg_mask;
+        const int p = base_pos + j;
+        const int local_d = d0 + dc;
+        int row = -1;
+        if (p == pos) {
+          row = b;
+        } else if (prefill_row_start >= 0) {
+          const int idx = prefill_row_start + (p - prefill_pos0);
+          if (idx >= prefill_row_start && idx < prefill_row_end && positions[idx] == p) {
+            row = idx;
+          }
+        }
+        const __nv_bfloat16* vp =
+            row >= 0
+                ? src + static_cast<int64_t>(row) * kv_dim + local_d
+                : residual + residual_base + static_cast<int64_t>(p & group_mask) * kv_dim +
+                      local_d;
+        // 8-byte load: four consecutive dims of one token (local_d is 4-aligned).
+        const uint2 raw = *reinterpret_cast<const uint2*>(vp);
+        const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&raw);
+        vals[q][0] = __bfloat162float(h[0].x);
+        vals[q][1] = __bfloat162float(h[0].y);
+        vals[q][2] = __bfloat162float(h[1].x);
+        vals[q][3] = __bfloat162float(h[1].y);
+#pragma unroll
+        for (int v = 0; v < 4; ++v) {
+          const unsigned rank = float_rank(vals[q][v]);
+          rmin = min(rmin, rank);
+          rmax = max(rmax, rank);
+        }
+      }
+      rmin = __reduce_min_sync(0xffffffffu, rmin);
+      rmax = __reduce_max_sync(0xffffffffu, rmax);
+      s4_quant_params(rank_float(rmin), rank_float(rmax), scale, zero);
+    } else {
+      float mn = FLT_MAX;
+      float mx = -FLT_MAX;
+      for (int idx = lane; idx < values; idx += 32) {
+        const int pj = cg_pow2 ? (idx >> cg_shift) : (idx / cg_width);
+        const int dc = cg_pow2 ? (idx & cg_mask) : (idx % cg_width);
+        const float v = value_at(base_pos + pj, d0 + dc);
+        mn = fminf(mn, v);
+        mx = fmaxf(mx, v);
+      }
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) {
+        mn = fminf(mn, __shfl_xor_sync(0xffffffffu, mn, o));
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+      }
+      s4_quant_params(mn, mx, scale, zero);
+    }
     const float inv_scale = 1.0f / scale;
 
     // One (scale, zero) pair per (page, group-in-page, channel group).
@@ -986,23 +1076,45 @@ __global__ void paged_kv_group_quantize_kernel_bf16(
       dst_zero[scale_idx] = zero;
     }
 
-    // Pack adjacent dims into one byte: dim d lives in byte d/2, low nibble
-    // for even d. Same flattened walk as the min/max pass: each lane owns one
-    // (token, dim-pair) byte, so every lane is active for the 64-byte group
-    // instead of four lanes walking group_size tokens each.
-    const int bytes_per_cg = (group_size * cg_width) >> 1;
-    const int pairs = cg_width >> 1;
-    const int pair_shift = cg_pow2 ? (cg_shift - 1) : 0;
-    const int pair_mask = pairs - 1;
-    for (int idx = lane; idx < bytes_per_cg; idx += 32) {
-      const int j = cg_pow2 ? (idx >> pair_shift) : (idx / pairs);
-      const int pair = cg_pow2 ? (idx & pair_mask) : (idx % pairs);
-      const int local_d = d0 + (pair << 1);
-      const int p = base_pos + j;
-      const int q0 = s4_quantize(value_at(p, local_d), inv_scale, zero);
-      const int q1 = s4_quantize(value_at(p, local_d + 1), inv_scale, zero);
-      const int64_t elem = page_base + static_cast<int64_t>(off + j) * kv_dim + local_d;
-      dst[elem >> 1] = static_cast<int8_t>(q0 | (q1 << 4));
+    if (fast) {
+      // Four adjacent dims pack into two bytes; `local_d` is 4-aligned, so
+      // one 16-bit store carries both. This is the same code layout the
+      // removed pair walk produced, with no second read of the values.
+#pragma unroll
+      for (int q = 0; q < kMaxQuads; ++q) {
+        if (q >= quads) break;
+        const int base = q * 128 + lane * 4;
+        if (base >= values) break;
+        const int j = base >> cg_shift;
+        const int dc = base & cg_mask;
+        const int q0 = s4_quantize(vals[q][0], inv_scale, zero);
+        const int q1 = s4_quantize(vals[q][1], inv_scale, zero);
+        const int q2 = s4_quantize(vals[q][2], inv_scale, zero);
+        const int q3 = s4_quantize(vals[q][3], inv_scale, zero);
+        const int64_t elem =
+            page_base + static_cast<int64_t>(off + j) * kv_dim + d0 + dc;
+        *reinterpret_cast<uint16_t*>(dst + (elem >> 1)) =
+            static_cast<uint16_t>(q0 | (q1 << 4) | (q2 << 8) | (q3 << 12));
+      }
+    } else {
+      // Pack adjacent dims into one byte: dim d lives in byte d/2, low nibble
+      // for even d. Same flattened walk as the min/max pass: each lane owns
+      // one (token, dim-pair) byte, so every lane is active for the 64-byte
+      // group instead of four lanes walking group_size tokens each.
+      const int bytes_per_cg = (group_size * cg_width) >> 1;
+      const int pairs = cg_width >> 1;
+      const int pair_shift = cg_pow2 ? (cg_shift - 1) : 0;
+      const int pair_mask = pairs - 1;
+      for (int idx = lane; idx < bytes_per_cg; idx += 32) {
+        const int j = cg_pow2 ? (idx >> pair_shift) : (idx / pairs);
+        const int pair = cg_pow2 ? (idx & pair_mask) : (idx % pairs);
+        const int local_d = d0 + (pair << 1);
+        const int p = base_pos + j;
+        const int q0 = s4_quantize(value_at(p, local_d), inv_scale, zero);
+        const int q1 = s4_quantize(value_at(p, local_d + 1), inv_scale, zero);
+        const int64_t elem = page_base + static_cast<int64_t>(off + j) * kv_dim + local_d;
+        dst[elem >> 1] = static_cast<int8_t>(q0 | (q1 << 4));
+      }
     }
   }
 }
@@ -2069,10 +2181,12 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_prefill_kernel_bf
   __shared__ __align__(16) __nv_bfloat16 s_k[kTileKv][kPad];
   __shared__ __align__(16) __nv_bfloat16 s_v[kTileKv][kPad];
   // Per-position V scales and zero points (one pair per staged row, since the
-  // CTA covers one kv head). K scales are per (token group, channel group) and
-  // therefore lane-dependent, so they are loaded directly in the compute loop
-  // rather than staged. Sized away in the QUANT false instantiation so its
-  // smem footprint is the pre-quantization kernel's.
+  // CTA covers one kv head). The staging pass applies them while expanding
+  // the packed codes, so the compute loop never sees them. K scales are per
+  // (token group, channel group) and therefore lane-dependent, so they stay
+  // in the compute loop (register-cached per token group). Sized away in the
+  // QUANT false instantiation so its smem footprint is the pre-quantization
+  // kernel's.
   __shared__ float s_vs[QUANT ? kTileKv : 1];
   __shared__ float s_vz[QUANT ? kTileKv : 1];
   // Physical page of each staged row (int4 K metadata is addressed through it).
@@ -2083,15 +2197,14 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_prefill_kernel_bf
   const int warp = tid >> 5;
   const int lane = tid & 31;
   const int nwarps = blockDim.x >> 5;
-  // The quantized arm stages the raw packed rows in the same storage — they
-  // need half of it — and dequantizes in the compute loop. Dequantizing on the
-  // way in (int4 -> bf16 in smem) would round every K/V value to a 4-bit
-  // mantissa, and it would put the prefill and the decode arm of the same row
-  // on different arithmetic. A 136-byte int4 row keeps the same alignment the
-  // bf16 row's uint2 reads use. As in the decode kernel, only the QUANT true
-  // instantiation has both arms compiled in at all.
+  // K stays packed in the tile: the compute loop feeds its codes to dp4a, so
+  // unpacking it would only add work. V is expanded to bf16 at staging time —
+  // 4-bit codes are exact integers in bf16, so this is numerically identical
+  // to the previous per-value nibble unpack, but the unpack now runs once per
+  // staged row instead of once per warp that walks the tile. A 136-byte int4
+  // K row keeps the alignment its uint2 reads need. As in the decode kernel,
+  // only the QUANT true instantiation has both arms compiled in at all.
   int8_t (*s_k4)[kPad] = reinterpret_cast<int8_t (*)[kPad]>(&s_k[0][0]);
-  int8_t (*s_v4)[kPad] = reinterpret_cast<int8_t (*)[kPad]>(&s_v[0][0]);
 
   const int seq = blockIdx.y;
   const int kv_head = blockIdx.z;
@@ -2172,15 +2285,13 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_prefill_kernel_bf
 
   float m_i[G];
   float l_i[G];
-  // V zero-point correction (see the decode kernel): a scalar per head,
-  // subtracted from the accumulated numerator once at the end.
-  float corr_i[G];
+  // No V zero-point correction here: the staged tile is dequantized in full
+  // (see expand_i4_16_to_bf16), unlike the decode kernel's raw-code path.
   float acc[G][kVec];
 #pragma unroll
   for (int i = 0; i < G; ++i) {
     m_i[i] = -FLT_MAX;
     l_i[i] = 0.f;
-    corr_i[i] = 0.f;
 #pragma unroll
     for (int c = 0; c < kVec; ++c) acc[i][c] = 0.f;
   }
@@ -2238,6 +2349,9 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_prefill_kernel_bf
         s_vs[r] = __ldg(value_scale + srow);
         s_vz[r] = __ldg(value_zero + srow);
       }
+      // The V staging threads handle rows other than the ones they staged the
+      // affine for, so the pair must be visible before the dequantizing copy.
+      __syncthreads();
     }
     {
       const int chunk = tid % chunks;
@@ -2267,8 +2381,10 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_prefill_kernel_bf
                             static_cast<int64_t>(gpos & (block_size - 1)) * kv_dim + kv_head_off +
                             ch;
         if constexpr (QUANT) {
-          *reinterpret_cast<uint2*>(&s_v4[r][ch >> 1]) =
-              *reinterpret_cast<const uint2*>(value_cache_i4 + (src >> 1));
+          // 16 codes per loader vector, dequantized into the 16 bf16 tile
+          // elements the compute loop reads (see expand_i4_16_to_bf16).
+          const uint2 raw = *reinterpret_cast<const uint2*>(value_cache_i4 + (src >> 1));
+          expand_i4_16_to_bf16(&s_v[r][ch], raw, s_vs[r], s_vz[r]);
         } else {
           *reinterpret_cast<uint4*>(&s_v[r][ch]) =
               *reinterpret_cast<const uint4*>(value_cache + src);
@@ -2280,6 +2396,15 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_prefill_kernel_bf
     if (active) {
       const int p_end = min(tile_pos + kTileKv, limit);
       int p = tile_pos;
+      // K (scale, zero) is constant for a whole (page, token group), i.e. for
+      // `group_size` consecutive positions. With the default grouping that is
+      // every page, so a register cache turns the per-quad metadata loads into
+      // one load per group (4x fewer on the served geometry). min/max and the
+      // dequantization read the same values either way, so this is exact.
+      int last_kpg = -1;
+      int last_kgroup = -1;
+      float cached_ks = 1.f;
+      float cached_kz = 0.f;
       // Complete groups of 4 positions: one rescale per group, exactly the
       // walk the decode kernel makes over the same prefix. As in the decode
       // kernel the packed prefix and the BF16 residual tail run through two
@@ -2294,13 +2419,20 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_prefill_kernel_bf
         float ks = 1.f;
         float kz = 0.f;
         if constexpr (QUANT && K_POOL) {
-          const int64_t kidx = key_meta_layer_base +
-                               (static_cast<int64_t>(s_pg[sp]) * groups_per_block +
-                                ((p & (block_size - 1)) >> group_shift)) *
-                                   channel_groups +
-                               lane_cg;
-          ks = __ldg(key_scale + kidx);
-          kz = __ldg(key_zero + kidx);
+          const int kpg = s_pg[sp];
+          const int kgroup = (p & (block_size - 1)) >> group_shift;
+          if (kpg != last_kpg || kgroup != last_kgroup) {
+            const int64_t kidx =
+                key_meta_layer_base +
+                (static_cast<int64_t>(kpg) * groups_per_block + kgroup) * channel_groups +
+                lane_cg;
+            cached_ks = __ldg(key_scale + kidx);
+            cached_kz = __ldg(key_zero + kidx);
+            last_kpg = kpg;
+            last_kgroup = kgroup;
+          }
+          ks = cached_ks;
+          kz = cached_kz;
         }
 #pragma unroll
         for (int j = 0; j < kGroup; ++j) {
@@ -2316,11 +2448,8 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_prefill_kernel_bf
           } else {
             load_bf16_chunk4(kf[j], s_k[sp + j], lane * kVec);
           }
-          if constexpr (QUANT) {
-            load_i4_tile_raw_chunk4(vf[j], s_v4[sp + j], lane * kVec);
-          } else {
-            load_bf16_chunk4(vf[j], s_v[sp + j], lane * kVec);
-          }
+          // V is already dequantized bf16 in the tile in both arms.
+          load_bf16_chunk4(vf[j], s_v[sp + j], lane * kVec);
         }
 #pragma unroll
         for (int i = 0; i < G; ++i) {
@@ -2369,18 +2498,13 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_prefill_kernel_bf
             pr[j] = fast_exp2(s[j] - m_new);
             l_new += pr[j];
           }
-          // Fold V's affine into the weight (w = p*scale) and keep the
-          // constant w*zero in corr_i; l stays the sum of the raw weights.
+          // The staged V tile already carries (q - zero) * scale, so the
+          // weight is just the softmax probability — same arithmetic as the
+          // non-quantized arm.
           float w[kGroup];
-          float corr_add = 0.f;
 #pragma unroll
           for (int j = 0; j < kGroup; ++j) {
-            if constexpr (QUANT) {
-              w[j] = pr[j] * s_vs[sp + j];
-              corr_add += w[j] * s_vz[sp + j];
-            } else {
-              w[j] = pr[j];
-            }
+            w[j] = pr[j];
           }
 #pragma unroll
           for (int c = 0; c < kVec; ++c) {
@@ -2391,7 +2515,6 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_prefill_kernel_bf
             }
             acc[i][c] = a;
           }
-          corr_i[i] = corr_i[i] * alpha + corr_add;
           m_i[i] = m_new;
           l_i[i] = l_new;
         }
@@ -2435,7 +2558,7 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_prefill_kernel_bf
             kza = __ldg(key_zero + kidx);
             kc = load_i4_tile_codes4(s_k4[sp], lane * kVec);
           }
-          load_i4_tile_raw_chunk4(vf, s_v4[sp], lane * kVec);
+          load_bf16_chunk4(vf, s_v[sp], lane * kVec);
         } else {
           load_bf16_chunk4(kf, s_k[sp], lane * kVec);
           load_bf16_chunk4(vf, s_v[sp], lane * kVec);
@@ -2466,13 +2589,7 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_prefill_kernel_bf
           const float alpha = fast_exp2(m_i[i] - m_new);
           const float pr = fast_exp2(s - m_new);
           l_i[i] = l_i[i] * alpha + pr;
-          float w = pr;
-          float corr_add = 0.f;
-          if constexpr (QUANT) {
-            w = pr * s_vs[sp];
-            corr_add = w * s_vz[sp];
-          }
-          corr_i[i] = corr_i[i] * alpha + corr_add;
+          const float w = pr;
           acc[i][0] = acc[i][0] * alpha + w * vf[0];
           acc[i][1] = acc[i][1] * alpha + w * vf[1];
           acc[i][2] = acc[i][2] * alpha + w * vf[2];
@@ -2492,10 +2609,8 @@ __global__ void __launch_bounds__(256, (G >= 8) ? 1 : 2) paged_prefill_kernel_bf
     const int64_t out_base =
         static_cast<int64_t>(my_row) * dim + (head_begin + i) * head_size + lane * kVec;
     __nv_bfloat162 o[2];
-    o[0] = __floats2bfloat162_rn((acc[i][0] - corr_i[i]) * inv_l,
-                                 (acc[i][1] - corr_i[i]) * inv_l);
-    o[1] = __floats2bfloat162_rn((acc[i][2] - corr_i[i]) * inv_l,
-                                 (acc[i][3] - corr_i[i]) * inv_l);
+    o[0] = __floats2bfloat162_rn(acc[i][0] * inv_l, acc[i][1] * inv_l);
+    o[1] = __floats2bfloat162_rn(acc[i][2] * inv_l, acc[i][3] * inv_l);
     *reinterpret_cast<uint2*>(output + out_base) = *reinterpret_cast<const uint2*>(o);
   }
 }

@@ -18,22 +18,21 @@ namespace scheduler {
 // prefix, and it is the reason the K pool alone is not a complete cache.
 //
 // Both halves are always quantized together, so this is a switch rather than a
-// mask. The spelling is 6: the old mask's 1/5 selected the removed
-// K-int8+V-int4 shape, and those values are now hard errors (see
-// kv_quant_from_env) so a stale command line cannot silently measure a
-// different precision.
+// mask. The spelling is 1: the removed shape's old spelling 5 and the
+// never-existing mask arms 2/3/4 are hard errors (see kv_quant_from_env) so a
+// stale command line cannot silently measure a different precision.
 enum KvQuant : int {
   kKvQuantNone = 0,  // bf16 pool
-  kKvQuantS4 = 6,    // K int4 (grouped, with BF16 residual) + V int4
+  kKvQuantS4 = 1,    // K int4 (grouped, with BF16 residual) + V int4
 };
 
-// LLAMA_KV_QUANT — "0"/"off" (default, unset) / "6"/"s4".
+// LLAMA_KV_QUANT — "0"/"off" (default, unset) / "1"/"s4".
 // Anything else is a LOG(FATAL): a typo silently leaving quantization off would
 // look like "no speedup and no PPL change", which is the most expensive
-// possible way to find the mistake. In particular the removed shape's
-// spellings ("1", "5") and the never-existing mask arms ("2", "3", "4") are
-// errors rather than aliases: a run that quietly means a different precision
-// produces a number nobody can attribute.
+// possible way to find the mistake. In particular the removed shape's spelling
+// ("5") and the never-existing mask arms ("2", "3", "4") are errors rather
+// than aliases: a run that quietly means a different precision produces a
+// number nobody can attribute.
 int kv_quant_from_env();
 
 class KVManager {
@@ -48,7 +47,7 @@ class KVManager {
   // block_size: physical block size of the paged pool (default 16). Only used
   //   in paged mode, where the constructor CHECKs it is a power of two >= 4
   //   dividing 256 (kernel geometry).
-  // kv_quant: whether to store the cache quantized (KvQuant: 0 or 6). Only the
+  // kv_quant: whether to store the cache quantized (KvQuant: 0 or 1). Only the
   //   paged CUDA layout can be quantized — the continuous layout puts the token
   //   index in the last (fastest) dim, so a per-token scale would be a strided
   //   access — and asking for it anywhere else is a LOG(FATAL) rather than a

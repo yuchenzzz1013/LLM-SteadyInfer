@@ -43,7 +43,7 @@ LLM-SteadyInfer 是一个基于 **C++ / CUDA C++** 实现的轻量级大语言�
   - 支持 Partial Attention Merge 优化长序列 Decode
 
 - **KV 量化（S4：K int4 分组 + BF16 残差窗口, V int4 非对称）**
-  - 只有一个量化形态，开关是 `LLAMA_KV_QUANT=0`（off）或 `6`（S4）。
+  - 只有一个量化形态，开关是 `LLAMA_KV_QUANT=0`（off）或 `1`（S4）。
   - K、V 都以 INT4 存储（每字节两个值，行宽 `kv_dim/2`）。
   - **K**：非对称量化，scale/zero-point 粒度 per-(token group, channel group)。
     最近 `group_size` 个 token 的 K 以 BF16 保存在残差池；一组写满后整组量化为
@@ -60,14 +60,14 @@ LLM-SteadyInfer 是一个基于 **C++ / CUDA C++** 实现的轻量级大语言�
     | kv_quant | KV 池 | 压缩比 | PASS (s) | PPL | ΔPPL |
     | --- | --- | --- | --- | --- | --- |
     | 0（BF16） | 18.00 GB | 1.00× | 76.6 | 14.614276 | 基准 |
-    | 6（S4） | 5.10 GB | 3.53× | 79.6 | 14.687720 | +0.503% |
+    | 1（S4） | 5.10 GB | 3.53× | 79.6 | 14.687720 | +0.503% |
 
     chunked prefill（32 并发 × 4096、chunk 512，单遍共 224 个打分位置）：
 
     | kv_quant | PASS (s) | PPL |
     | --- | --- | --- |
-    | 0（BF16） | 29.6 | 16.749046 |
-    | 6（S4） | 39.9 | 16.760719 |
+    | 0（BF16） | 29.7 | 16.749046 |
+    | 1（S4） | 32.3 | 16.630779 |
 
   - S4 decode 已从早期版本的 2.37× 降到与 BF16 基本持平（本次实测 +3.9%）。
     关键是 decode 读路径不再逐值解量化：
@@ -83,11 +83,22 @@ LLM-SteadyInfer 是一个基于 **C++ / CUDA C++** 实现的轻量级大语言�
       scale 对）每页解析一次。
     - prefill 的 int4 tile staging 从 2B 逐值搬运改为 8B 向量，decode 的
       K 组量化器用 512 线程打满完成组的并行度。
-  - 剩余差距主要来自 V：V 的权重是浮点，无法被整数点积吸收，仍要逐值展开
-    int4。收益仍在显存/容量（3.53×）；decode 延迟已接近 BF16，chunked
-    prefill 仍有约 1.34× 的差距。
+    - K 组量化器改为单遍：min/max 与打包复用同一批寄存器，不再逐值走两遍
+      `value_at`；warp 归约用保序整数编码 + `redux.sync.min/max` 一条指令
+      替换每组 10 条 `shfl`，默认 `group_size=16, channel_group=8` 下完成组
+      的写入 burst 明显缩短。
+    - prefill 的 V tile 在 staging 阶段一次性反量化成 bf16（每个 staged row
+      一次，而不是每个 warp 读 tile 时各解一遍），compute 循环的 V 部分与
+      BF16 路径同构，V 的 zero-point 修正也不再需要。4bit code 本身是精确
+      整数，但 `(q - zero) * scale` 会舍入到 bf16（相对误差 ≤2^-9，远小于
+      4bit 量化步长）；992 个打分位置的对照里 PPL 变化约 +0.09%。
+  - 剩余差距主要来自 V：decode 每 warp 单独处理一行，没有可摊销的共享
+    tile，仍需逐值展开 int4 并把仿射折进 float 权重。收益仍在显存/容量
+    （3.53×）；decode 延迟已接近 BF16（+3~4%），chunked prefill 从早期
+    版本的约 1.34× 降到约 1.09×。
   - q 侧 int8 量化 + 定点规约会改变逐位路径，S4 与 BF16 不再保证 token 级
-    一致；质量门禁改用 PPL（decode +0.50%，chunked +0.07%）。
+    一致；质量门禁改用 PPL（decode +0.50%，chunked 在 224 位置样本上
+    16.630779 vs BF16 16.749046；992 位置样本上约 +1.47%）。
 
 
 

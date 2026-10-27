@@ -12,20 +12,20 @@ int kv_quant_from_env() {
   // Case-insensitive: the value is typed by hand on a command line.
   std::string v(raw);
   for (char& c : v) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
-  // "6" is the switch: the number is the arm's enum value, identical to the
+  // "1" is the switch: the number is the arm's enum value, identical to the
   // Scheduler constructor argument and the benchmarks' --kv-quant, so the two
   // entry points cannot be read against each other. Every other value is a
-  // LOG(FATAL) rather than an alias — in particular 1 and 5 named the removed
+  // LOG(FATAL) rather than an alias — in particular 5 named the removed
   // K-int8 + V-int4 shape, and 2/3/4 named mask arms that no longer exist.
   // Quietly resolving any of them to a different precision would produce a
   // number nobody can attribute.
   if (v == "0" || v == "off" || v == "none" || v == "false") return kKvQuantNone;
-  if (v == "6" || v == "s4") return kKvQuantS4;
+  if (v == "1" || v == "s4") return kKvQuantS4;
   LOG(FATAL) << "LLAMA_KV_QUANT: unrecognized value '" << raw
-             << "' (expected 0/off or 6/s4 — S4: K int4 grouped with a BF16 residual "
-                "window + V int4 asymmetric). The old K-int8 + V-int4 spellings 1 and 5, "
+             << "' (expected 0/off or 1/s4 — S4: K int4 grouped with a BF16 residual "
+                "window + V int4 asymmetric). The old K-int8 + V-int4 spelling 5, "
                 "and the removed mask arms 2/3/4, are hard errors: rewrite reproduce "
-                "commands to use 6.";
+                "commands to use 1.";
   return kKvQuantNone;
 }
 

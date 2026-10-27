@@ -171,7 +171,7 @@ static Args parse_args(int argc, char** argv) {
   // 都加载完了。这里直接拒绝,顺带把编码再讲一遍。只认 0 和 1 —— 2/3/4 三条臂
   // 已随掩码收敛删除,当别名用会跑出一个没人能归因的数。
   if (a.kv_quant != -1 && a.kv_quant != 0 && a.kv_quant != scheduler::kKvQuantS4) {
-    LOG(FATAL) << "--kv-quant 必须是 0(off) 或 6(S4: K int4 分组+残差窗口, V int4 非对称),或 -1(= 读 "
+    LOG(FATAL) << "--kv-quant 必须是 0(off) 或 1(S4: K int4 分组+残差窗口, V int4 非对称),或 -1(= 读 "
                   "LLAMA_KV_QUANT)。得到: "
                << a.kv_quant;
   }
@@ -232,7 +232,7 @@ static void print_usage(const char* prog) {
       << "                         极低,开着只会把已完成请求的 prompt 块钉在池里并\n"
       << "                         计入哈希开销;要看净收益用\n"
       << "                         prefix_caching_benchmark 的 A/B\n"
-      << "  --kv-quant <0|6>       KV Cache 量化:0=off,6=S4(K int4 分组+残差, V int4 非对称)\n"
+      << "  --kv-quant <0|1>       KV Cache 量化:0=off,1=S4(K int4 分组+残差, V int4 非对称)\n"
       << "                         (默认 -1 = 读 LLAMA_KV_QUANT 环境变量)。仅 Paged\n"
       << "                         CUDA 布局;开启后 KV 池按 K 1B + V 0.5B/值估算,\n"
       << "                         autobatch 的并发上限随之放宽\n"
@@ -246,7 +246,7 @@ struct ServingMetrics {
   int num_requests = 0, submitted = 0, completed = 0, rejected = 0, dropped = 0;
   // 本轮实际生效的调度配置(autobatch 会自动放大 max_batch,写进 CSV 才能复现)
   int max_batch = 0, max_gen = 0, block_size = 0;
-  int kv_quant = 0;  // 生效的量化值(0=off, 6=S4)
+  int kv_quant = 0;  // 生效的量化值(0=off, 1=S4)
   bool auto_batch = false;  // max_batch 是否由空闲显存自动决定
   // 正式窗口内的 CUDA graph 捕获开销(预热后清零,见 offline 同名字段)
   long long graph_captures = 0, graph_evictions = 0;

@@ -135,7 +135,7 @@ int main(int argc, char* argv[]) {
                  " [--mode decode|chunked] [--chunk-size 512]"
                  " [--kv-quant 0|1] [--model-type qwen3|qwen2|llama]"
                  " [--csv out.csv] [--tag label]\n"
-                 "  --kv-quant: 0=off, 6=S4 (默认读环境变量 LLAMA_KV_QUANT)\n"
+                 "  --kv-quant: 0=off, 1=S4 (默认读环境变量 LLAMA_KV_QUANT)\n"
                  "  --mode decode: 逐 token decode 驱动(每位置都有 NLL);\n"
                  "         chunked: 生产混合步形,每 chunk 只对末位置的 decode 行算 NLL\n";
     return -1;
@@ -172,7 +172,7 @@ int main(int argc, char* argv[]) {
   // 一次白跑,所以在解析处先拒绝(与 online/offline 同一口径)。只认 0 和 1:
   // 2/3/4 三条臂已随掩码收敛删除,把它们当别名会跑出一个没人能归因的数。
   if (a.kv_quant != -1 && a.kv_quant != 0 && a.kv_quant != scheduler::kKvQuantS4) {
-    std::cerr << "参数非法: --kv-quant 必须是 0(off)或 6(S4),"
+    std::cerr << "参数非法: --kv-quant 必须是 0(off)或 1(S4),"
                  "或 -1(= 读 LLAMA_KV_QUANT);得到 "
               << a.kv_quant << "\n";
     return -1;
