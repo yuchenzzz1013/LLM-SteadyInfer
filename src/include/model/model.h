@@ -1,6 +1,7 @@
 #ifndef SRC_INCLUDE_MODEL_MODEL_H_
 #define SRC_INCLUDE_MODEL_MODEL_H_
 #include <op/embedding.h>
+#include <op/matmul.h>
 #include <cuda_runtime_api.h>
 #include <cstdint>
 #include <cstring>
@@ -516,6 +517,47 @@ class Model {
   // safetensors, see safetensors_reader.h) into weight_map_.
   virtual base::Status load_hf_model();
 
+  // Build one linear projection from the host weight map. AWQ modules are
+  // dequantized into the model's compute dtype at load time, so the result is
+  // always a dense op::MatmulLayer: the quantized and full-precision models
+  // execute the exact same operator graph and kernels (and therefore have the
+  // same throughput/latency). Modules without a "<prefix>.qweight" tensor keep
+  // their full-precision weights, so mixed checkpoints (modules_to_not_convert)
+  // work unchanged.
+  //
+  // `prefix` is the HF module name without a tensor suffix, e.g.
+  // "model.layers.0.self_attn.q_proj". dims are [out_features, in_features].
+  // `has_bias` reads "<prefix>.bias" when true.
+  std::shared_ptr<op::Layer> create_linear_layer(const std::string& prefix,
+                                                 int32_t out_features, int32_t in_features,
+                                                 bool has_bias = false);
+
+  // Build one projection whose output rows are the concatenation of the given
+  // modules (fused QKV: q|k|v; fused FFN: gate|up). AWQ modules are
+  // dequantized first, so the fused layer is a plain dense MatmulLayer and the
+  // fused operator sequence is identical for both checkpoint kinds.
+  std::shared_ptr<op::MatmulLayer> create_fused_linear_layer(
+      const std::vector<std::string>& prefixes, const std::vector<int32_t>& out_features,
+      int32_t in_features, bool has_bias = false);
+
+  // Point per-projection layers at row slices of a fused layer's storage, so a
+  // fused build has a single device residence (the legacy single-sequence path
+  // then reads the same bytes). CUDA only, matching the dense path.
+  void repoint_layers_to_fused(const std::shared_ptr<op::MatmulLayer>& fused,
+                               const std::vector<std::shared_ptr<op::Layer>>& layers,
+                               const std::vector<int32_t>& out_features);
+
+  // Dequantize one AWQ module into `dst`, laid out as [N, K] row-major in
+  // `dst_dtype` (BF16 on CUDA models, FP32 on CPU models). The host weight map
+  // supplies qweight/qzeros (int32) and scales (already in dst_dtype).
+  void dequantize_awq_module(const std::string& prefix, int32_t out_features,
+                             int32_t in_features, base::DataType dst_dtype,
+                             void* dst) const;
+
+  // Free the host-side packed AWQ tensors once all layers have been built
+  // (call after init_mem(), which also builds the fused projections).
+  void release_quantization_payload();
+
   virtual base::Status create_encode_layer();
 
   virtual base::Status gen_model_from_file();
@@ -535,10 +577,11 @@ class Model {
 
   virtual void create_nonparam_layers() = 0;
 
-  virtual void create_param_quant_layers() = 0;
-
  protected:
   int32_t group_size_ = 1;
+  // True when the checkpoint declares quantized weights. Purely descriptive:
+  // quantization is resolved per module while the layers are built, and AWQ
+  // modules are dequantized there, so forward execution is format-agnostic.
   bool is_quant_model_ = false;
   std::unique_ptr<TransformerConfig> config_;
 
@@ -565,15 +608,22 @@ class Model {
   struct HostWeight {
     std::shared_ptr<std::vector<uint8_t>> bytes;  // base::DataTypeSize(dtype) * numel
     int64_t numel = 0;
+    // Floating-point weights are stored as compute_dtype() (BF16 bits on CUDA
+    // models, FP32 on CPU models); packed integer weights (AWQ qweight /
+    // qzeros) keep their checkpoint dtype (Int32).
+    base::DataType data_type = base::DataType::kDataTypeUnknown;
   };
   std::unordered_map<std::string, HostWeight> weight_map_;
 
   // Host pointer to the storage of the HF tensor `name`, laid out as
   // compute_dtype() (uint16_t BF16 bits on CUDA models, float on CPU models).
   // Stable for the model lifetime; CHECK-fails when the tensor is unknown.
-  const void* get_weight_data(const std::string& name);
+  const void* get_weight_data(const std::string& name) const;
 
   size_t get_weight_numel(const std::string& name) const;
+
+  // Storage dtype of the HF tensor `name` (see HostWeight::data_type).
+  base::DataType get_weight_dtype(const std::string& name) const;
 
   base::DeviceType device_type_ = base::DeviceType::kDeviceUnknown;
   base::ModelType model_type_ = base::ModelType::kModelTypeUnknown;

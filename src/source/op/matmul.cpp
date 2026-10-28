@@ -136,6 +136,14 @@ base::Status MatmulLayer::forward() {
   return base::error::Success();
 }
 
+base::Status MatmulLayer::set_bias(int32_t idx, const tensor::Tensor& bias) {
+  CHECK_GE(idx, 0);
+  CHECK_LT(idx, static_cast<int32_t>(bias_.size()));
+  CHECK(!bias.is_empty());
+  bias_.at(idx) = bias;
+  return base::error::Success();
+}
+
 base::Status MatmulLayer::set_bias(int32_t idx, int32_t dim, const void* bias_ptr,
                                    base::DeviceType device_type, base::DataType data_type) {
   CHECK_GE(idx, 0);
@@ -189,9 +197,10 @@ const tensor::Tensor& MatmulLayer::get_bias(int32_t idx) const {
 
 void MatmulLayer::to_cuda() {
   LayerParam::to_cuda();
+  cudaStream_t stream = cuda_config_ ? cuda_config_->stream : nullptr;
   if (has_bias_) {
     for (auto& bias : bias_) {
-      bias.to_cuda(cuda_config_ ? cuda_config_->stream : nullptr);
+      bias.to_cuda(stream);
     }
   }
 }

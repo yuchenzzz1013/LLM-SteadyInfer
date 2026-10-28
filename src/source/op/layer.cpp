@@ -180,7 +180,11 @@ const tensor::Tensor& LayerParam::get_weight(int32_t idx) const {
 void LayerParam::to_cuda() {
   Layer::to_cuda();
   for (auto& weight : weights_) {
-    weight.to_cuda(cuda_config_ ? cuda_config_->stream : nullptr);
+    // AWQ layers keep their packed weights in dedicated tensors and leave the
+    // dense weight slot empty; an empty slot is not an error.
+    if (!weight.is_empty()) {
+      weight.to_cuda(cuda_config_ ? cuda_config_->stream : nullptr);
+    }
   }
   if (!scales_.is_empty()) {
     scales_.to_cuda(cuda_config_ ? cuda_config_->stream : nullptr);

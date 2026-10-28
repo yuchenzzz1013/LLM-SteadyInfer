@@ -6,9 +6,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <nlohmann/json.hpp>
+#include "base/bf16_utils.h"
 #include "model/safetensors_reader.h"
+#include "op/matmul.h"
 #include "../op/kernels/cuda/mha_kernel.cuh"
 #include "../op/kernels/cuda/paged_kernels.cuh"  // paged_decode_geometry_ok (partials sizing)
 namespace model {
@@ -455,10 +458,12 @@ base::Status Model::load_hf_model() {
     return load_status;
   }
 
-  // Store every weight in the model's compute dtype right away: BF16 bits on
-  // CUDA models, FP32 on CPU models. The checkpoint dtype is converted only
-  // when it differs, so an FP32 (CPU) run keeps the checkpoint's full
-  // precision instead of round-tripping F32 -> BF16 -> F32.
+  // Store floating-point weights in the model's compute dtype right away:
+  // BF16 bits on CUDA models, FP32 on CPU models. The checkpoint dtype is
+  // converted only when it differs, so an FP32 (CPU) run keeps the
+  // checkpoint's full precision instead of round-tripping F32 -> BF16 -> F32.
+  // Packed integer tensors (AWQ qweight/qzeros) keep int32 verbatim — they
+  // are bit fields, not numbers to convert.
   const base::DataType dtype = compute_dtype();
   weight_map_.clear();
   for (const std::string& name : reader.tensor_names()) {
@@ -467,13 +472,16 @@ base::Status Model::load_hf_model() {
       LOG(WARNING) << "[MODEL] skip empty tensor '" << name << "'";
       continue;
     }
+    const std::string& src_dtype = reader.meta(name).dtype;
+    const base::DataType dst_dtype =
+        (src_dtype == "I32") ? base::DataType::kDataTypeInt32 : dtype;
     auto storage = std::make_shared<std::vector<uint8_t>>(
-        static_cast<size_t>(n) * base::DataTypeSize(dtype));
-    if (reader.read_tensor(name, dtype, storage->data()) != n) {
+        static_cast<size_t>(n) * base::DataTypeSize(dst_dtype));
+    if (reader.read_tensor(name, dst_dtype, storage->data()) != n) {
       return error::ModelParseError("Failed to read the weight tensor '" + name + "' from " +
                                     model_path_);
     }
-    weight_map_.emplace(name, HostWeight{std::move(storage), n});
+    weight_map_.emplace(name, HostWeight{std::move(storage), n, dst_dtype});
   }
   if (weight_map_.empty()) {
     return error::ModelParseError("No weight tensor was loaded from the model dir " + model_path_);
@@ -484,7 +492,7 @@ base::Status Model::load_hf_model() {
   return error::Success();
 }
 
-const void* Model::get_weight_data(const std::string& name) {
+const void* Model::get_weight_data(const std::string& name) const {
   auto it = weight_map_.find(name);
   CHECK(it != weight_map_.end()) << "Unknown model weight tensor '" << name << "'";
   return it->second.bytes->data();
@@ -494,6 +502,321 @@ size_t Model::get_weight_numel(const std::string& name) const {
   auto it = weight_map_.find(name);
   CHECK(it != weight_map_.end()) << "Unknown model weight tensor '" << name << "'";
   return static_cast<size_t>(it->second.numel);
+}
+
+base::DataType Model::get_weight_dtype(const std::string& name) const {
+  auto it = weight_map_.find(name);
+  CHECK(it != weight_map_.end()) << "Unknown model weight tensor '" << name << "'";
+  return it->second.data_type;
+}
+
+namespace {
+// AWQ packs eight signed 4-bit codes into one int32; output-column offset i
+// selects the nibble at bit 4 * kAwqOrder[i]. This interleaved order was
+// verified against the full-precision counterpart of an AWQ checkpoint.
+constexpr int kAwqOrder[8] = {0, 4, 1, 5, 2, 6, 3, 7};
+
+template <typename T>
+struct AwqStore;
+template <>
+struct AwqStore<float> {
+  static float load_scale(const void* p, int64_t i) {
+    return static_cast<const float*>(p)[i];
+  }
+  static float store(float v) { return v; }
+};
+template <>
+struct AwqStore<base::bf16_t> {
+  static float load_scale(const void* p, int64_t i) {
+    return base::bf16_to_fp32(static_cast<const base::bf16_t*>(p)[i]);
+  }
+  static base::bf16_t store(float v) { return base::fp32_to_bf16(v); }
+};
+
+// One packed column (eight output rows) is dequantized at a time, so each
+// qweight int32 is read once and its eight codes are stored contiguously along
+// K in the [N, K] destination rows.
+template <typename T>
+void awq_dequantize_impl(const int32_t* qweight, const int32_t* qzeros, const void* scales,
+                         int32_t in_features, int32_t out_features, int32_t group_size,
+                         bool zero_point, T* dst) {
+  const int32_t packed_cols = out_features / 8;
+  const int32_t groups = in_features / group_size;
+  using Store = AwqStore<T>;
+#pragma omp parallel for schedule(static)
+  for (int32_t c = 0; c < packed_cols; ++c) {
+    const int32_t n0 = c * 8;
+    for (int32_t g = 0; g < groups; ++g) {
+      const uint32_t zero_packed =
+          zero_point ? static_cast<uint32_t>(qzeros[static_cast<int64_t>(g) * packed_cols + c])
+                     : 0u;
+      int32_t zero[8];
+      float scale[8];
+      for (int i = 0; i < 8; ++i) {
+        const int shift = 4 * kAwqOrder[i];
+        zero[i] = zero_point ? static_cast<int>((zero_packed >> shift) & 0xFu) : 8;
+        scale[i] =
+            Store::load_scale(scales, static_cast<int64_t>(g) * out_features + n0 + i);
+      }
+      for (int32_t kk = 0; kk < group_size; ++kk) {
+        const int32_t k = g * group_size + kk;
+        const uint32_t packed =
+            static_cast<uint32_t>(qweight[static_cast<int64_t>(k) * packed_cols + c]);
+        for (int i = 0; i < 8; ++i) {
+          const int q = static_cast<int>((packed >> (4 * kAwqOrder[i])) & 0xFu);
+          dst[static_cast<int64_t>(n0 + i) * in_features + k] =
+              Store::store(static_cast<float>(q - zero[i]) * scale[i]);
+        }
+      }
+    }
+  }
+}
+}  // namespace
+
+void Model::dequantize_awq_module(const std::string& prefix, int32_t out_features,
+                                  int32_t in_features, base::DataType dst_dtype,
+                                  void* dst) const {
+  CHECK(config_ && config_->weight_quant_ == WeightQuantType::kAwqInt4)
+      << "AWQ dequantization requested for a non-AWQ model";
+  const int32_t group_size = config_->weight_quant_group_size_;
+  CHECK_GT(group_size, 0);
+  CHECK_EQ(in_features % group_size, 0);
+  CHECK_EQ(out_features % 8, 0);
+  const bool zero_point = config_->weight_quant_zero_point_;
+  const int32_t packed_cols = out_features / 8;
+  const int32_t groups = in_features / group_size;
+  const std::string qweight_name = prefix + ".qweight";
+  CHECK(weight_map_.count(qweight_name) > 0) << "AWQ module '" << prefix << "' misses "
+                                             << qweight_name;
+  CHECK_EQ(get_weight_numel(qweight_name),
+           static_cast<size_t>(in_features) * packed_cols)
+      << "AWQ qweight shape mismatch for '" << prefix << "'";
+  const void* qweight = get_weight_data(qweight_name);
+  const void* qzeros = nullptr;
+  if (zero_point) {
+    const std::string qzeros_name = prefix + ".qzeros";
+    CHECK(weight_map_.count(qzeros_name) > 0)
+        << "AWQ module '" << prefix << "' misses " << qzeros_name;
+    CHECK_EQ(get_weight_numel(qzeros_name), static_cast<size_t>(groups) * packed_cols)
+        << "AWQ qzeros shape mismatch for '" << prefix << "'";
+    qzeros = get_weight_data(qzeros_name);
+  }
+  const std::string scales_name = prefix + ".scales";
+  CHECK(weight_map_.count(scales_name) > 0)
+      << "AWQ module '" << prefix << "' misses " << scales_name;
+  CHECK_EQ(get_weight_numel(scales_name), static_cast<size_t>(groups) * out_features)
+      << "AWQ scales shape mismatch for '" << prefix << "'";
+  CHECK_EQ(static_cast<int>(get_weight_dtype(scales_name)), static_cast<int>(dst_dtype))
+      << "AWQ scales for '" << prefix << "' were not loaded in the compute dtype";
+  const void* scales = get_weight_data(scales_name);
+
+  if (dst_dtype == base::DataType::kDataTypeBF16) {
+    awq_dequantize_impl<base::bf16_t>(static_cast<const int32_t*>(qweight),
+                                      static_cast<const int32_t*>(qzeros), scales, in_features,
+                                      out_features, group_size, zero_point,
+                                      static_cast<base::bf16_t*>(dst));
+  } else if (dst_dtype == base::DataType::kDataTypeFp32) {
+    awq_dequantize_impl<float>(static_cast<const int32_t*>(qweight),
+                               static_cast<const int32_t*>(qzeros), scales, in_features,
+                               out_features, group_size, zero_point, static_cast<float*>(dst));
+  } else {
+    LOG(FATAL) << "Unsupported AWQ dequantization target dtype";
+  }
+}
+
+void Model::release_quantization_payload() {
+  // The packed AWQ tensors are only input to layer construction (each module is
+  // dequantized into its layer's storage). Drop the host copies once every
+  // layer exists so an AWQ checkpoint does not keep ~9 GB of qweight/qzeros
+  // resident for the model's lifetime. Full-precision modules keep their
+  // entries: their layers hold non-owning views into weight_map_.
+  if (!config_ || config_->weight_quant_ != WeightQuantType::kAwqInt4) {
+    return;
+  }
+  const auto ends_with = [](const std::string& name, const char* suffix) {
+    const size_t n = std::strlen(suffix);
+    return name.size() >= n && name.compare(name.size() - n, n, suffix) == 0;
+  };
+  for (auto it = weight_map_.begin(); it != weight_map_.end();) {
+    const bool packed = ends_with(it->first, ".qweight") ||
+                        ends_with(it->first, ".qzeros") ||
+                        ends_with(it->first, ".scales");
+    it = packed ? weight_map_.erase(it) : std::next(it);
+  }
+}
+
+std::shared_ptr<op::Layer> Model::create_linear_layer(const std::string& prefix,
+                                                      int32_t out_features, int32_t in_features,
+                                                      bool has_bias) {
+  const auto cpu_device_type = base::DeviceType::kDeviceCPU;
+  const bool cuda = device_type_ == base::DeviceType::kDeviceCUDA;
+  const base::DataType dtype = compute_dtype();
+  std::shared_ptr<base::DeviceAllocator> alloc =
+      cuda ? std::shared_ptr<base::DeviceAllocator>(
+                 base::CUDADeviceAllocatorFactory::get_instance())
+           : std::shared_ptr<base::DeviceAllocator>(
+                 base::CPUDeviceAllocatorFactory::get_instance());
+
+  const bool awq_module =
+      config_ && config_->weight_quant_ == WeightQuantType::kAwqInt4 &&
+      weight_map_.count(prefix + ".qweight") > 0 &&
+      std::find(config_->weight_quant_exclude.begin(), config_->weight_quant_exclude.end(),
+                prefix) == config_->weight_quant_exclude.end();
+  auto layer = std::make_shared<op::MatmulLayer>(device_type_, out_features, in_features,
+                                                 /*is_quant_layer=*/false, has_bias);
+  if (awq_module) {
+    // Dequantize now: every downstream consumer (single projection, fused
+    // QKV/FFN, cuBLAS GEMM) then sees the same dense weight the full-precision
+    // checkpoint would have produced.
+    const size_t bytes = static_cast<size_t>(out_features) * in_features *
+                         base::DataTypeSize(dtype);
+    std::vector<uint8_t> host_weight(bytes);
+    dequantize_awq_module(prefix, out_features, in_features, dtype, host_weight.data());
+    tensor::Tensor weight(dtype, out_features, in_features, true, alloc);
+    if (cuda) {
+      cudaStream_t stream = cuda_config_ ? cuda_config_->stream : nullptr;
+      cudaMemcpyAsync(weight.ptr<uint8_t>(), host_weight.data(), bytes,
+                      cudaMemcpyHostToDevice, stream);
+      if (stream) cudaStreamSynchronize(stream);
+    } else {
+      std::memcpy(weight.ptr<uint8_t>(), host_weight.data(), bytes);
+    }
+    CHECK(layer->set_weight(0, weight));
+  } else {
+    const std::string weight_name = prefix + ".weight";
+    CHECK(weight_map_.count(weight_name) > 0)
+        << "Checkpoint misses the weight tensor '" << weight_name << "'";
+    CHECK(layer->set_weight(0, {out_features, in_features}, get_weight_data(weight_name),
+                            cpu_device_type, get_weight_dtype(weight_name)));
+  }
+
+  if (has_bias) {
+    const std::string bias_name = prefix + ".bias";
+    CHECK(weight_map_.count(bias_name) > 0)
+        << "Linear layer '" << prefix << "' misses " << bias_name;
+    CHECK(layer->set_bias(0, out_features, get_weight_data(bias_name), cpu_device_type,
+                          get_weight_dtype(bias_name)));
+  }
+  return layer;
+}
+
+std::shared_ptr<op::MatmulLayer> Model::create_fused_linear_layer(
+    const std::vector<std::string>& prefixes, const std::vector<int32_t>& out_features,
+    int32_t in_features, bool has_bias) {
+  CHECK(!prefixes.empty());
+  CHECK_EQ(prefixes.size(), out_features.size());
+  int32_t total_out = 0;
+  for (int32_t n : out_features) total_out += n;
+
+  const bool cuda = device_type_ == base::DeviceType::kDeviceCUDA;
+  const base::DataType dtype = compute_dtype();
+  const size_t elem = base::DataTypeSize(dtype);
+  std::shared_ptr<base::DeviceAllocator> alloc =
+      cuda ? std::shared_ptr<base::DeviceAllocator>(
+                 base::CUDADeviceAllocatorFactory::get_instance())
+           : std::shared_ptr<base::DeviceAllocator>(
+                 base::CPUDeviceAllocatorFactory::get_instance());
+
+  // Rows are concatenated in prefix order; the forward pass already expects
+  // that order (q|k|v and gate|up).
+  const size_t weight_bytes = static_cast<size_t>(total_out) * in_features * elem;
+  std::vector<uint8_t> host_weight(weight_bytes);
+  int32_t row_off = 0;
+  for (size_t i = 0; i < prefixes.size(); ++i) {
+    const std::string& prefix = prefixes[i];
+    const int32_t out_i = out_features[i];
+    uint8_t* dst = host_weight.data() + static_cast<int64_t>(row_off) * in_features * elem;
+    const bool awq_module =
+        config_ && config_->weight_quant_ == WeightQuantType::kAwqInt4 &&
+        weight_map_.count(prefix + ".qweight") > 0 &&
+        std::find(config_->weight_quant_exclude.begin(), config_->weight_quant_exclude.end(),
+                  prefix) == config_->weight_quant_exclude.end();
+    if (awq_module) {
+      dequantize_awq_module(prefix, out_i, in_features, dtype, dst);
+    } else {
+      const std::string weight_name = prefix + ".weight";
+      CHECK(weight_map_.count(weight_name) > 0)
+          << "Checkpoint misses the weight tensor '" << weight_name << "'";
+      std::memcpy(dst, get_weight_data(weight_name),
+                  static_cast<size_t>(out_i) * in_features * elem);
+    }
+    row_off += out_i;
+  }
+
+  auto layer = std::make_shared<op::MatmulLayer>(device_type_, total_out, in_features,
+                                                 /*is_quant_layer=*/false, has_bias);
+  tensor::Tensor weight(dtype, total_out, in_features, true, alloc);
+  cudaStream_t stream = cuda_config_ ? cuda_config_->stream : nullptr;
+  if (cuda) {
+    cudaMemcpyAsync(weight.ptr<uint8_t>(), host_weight.data(), weight_bytes,
+                    cudaMemcpyHostToDevice, stream);
+  } else {
+    std::memcpy(weight.ptr<uint8_t>(), host_weight.data(), weight_bytes);
+  }
+  CHECK(layer->set_weight(0, weight));
+
+  if (has_bias) {
+    std::vector<uint8_t> host_bias(static_cast<size_t>(total_out) * elem);
+    int32_t bias_off = 0;
+    for (size_t i = 0; i < prefixes.size(); ++i) {
+      const std::string bias_name = prefixes[i] + ".bias";
+      CHECK(weight_map_.count(bias_name) > 0)
+          << "Linear layer '" << prefixes[i] << "' misses " << bias_name;
+      std::memcpy(host_bias.data() + static_cast<int64_t>(bias_off) * elem,
+                  get_weight_data(bias_name), static_cast<size_t>(out_features[i]) * elem);
+      bias_off += out_features[i];
+    }
+    tensor::Tensor bias(dtype, total_out, true, alloc);
+    if (cuda) {
+      cudaMemcpyAsync(bias.ptr<uint8_t>(), host_bias.data(),
+                      static_cast<size_t>(total_out) * elem, cudaMemcpyHostToDevice, stream);
+    } else {
+      std::memcpy(bias.ptr<uint8_t>(), host_bias.data(),
+                  static_cast<size_t>(total_out) * elem);
+    }
+    CHECK(layer->set_bias(0, bias));
+  }
+
+  // The host staging buffers are freed after this call, so the H2D copies must
+  // have completed (init-time only).
+  if (cuda && stream) cudaStreamSynchronize(stream);
+  return layer;
+}
+
+void Model::repoint_layers_to_fused(
+    const std::shared_ptr<op::MatmulLayer>& fused,
+    const std::vector<std::shared_ptr<op::Layer>>& layers,
+    const std::vector<int32_t>& out_features) {
+  CHECK(fused != nullptr);
+  CHECK_EQ(layers.size(), out_features.size());
+  const int32_t in_features = fused->in_features();
+  const tensor::Tensor& weight = fused->get_weight(0);
+  const size_t elem = base::DataTypeSize(weight.data_type());
+
+  int32_t out_off = 0;
+  for (size_t i = 0; i < layers.size(); ++i) {
+    const int32_t out_i = out_features[i];
+    auto target = std::dynamic_pointer_cast<op::MatmulLayer>(layers[i]);
+    CHECK(target != nullptr) << "A fused projection can only re-point MatmulLayers.";
+
+    tensor::Tensor view(
+        weight.data_type(), out_i, in_features, false, nullptr,
+        const_cast<uint8_t*>(
+            weight.ptr<uint8_t>(static_cast<int64_t>(out_off) * in_features * elem)));
+    view.set_device_type(device_type_);
+    CHECK(target->set_weight(0, view));
+
+    if (fused->has_bias() && target->has_bias()) {
+      const tensor::Tensor& bias = fused->get_bias(0);
+      const size_t bias_elem = base::DataTypeSize(bias.data_type());
+      tensor::Tensor bias_view(
+          bias.data_type(), out_i, false, nullptr,
+          const_cast<uint8_t*>(bias.ptr<uint8_t>(static_cast<int64_t>(out_off) * bias_elem)));
+      bias_view.set_device_type(device_type_);
+      CHECK(target->set_bias(0, bias_view));
+    }
+    out_off += out_i;
+  }
 }
 
 base::Status Model::generate_model_infos(const HfConfig& config) const {
@@ -615,6 +938,30 @@ base::Status Model::gen_model_from_file() {
       hf.rope_theta = j["rope_theta"].get<float>();
     }
     hf.tie_word_embeddings = j.value("tie_word_embeddings", false);
+    // Quantized checkpoints describe their weight storage in config.json.
+    // Reading it here (rather than taking a CLI flag) keeps the runtime
+    // checkpoint-driven and works for every model family below.
+    if (j.contains("quantization_config") && !j["quantization_config"].is_null()) {
+      const auto& q = j["quantization_config"];
+      hf.quant_method = q.value("quant_method", std::string());
+      hf.quant_version = q.value("version", std::string());
+      if (q.contains("bits")) {
+        hf.quant_bits = q["bits"].get<int32_t>();
+      } else if (q.contains("w_bit")) {
+        hf.quant_bits = q["w_bit"].get<int32_t>();
+      }
+      if (q.contains("group_size")) {
+        hf.quant_group_size = q["group_size"].get<int32_t>();
+      } else if (q.contains("q_group_size")) {
+        hf.quant_group_size = q["q_group_size"].get<int32_t>();
+      }
+      hf.quant_zero_point = q.value("zero_point", true);
+      if (q.contains("modules_to_not_convert") && !q["modules_to_not_convert"].is_null()) {
+        for (const auto& module : q["modules_to_not_convert"]) {
+          hf.modules_to_not_convert.push_back(module.get<std::string>());
+        }
+      }
+    }
   } catch (const std::exception& e) {
     return error::ModelParseError("Failed to parse the model config " + config_path + ": " +
                                   e.what());
@@ -623,6 +970,41 @@ base::Status Model::gen_model_from_file() {
   if (!gen_status) {
     LOG(ERROR) << "Invalid model config in " << config_path;
     return gen_status;
+  }
+  // Resolve the checkpoint's weight-quantization scheme. AWQ is the only
+  // quantized format the runtime implements; anything else must fail loudly
+  // instead of being silently treated as full precision.
+  if (!hf.quant_method.empty()) {
+    if (hf.quant_method != "awq") {
+      return error::ModelParseError("Unsupported quantization method '" + hf.quant_method +
+                                    "' in " + config_path + " (supported: awq)");
+    }
+    if (hf.quant_bits != 4) {
+      return error::ModelParseError("AWQ with bits=" + std::to_string(hf.quant_bits) +
+                                    " is unsupported (only 4-bit AWQ is implemented)");
+    }
+    if (hf.quant_group_size <= 0) {
+      return error::ModelParseError("AWQ group_size must be positive, got " +
+                                    std::to_string(hf.quant_group_size));
+    }
+    // Only autoawq's "gemm" layout is implemented: qweight [K, N/8] with the
+    // 4-bit codes packed along N. The "gemv" layout stores [N/8, K] and would
+    // decode as garbage, so reject it explicitly.
+    if (!hf.quant_version.empty() && hf.quant_version != "gemm") {
+      return error::ModelParseError("Unsupported AWQ layout version '" + hf.quant_version +
+                                    "' in " + config_path + " (supported: gemm)");
+    }
+    config_->weight_quant_ = WeightQuantType::kAwqInt4;
+    config_->weight_quant_group_size_ = hf.quant_group_size;
+    config_->weight_quant_zero_point_ = hf.quant_zero_point;
+    config_->weight_quant_exclude = hf.modules_to_not_convert;
+    is_quant_model_ = true;
+    LOG(INFO) << "[MODEL] AWQ W4A16 checkpoint: group_size=" << hf.quant_group_size
+              << ", zero_point=" << (hf.quant_zero_point ? "true" : "false");
+  } else if (is_quant_model_) {
+    return error::ModelParseError(
+        "The model was constructed with is_quant_model=true but " + config_path +
+        " carries no quantization_config; the legacy int8 format is no longer supported.");
   }
   if (config_->vocab_size_ != tokenizer_vocab_size) {
     LOG(WARNING) << "[MODEL] config.json vocab_size=" << config_->vocab_size_

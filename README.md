@@ -24,6 +24,9 @@ LLM-SteadyInfer 是一个基于 **C++ / CUDA C++** 实现的轻量级大语言�
 - BF16 推理（HF safetensors 模型目录加载;CUDA 全链路 BF16——权重 / 激活 /
   KV Cache / logits 均 BF16,Tensor Core 数学运算;CPU 设备自动回退 FP32,
   权重加载时转换）
+- AWQ W4A16 量化模型（读取 `quantization_config` 与
+  `qweight/qzeros/scales`，加载时反量化为模型计算 dtype，之后与非量化模型
+  走**完全相同**的算子图、融合投影与 GEMM kernel）
 - LLaMA3 / Qwen2 / Qwen3 模型架构
 
 ---
@@ -143,6 +146,14 @@ LLM-SteadyInfer 是一个基于 **C++ / CUDA C++** 实现的轻量级大语言�
 
 - BF16（CUDA:全链路权重 / 激活 / KV Cache / RoPE sin-cos 表均 BF16）
 - FP32（后备:仅 CPU 设备,权重加载时转换;CUDA 侧不保留任何 FP32 算子）
+
+量化权重：
+
+- AWQ W4A16（`quant_method: "awq"`, group_size / zero_point 从
+  `config.json` 读取）。AWQ 的 `qweight/qzeros/scales` 在构建层时反量化为
+  计算 dtype（CUDA BF16 / CPU FP32），因此量化模型与非量化模型执行同一套
+  MatmulLayer、融合 QKV、融合 gate/up 与 cuBLAS GEMM，吞吐与延迟一致。
+  未量化的模块（`modules_to_not_convert` / 无 `qweight`）自动保持全精度。
 
 ---
 

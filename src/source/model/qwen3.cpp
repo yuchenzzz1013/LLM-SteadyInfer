@@ -145,9 +145,6 @@ base::Status Qwen3Model::init(base::DeviceType device_type) {
   if (token_path_.empty()) {
     return error::PathNotValid(token_path_);
   }
-  if (device_type == base::DeviceType::kDeviceCPU && is_quant_model_) {
-    return error::InternalError("The cpu device do not support int8 quant model.");
-  }
 
   device_type_ = device_type;
   if (device_type == DeviceType::kDeviceCUDA) {
@@ -167,6 +164,9 @@ base::Status Qwen3Model::init(base::DeviceType device_type) {
     return read_status;
   }
   init_mem();
+  // All layers (including the fused projections) now own their dequantized
+  // weights; the packed AWQ payload can be released.
+  release_quantization_payload();
   if (device_type_ == base::DeviceType::kDeviceCPU) {
     kernel::sin_cos_cache_calc_cpu(config_->head_size_, config_->seq_len_,
                                    get_buffer(ModelBufferType::kSinCache).ptr<float>(),
@@ -188,9 +188,6 @@ base::Status Qwen3Model::forward(const tensor::Tensor& input, const tensor::Tens
                                  int& next) const {
   if (input.is_empty()) {
     return base::error::InvalidArgument("The input tensor is empty.");
-  }
-  if (device_type_ == base::DeviceType::kDeviceCPU && is_quant_model_) {
-    return base::error::InternalError("Unsupported int8 quant in the cpu device");
   }
 
   for (int32_t layer_idx = 0; layer_idx < config_->layer_num_; ++layer_idx) {
@@ -223,20 +220,15 @@ void Qwen3Model::create_nonparam_layers() {
       std::make_shared<op::SwiGLULayer>(device_type_, config_->immediate_dim_);
 }
 
-void Qwen3Model::create_param_quant_layers() {
-  // Int8 group quantization is not migrated to the HF safetensors loading
-  // path (BF16 replaces it). Loading quantized checkpoints fails loudly.
-  LOG(FATAL) << "Int8 quantized models are not supported by the HF safetensors "
-                "loader; use a BF16 checkpoint.";
-}
 
 void Qwen3Model::create_param_layers() {
-  CHECK(!is_quant_model_);
   CHECK(qwen_layers_ != nullptr);
 
   // Weights come from the HF safetensors checkpoint under the model compute
   // dtype: BF16 raw bits on CUDA, FP32 (converted at load time) on the CPU
-  // path.
+  // path. Linear projections go through create_linear_layer(), which makes
+  // the checkpoint's own metadata decide between a full-precision GEMM and an
+  // AWQ W4A16 GEMM per module; norms / embeddings stay full precision.
   const auto cpu_device_type = base::DeviceType::kDeviceCPU;
   const base::DataType w_dtype = compute_dtype();
 
@@ -251,6 +243,11 @@ void Qwen3Model::create_param_layers() {
   const int32_t head_size = config_->head_size_;
   const int32_t vocab = std::abs(config_->vocab_size_);
   auto block_name = [](int32_t i, const std::string& suffix) {
+    return "model.layers." + std::to_string(i) + "." + suffix;
+  };
+  // HF module prefix without a tensor suffix (create_linear_layer appends
+  // ".weight" / ".qweight" / ".bias" itself).
+  auto block_prefix = [](int32_t i, const std::string& suffix) {
     return "model.layers." + std::to_string(i) + "." + suffix;
   };
   const std::string attn = "self_attn.";
@@ -296,11 +293,8 @@ void Qwen3Model::create_param_layers() {
 
   // Query projection. Qwen3 has no QKV bias.
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto wq = std::make_shared<op::MatmulLayer>(device_type_, dim, hidden_dim);
-    const void* wq_w = get_weight_data(block_name(i, attn + "q_proj.weight"));
-    CHECK_NE(wq_w, nullptr) << "Qwen3 checkpoint misses " << block_name(i, attn + "q_proj.weight");
-    wq->set_weight(0, {dim, hidden_dim}, wq_w, cpu_device_type, w_dtype);
-    qwen_layers_->wq_layers_.push_back(wq);
+    qwen_layers_->wq_layers_.push_back(
+        create_linear_layer(block_prefix(i, attn + "q_proj"), dim, hidden_dim));
   }
 
   // Query norm (Qwen3 specific): per-head RMSNorm applied to [.., head_dim]
@@ -316,11 +310,8 @@ void Qwen3Model::create_param_layers() {
 
   // Key projection
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto wk = std::make_shared<op::MatmulLayer>(device_type_, kv_dim, hidden_dim);
-    const void* wk_w = get_weight_data(block_name(i, attn + "k_proj.weight"));
-    CHECK_NE(wk_w, nullptr) << "Qwen3 checkpoint misses " << block_name(i, attn + "k_proj.weight");
-    wk->set_weight(0, {kv_dim, hidden_dim}, wk_w, cpu_device_type, w_dtype);
-    qwen_layers_->wk_layers_.push_back(wk);
+    qwen_layers_->wk_layers_.push_back(
+        create_linear_layer(block_prefix(i, attn + "k_proj"), kv_dim, hidden_dim));
   }
 
   // Key norm (Qwen3 specific), same convention as the query norm.
@@ -335,57 +326,39 @@ void Qwen3Model::create_param_layers() {
 
   // Value projection
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto wv = std::make_shared<op::MatmulLayer>(device_type_, kv_dim, hidden_dim);
-    const void* wv_w = get_weight_data(block_name(i, attn + "v_proj.weight"));
-    CHECK_NE(wv_w, nullptr) << "Qwen3 checkpoint misses " << block_name(i, attn + "v_proj.weight");
-    wv->set_weight(0, {kv_dim, hidden_dim}, wv_w, cpu_device_type, w_dtype);
-    qwen_layers_->wv_layers_.push_back(wv);
+    qwen_layers_->wv_layers_.push_back(
+        create_linear_layer(block_prefix(i, attn + "v_proj"), kv_dim, hidden_dim));
   }
 
   // Output projection
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto wo = std::make_shared<op::MatmulLayer>(device_type_, hidden_dim, dim);
-    const void* wo_w = get_weight_data(block_name(i, attn + "o_proj.weight"));
-    CHECK_NE(wo_w, nullptr) << "Qwen3 checkpoint misses " << block_name(i, attn + "o_proj.weight");
-    wo->set_weight(0, {hidden_dim, dim}, wo_w, cpu_device_type, w_dtype);
-    qwen_layers_->wo_layers_.push_back(wo);
+    qwen_layers_->wo_layers_.push_back(
+        create_linear_layer(block_prefix(i, attn + "o_proj"), hidden_dim, dim));
   }
 
   // FFN: SwiGLU computes silu(w1_out) * w3_out (kernel convention), so w1
-  // takes mlp.gate_proj.weight and w3 takes mlp.up_proj.weight.
+  // takes mlp.gate_proj and w3 takes mlp.up_proj.
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto w1 = std::make_shared<op::MatmulLayer>(device_type_, immediate_dim, hidden_dim);
-    const void* w1_w = get_weight_data(block_name(i, "mlp.gate_proj.weight"));
-    CHECK_NE(w1_w, nullptr) << "Qwen3 checkpoint misses "
-                            << block_name(i, "mlp.gate_proj.weight");
-    w1->set_weight(0, {immediate_dim, hidden_dim}, w1_w, cpu_device_type, w_dtype);
-    qwen_layers_->w1_layers_.push_back(w1);
-
-    auto w2 = std::make_shared<op::MatmulLayer>(device_type_, hidden_dim, immediate_dim);
-    const void* w2_w = get_weight_data(block_name(i, "mlp.down_proj.weight"));
-    CHECK_NE(w2_w, nullptr) << "Qwen3 checkpoint misses "
-                            << block_name(i, "mlp.down_proj.weight");
-    w2->set_weight(0, {hidden_dim, immediate_dim}, w2_w, cpu_device_type, w_dtype);
-    qwen_layers_->w2_layers_.push_back(w2);
-
-    auto w3 = std::make_shared<op::MatmulLayer>(device_type_, immediate_dim, hidden_dim);
-    const void* w3_w = get_weight_data(block_name(i, "mlp.up_proj.weight"));
-    CHECK_NE(w3_w, nullptr) << "Qwen3 checkpoint misses " << block_name(i, "mlp.up_proj.weight");
-    w3->set_weight(0, {immediate_dim, hidden_dim}, w3_w, cpu_device_type, w_dtype);
-    qwen_layers_->w3_layers_.push_back(w3);
+    qwen_layers_->w1_layers_.push_back(
+        create_linear_layer(block_prefix(i, "mlp.gate_proj"), immediate_dim, hidden_dim));
+    qwen_layers_->w2_layers_.push_back(
+        create_linear_layer(block_prefix(i, "mlp.down_proj"), hidden_dim, immediate_dim));
+    qwen_layers_->w3_layers_.push_back(
+        create_linear_layer(block_prefix(i, "mlp.up_proj"), immediate_dim, hidden_dim));
   }
 
   // LM head: tied in Qwen3 (tie_word_embeddings) — lm_head.weight is absent
-  // from the shards and the embedding rows are reused. Matches the classic
-  // Llama/Qwen convention when an untied lm_head.weight does exist.
-  qwen_layers_->cls_layer_ = std::make_shared<op::MatmulLayer>(device_type_, vocab, hidden_dim);
-  if (config_->is_shared_weight_ || !weight_map_.count("lm_head.weight")) {
+  // from the shards and the embedding rows are reused. An untied head goes
+  // through the same factory as the other projections, so a checkpoint that
+  // also quantizes lm_head is handled without special casing.
+  const bool head_in_checkpoint =
+      weight_map_.count("lm_head.weight") > 0 || weight_map_.count("lm_head.qweight") > 0;
+  if (config_->is_shared_weight_ || !head_in_checkpoint) {
+    qwen_layers_->cls_layer_ = std::make_shared<op::MatmulLayer>(device_type_, vocab, hidden_dim);
     qwen_layers_->cls_layer_->set_weight(0, {vocab, hidden_dim}, weight_embedding,
                                          cpu_device_type, w_dtype);
   } else {
-    qwen_layers_->cls_layer_->set_weight(0, {vocab, hidden_dim},
-                                         get_weight_data("lm_head.weight"), cpu_device_type,
-                                         w_dtype);
+    qwen_layers_->cls_layer_ = create_linear_layer("lm_head", vocab, hidden_dim);
   }
 }
 
@@ -395,97 +368,45 @@ void Qwen3Model::build_fused_qkv_layers() {
   if (disable && std::string(disable) == "1") {
     return;
   }
-  if (is_quant_model_) {
-    return;
-  }
 
   const int32_t dim = config_->dim_;
   const int32_t kv_dim = config_->kv_dim_;
   const int32_t hidden_dim = config_->hidden_dim_;
-  const int32_t fused_dim = dim + 2 * kv_dim;
   const int32_t num_layers = config_->layer_num_;
-  // The stacked weight buffer adopts the model compute dtype (BF16 on CUDA,
-  // FP32 on CPU runs) and is filled from the host weight map — the load-time
-  // source of truth, still on the host because this builder runs before
-  // to_cuda(). Every source block is K-major ([K, M] row-major) so each is one
-  // contiguous byte memcpy. The stacked buffer then becomes the single device
-  // residence of the three projections: on CUDA the legacy wq/wk/wv layers
-  // are re-pointed at slices of it, so to_cuda() copies nothing for them.
-  const base::DataType dtype = compute_dtype();
-  const size_t elem = base::DataTypeSize(dtype);
-  const size_t w_block_q = static_cast<size_t>(dim) * hidden_dim * elem;
-  const size_t w_block_kv = static_cast<size_t>(kv_dim) * hidden_dim * elem;
-  const auto block_name = [](int32_t i, const char* suffix) {
+  const std::vector<int32_t> widths = {dim, kv_dim, kv_dim};
+  const auto prefix = [](int32_t i, const char* suffix) {
     return "model.layers." + std::to_string(i) + "." + suffix;
   };
 
-  std::shared_ptr<base::DeviceAllocator> alloc;
-  if (device_type_ == base::DeviceType::kDeviceCUDA) {
-    alloc = base::CUDADeviceAllocatorFactory::get_instance();
-  } else {
-    alloc = base::CPUDeviceAllocatorFactory::get_instance();
-  }
-
   qwen_layers_->fused_qkv_layers_.clear();
-  qwen_layers_->fused_qkv_weight_src_.clear();
-  qwen_layers_->fused_qkv_bias_src_.clear();
   for (int32_t i = 0; i < num_layers; ++i) {
-    const void* wq_w = get_weight_data(block_name(i, "self_attn.q_proj.weight"));
-    const void* wk_w = get_weight_data(block_name(i, "self_attn.k_proj.weight"));
-    const void* wv_w = get_weight_data(block_name(i, "self_attn.v_proj.weight"));
-
-    // Stacked weight [q | k | v]: K-major blocks, one contiguous memcpy each.
-    tensor::Tensor fused_w(dtype, fused_dim, hidden_dim, true, alloc);
-    if (device_type_ == base::DeviceType::kDeviceCUDA) {
-      cudaStream_t stream = cuda_config_->stream;
-      cudaMemcpyAsync(fused_w.ptr<uint8_t>(), wq_w, w_block_q, cudaMemcpyHostToDevice, stream);
-      cudaMemcpyAsync(fused_w.ptr<uint8_t>(w_block_q), wk_w, w_block_kv,
-                      cudaMemcpyHostToDevice, stream);
-      cudaMemcpyAsync(fused_w.ptr<uint8_t>(w_block_q + w_block_kv), wv_w, w_block_kv,
-                      cudaMemcpyHostToDevice, stream);
-      cudaStreamSynchronize(stream);  // init-time only: weights must be ready pre-forward
-    } else {
-      std::memcpy(fused_w.ptr<uint8_t>(), wq_w, w_block_q);
-      std::memcpy(fused_w.ptr<uint8_t>(w_block_q), wk_w, w_block_kv);
-      std::memcpy(fused_w.ptr<uint8_t>(w_block_q + w_block_kv), wv_w, w_block_kv);
+    // Same fused [q | k | v] projection for both weight formats: the model
+    // layer concatenates dense rows or AWQ packed columns, so the operator
+    // graph downstream (split, Q/K norms, RoPE, attention) is identical.
+    auto fused = create_fused_linear_layer(
+        {prefix(i, "self_attn.q_proj"), prefix(i, "self_attn.k_proj"),
+         prefix(i, "self_attn.v_proj")},
+        widths, hidden_dim, /*has_bias=*/false);
+    if (!fused) {
+      // Mixed dense/quantized QKV modules: keep the unfused projections.
+      qwen_layers_->fused_qkv_layers_.clear();
+      return;
     }
-
-    // Qwen3 has no QKV bias (unlike Qwen2).
-    auto fused = std::make_shared<op::MatmulLayer>(device_type_, fused_dim, hidden_dim,
-                                                   false, false);
-    CHECK(fused->set_weight(0, fused_w));
     if (device_type_ == base::DeviceType::kDeviceCUDA) {
       fused->set_cuda_config(cuda_config_);
-      // Single device residence: the legacy projections view slices of the
-      // stacked buffer instead of owning device copies of their own; they
-      // read the same bytes, so the legacy forward()/predict() path works
-      // unchanged.
-      auto wq_layer = std::dynamic_pointer_cast<op::MatmulLayer>(qwen_layers_->wq_layers_.at(i));
-      auto wk_layer = std::dynamic_pointer_cast<op::MatmulLayer>(qwen_layers_->wk_layers_.at(i));
-      auto wv_layer = std::dynamic_pointer_cast<op::MatmulLayer>(qwen_layers_->wv_layers_.at(i));
-      CHECK(wq_layer->set_weight(0, {dim, hidden_dim}, fused_w.ptr<uint8_t>(), device_type_,
-                                 dtype));
-      CHECK(wk_layer->set_weight(0, {kv_dim, hidden_dim}, fused_w.ptr<uint8_t>(w_block_q),
-                                 device_type_, dtype));
-      CHECK(wv_layer->set_weight(0, {kv_dim, hidden_dim},
-                                 fused_w.ptr<uint8_t>(w_block_q + w_block_kv), device_type_,
-                                 dtype));
+      repoint_layers_to_fused(
+          fused, {qwen_layers_->wq_layers_.at(i), qwen_layers_->wk_layers_.at(i),
+                  qwen_layers_->wv_layers_.at(i)},
+          widths);
     }
     qwen_layers_->fused_qkv_layers_.push_back(fused);
-    // Keep-alive holder: set_weight stores a non-owning view into this buffer.
-    qwen_layers_->fused_qkv_weight_src_.push_back(fused_w);
   }
   qwen_layers_->fused_qkv_enabled_ = true;
 }
 
 void Qwen3Model::build_fused_w13_layers() {
-  if (is_quant_model_) {
-    return;
-  }
-  // CUDA only: the stacked weight replaces the two device copies of w1/w3 and
-  // the paired SwiGLU kernel is a CUDA kernel. The CPU fallback keeps its two
-  // GEMMs + get_swiglu_kernel path (there the w1/w3 "copies" are just views
-  // into the host weight map, so there is nothing to consolidate).
+  // CUDA only: the paired SwiGLU kernel is a CUDA kernel. The CPU fallback
+  // keeps its two GEMMs + get_swiglu_kernel path.
   if (device_type_ != base::DeviceType::kDeviceCUDA) {
     return;
   }
@@ -493,50 +414,29 @@ void Qwen3Model::build_fused_w13_layers() {
   const int32_t ffn_dim = config_->immediate_dim_;
   const int32_t hidden_dim = config_->hidden_dim_;
   const int32_t num_layers = config_->layer_num_;
-  const base::DataType dtype = compute_dtype();
-  const size_t elem = base::DataTypeSize(dtype);
-  const size_t w_block = static_cast<size_t>(ffn_dim) * hidden_dim * elem;
-  const auto block_name = [](int32_t i, const char* suffix) {
+  const std::vector<int32_t> widths = {ffn_dim, ffn_dim};
+  const auto prefix = [](int32_t i, const char* suffix) {
     return "model.layers." + std::to_string(i) + "." + suffix;
   };
 
-  auto alloc = base::CUDADeviceAllocatorFactory::get_instance();
-  cudaStream_t stream = cuda_config_->stream;
-
   qwen_layers_->fused_w13_layers_.clear();
-  qwen_layers_->fused_w13_weight_src_.clear();
   for (int32_t i = 0; i < num_layers; ++i) {
-    const void* w1_w = get_weight_data(block_name(i, "mlp.gate_proj.weight"));
-    const void* w3_w = get_weight_data(block_name(i, "mlp.up_proj.weight"));
-
-    // Both operands are K-major ([K, M] row-major), so the stacked weight is
-    // two contiguous block copies out of the host weight map — no repacking
-    // kernel needed.
-    tensor::Tensor fused_w(dtype, 2 * ffn_dim, hidden_dim, true, alloc);
-    cudaMemcpyAsync(fused_w.ptr<uint8_t>(), w1_w, w_block, cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(fused_w.ptr<uint8_t>(w_block), w3_w, w_block, cudaMemcpyHostToDevice, stream);
-    cudaStreamSynchronize(stream);  // init-time only: weights must be ready pre-forward
-
-    auto fused = std::make_shared<op::MatmulLayer>(device_type_, 2 * ffn_dim, hidden_dim, false,
-                                                   false);
-    CHECK(fused->set_weight(0, fused_w));
+    auto fused = create_fused_linear_layer(
+        {prefix(i, "mlp.gate_proj"), prefix(i, "mlp.up_proj")}, widths, hidden_dim,
+        /*has_bias=*/false);
+    if (!fused) {
+      qwen_layers_->fused_w13_layers_.clear();
+      return;
+    }
     fused->set_cuda_config(cuda_config_);
-    // Single device residence: w1/w3 view slices of the stacked buffer, so
-    // to_cuda() (which runs after this builder) copies nothing for them and
-    // the legacy feed_forward() path reads the same bytes as before.
-    auto w1_layer = std::dynamic_pointer_cast<op::MatmulLayer>(qwen_layers_->w1_layers_.at(i));
-    auto w3_layer = std::dynamic_pointer_cast<op::MatmulLayer>(qwen_layers_->w3_layers_.at(i));
-    CHECK(w1_layer->set_weight(0, {ffn_dim, hidden_dim}, fused_w.ptr<uint8_t>(), device_type_,
-                               dtype));
-    CHECK(w3_layer->set_weight(0, {ffn_dim, hidden_dim}, fused_w.ptr<uint8_t>(w_block),
-                               device_type_, dtype));
+    repoint_layers_to_fused(
+        fused, {qwen_layers_->w1_layers_.at(i), qwen_layers_->w3_layers_.at(i)}, widths);
     qwen_layers_->fused_w13_layers_.push_back(fused);
-    // Keep-alive holder: set_weight stores a non-owning view into this buffer.
-    qwen_layers_->fused_w13_weight_src_.push_back(fused_w);
   }
   qwen_layers_->fused_w13_enabled_ = true;
   LOG(INFO) << "[QWEN3] fused gate/up projection: " << num_layers << " layers, "
-            << (2.0 * w_block * num_layers) / (1024.0 * 1024.0)
+            << (2.0 * ffn_dim * hidden_dim * base::DataTypeSize(compute_dtype()) * num_layers) /
+                   (1024.0 * 1024.0)
             << " MB stacked weights (the separate w1/w3 device copies are gone)";
 }
 
@@ -632,11 +532,10 @@ base::Status Qwen3Model::create_layers() {
     qwen_layers_ = std::make_unique<Qwen3Layers>();
   }
 
-  if (!is_quant_model_) {
-    create_param_layers();
-  } else {
-    create_param_quant_layers();
-  }
+  // One builder handles both full-precision and AWQ checkpoints: whether a
+  // module is quantized is a property of the loaded tensor set, not of a
+  // model-wide mode switch (AWQ weights are dequantized while building).
+  create_param_layers();
   create_nonparam_layers();
 
   if (!qwen_layers_->embedding_layer_) {

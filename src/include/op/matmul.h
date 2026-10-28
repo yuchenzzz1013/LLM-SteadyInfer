@@ -16,9 +16,18 @@ class MatmulLayer : public LayerParam {
                         base::DeviceType device_type,
                         base::DataType data_type = base::DataType::kDataTypeFp32);
 
+  // Owning form: keeps the tensor's storage alive with the layer (used by the
+  // fused projections, whose stacked bias is built by the model).
+  base::Status set_bias(int32_t idx, const tensor::Tensor& bias);
+
   tensor::Tensor& get_bias(int32_t idx);
 
   const tensor::Tensor& get_bias(int32_t idx) const;
+
+  bool has_bias() const { return has_bias_; }
+
+  int32_t out_features() const { return dim0_; }
+  int32_t in_features() const { return dim1_; }
 
   void to_cuda() override;
 

@@ -9,10 +9,11 @@
 //
 // Every safetensors file is:  <uint64 LE header_len> <JSON header> <raw data>.
 // The JSON header maps tensor name -> {dtype, shape, data_offsets:[b,e]}, and
-// the optional index file maps tensor name -> shard file name. dtype is
-// restricted to "BF16"/"F32"; read_tensor converts to the caller's target
-// dtype only when it differs, so an FP32 model never round-trips its weights
-// through BF16 (see base/bf16_utils.h).
+// the optional index file maps tensor name -> shard file name. Floating-point
+// dtypes "BF16"/"F16"/"F32" are converted to the caller's target dtype only
+// when it differs (so an FP32 model never round-trips its weights through
+// BF16; see base/bf16_utils.h). Quantized integer tensors ("I32", the AWQ
+// qweight/qzeros packing) are read verbatim into an int32 destination.
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -48,9 +49,11 @@ class SafetensorsReader {
   int64_t numel(const std::string& name) const;
 
   // Read one tensor into `dst` as `dst_dtype` (kDataTypeBF16 raw bits /
-  // kDataTypeFp32), converting only when the checkpoint dtype differs so an
-  // FP32 target never round-trips through BF16. `dst` must hold numel(name)
-  // elements. Returns numel on success and -1 on failure (details logged).
+  // kDataTypeFp32 / kDataTypeInt32), converting only when the checkpoint dtype
+  // differs so an FP32 target never round-trips through BF16. Integer tensors
+  // ("I32", e.g. AWQ's packed qweight/qzeros) require an int32 destination and
+  // are copied verbatim. `dst` must hold numel(name) elements. Returns numel on
+  // success and -1 on failure (details logged).
   int64_t read_tensor(const std::string& name, base::DataType dst_dtype, void* dst) const;
 
  private:

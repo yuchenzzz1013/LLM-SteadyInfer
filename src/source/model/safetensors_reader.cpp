@@ -13,6 +13,37 @@ namespace model {
 namespace {
 constexpr int64_t kSafetensorHeaderPrefix = 8;  // uint64 LE header length
 
+// IEEE-754 binary16 -> binary32 (host-side; only used at load time for
+// checkpoints that store scales/biases as F16). Handles subnormals, inf and
+// NaN via the standard bit-field expansion.
+float fp16_to_fp32(uint16_t h) {
+  const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+  uint32_t exp = (h >> 10) & 0x1Fu;
+  uint32_t mant = h & 0x3FFu;
+  uint32_t bits;
+  if (exp == 0) {
+    if (mant == 0) {
+      bits = sign;  // +/- 0
+    } else {
+      // Subnormal: normalize the mantissa.
+      int32_t e = -1;
+      do {
+        ++e;
+        mant <<= 1;
+      } while ((mant & 0x400u) == 0);
+      mant &= 0x3FFu;
+      bits = sign | static_cast<uint32_t>(127 - 15 - e) << 23 | mant << 13;
+    }
+  } else if (exp == 0x1Fu) {
+    bits = sign | 0x7F800000u | mant << 13;  // inf / NaN
+  } else {
+    bits = sign | (exp - 15 + 127) << 23 | mant << 13;
+  }
+  float f = 0.0f;
+  std::memcpy(&f, &bits, sizeof(f));
+  return f;
+}
+
 // Read the header JSON of one safetensors file: [8-byte len][JSON][data].
 bool parse_shard_header(const std::string& file_path,
                         std::unordered_map<std::string, SafetensorMeta>* metas,
@@ -191,15 +222,24 @@ int64_t SafetensorsReader::read_tensor(const std::string& name, base::DataType d
   }
   const bool dst_bf16 = dst_dtype == base::DataType::kDataTypeBF16;
   const bool dst_fp32 = dst_dtype == base::DataType::kDataTypeFp32;
-  CHECK(dst_bf16 || dst_fp32) << "[safetensors] unsupported target dtype "
-                              << static_cast<int>(dst_dtype);
+  const bool dst_i32 = dst_dtype == base::DataType::kDataTypeInt32;
+  CHECK(dst_bf16 || dst_fp32 || dst_i32)
+      << "[safetensors] unsupported target dtype " << static_cast<int>(dst_dtype);
   const SafetensorMeta& m = meta(name);
   const int64_t n = numel(name);
   const bool src_bf16 = m.dtype == "BF16";
   const bool src_fp32 = m.dtype == "F32";
-  if (!src_bf16 && !src_fp32) {
+  const bool src_fp16 = m.dtype == "F16";
+  const bool src_i32 = m.dtype == "I32";
+  if (!src_bf16 && !src_fp32 && !src_fp16 && !src_i32) {
     LOG(ERROR) << "[safetensors] unsupported dtype '" << m.dtype << "' for tensor '" << name
-               << "' (expected BF16 or F32)";
+               << "' (expected BF16/F16/F32/I32)";
+    return -1;
+  }
+  if (src_i32 != dst_i32) {
+    LOG(ERROR) << "[safetensors] tensor '" << name << "' is " << m.dtype
+               << " but the destination dtype is " << static_cast<int>(dst_dtype)
+               << " (integer tensors must stay int32)";
     return -1;
   }
   const std::string file_path = dir_ + "/" + m.shard;
@@ -225,10 +265,18 @@ int64_t SafetensorsReader::read_tensor(const std::string& name, base::DataType d
 
   int64_t rc = -1;
   const size_t count = static_cast<size_t>(n);
-  if (src_bf16 == dst_bf16) {
-    // Same element layout (BF16 bits as uint16_t, or IEEE fp32): copy verbatim.
-    const size_t elem_size = src_bf16 ? sizeof(uint16_t) : sizeof(float);
-    if (fread(dst, elem_size, count, file) == count) {
+  if (src_i32) {
+    // Packed integer payload (AWQ qweight/qzeros): verbatim into int32.
+    if (fread(dst, sizeof(int32_t), count, file) == count) {
+      rc = n;
+    }
+  } else if (src_bf16 && dst_bf16) {
+    // Same element layout (BF16 bits as uint16_t): copy verbatim.
+    if (fread(dst, sizeof(uint16_t), count, file) == count) {
+      rc = n;
+    }
+  } else if (src_fp32 && dst_fp32) {
+    if (fread(dst, sizeof(float), count, file) == count) {
       rc = n;
     }
   } else if (src_fp32) {  // F32 -> BF16 (CUDA models downcast at load)
@@ -237,10 +285,24 @@ int64_t SafetensorsReader::read_tensor(const std::string& name, base::DataType d
       base::fp32_to_bf16_batch(tmp.data(), static_cast<base::bf16_t*>(dst), count);
       rc = n;
     }
-  } else {  // BF16 -> F32 (CPU models upconvert once at load)
+  } else if (src_bf16) {  // BF16 -> F32 (CPU models upconvert once at load)
     std::vector<base::bf16_t> tmp(count);
     if (fread(tmp.data(), sizeof(uint16_t), count, file) == count) {
       base::bf16_to_fp32_batch(tmp.data(), static_cast<float*>(dst), count);
+      rc = n;
+    }
+  } else {  // F16 -> F32 / BF16 (AWQ checkpoints written with float16 scales)
+    std::vector<uint16_t> tmp(count);
+    if (fread(tmp.data(), sizeof(uint16_t), count, file) == count) {
+      if (dst_fp32) {
+        float* out = static_cast<float*>(dst);
+        for (size_t i = 0; i < count; ++i) out[i] = fp16_to_fp32(tmp[i]);
+      } else {
+        base::bf16_t* out = static_cast<base::bf16_t*>(dst);
+        for (size_t i = 0; i < count; ++i) {
+          out[i] = base::fp32_to_bf16(fp16_to_fp32(tmp[i]));
+        }
+      }
       rc = n;
     }
   }
