@@ -36,7 +36,29 @@ base::Status MatmulLayer::check() const {
     }
   }
 
-  if (!is_quant_layer_) {
+  if (awq_) {
+    // Packed int4 weight + its scale/zero-point metadata.
+    status = check_tensor_with_dim(awq_qweight_, device_type_, base::DataType::kDataTypeInt32,
+                                   awq_qweight_.get_dim(0), awq_qweight_.get_dim(1));
+    if (!status) {
+      LOG(ERROR) << "The packed AWQ weight tensor error in the matmul layer.";
+      return status;
+    }
+    status = check_tensor_with_dim(awq_scales_, device_type_, data_type_,
+                                   awq_scales_.get_dim(0), awq_scales_.get_dim(1));
+    if (!status) {
+      LOG(ERROR) << "The AWQ scale tensor error in the matmul layer.";
+      return status;
+    }
+    if (awq_zero_point_) {
+      status = check_tensor_with_dim(awq_qzeros_, device_type_, base::DataType::kDataTypeInt32,
+                                     awq_qzeros_.get_dim(0), awq_qzeros_.get_dim(1));
+      if (!status) {
+        LOG(ERROR) << "The AWQ zero-point tensor error in the matmul layer.";
+        return status;
+      }
+    }
+  } else if (!is_quant_layer_) {
     status = check_tensor_with_dim(get_weight(0), device_type_, data_type_, dim0_, dim1_);
     if (!status) {
       LOG(ERROR) << "The weight tensor error in the matmul layer.";
@@ -113,7 +135,16 @@ base::Status MatmulLayer::forward() {
                              const_cast<uint8_t*>(output.ptr<uint8_t>()));
   output_flat.set_device_type(device_type_);
 
-  if (is_quant_layer_) {
+  if (awq_) {
+    kernel::AwqMatmulParams params;
+    params.group_size = awq_group_size_;
+    params.zero_point = awq_zero_point_;
+    params.out_offset = awq_out_offset_;
+    params.out_features = dim0_;
+    kernel::get_matmul_kernel_awq(device_type_)(
+        input_flat, awq_qweight_, awq_qzeros_, awq_scales_, output_flat, params,
+        cuda_config_ ? cuda_config_.get() : nullptr);
+  } else if (is_quant_layer_) {
     kernel::get_matmul_kernel_quant8(device_type_)(input_flat, weight, output_flat,
                                                    group_size_, scales_,
                                                    cuda_config_ ? cuda_config_.get() : nullptr);
@@ -195,9 +226,47 @@ const tensor::Tensor& MatmulLayer::get_bias(int32_t idx) const {
   return bias_.at(idx);
 }
 
+base::Status MatmulLayer::set_awq_weight(const tensor::Tensor& qweight,
+                                         const tensor::Tensor& qzeros,
+                                         const tensor::Tensor& scales, int32_t group_size,
+                                         bool zero_point, int32_t out_offset,
+                                         int32_t out_features) {
+  CHECK(!qweight.is_empty()) << "AWQ qweight tensor is empty.";
+  CHECK(!scales.is_empty()) << "AWQ scales tensor is empty.";
+  CHECK_EQ(static_cast<int>(qweight.data_type()),
+           static_cast<int>(base::DataType::kDataTypeInt32));
+  CHECK(scales.data_type() == base::DataType::kDataTypeFp32 ||
+        scales.data_type() == base::DataType::kDataTypeBF16);
+  CHECK_GT(group_size, 0);
+  CHECK_GE(out_offset, 0);
+  CHECK_EQ(out_features, dim0_);
+  CHECK_EQ(static_cast<int>(qweight.device_type()), static_cast<int>(device_type_));
+  CHECK_EQ(static_cast<int>(scales.device_type()), static_cast<int>(device_type_));
+
+  awq_ = true;
+  awq_group_size_ = group_size;
+  awq_zero_point_ = zero_point;
+  awq_out_offset_ = out_offset;
+  awq_qweight_ = qweight;
+  awq_qzeros_ = qzeros;
+  awq_scales_ = scales;
+  // The layer computes in its scale dtype (BF16 on CUDA, FP32 on CPU).
+  data_type_ = scales.data_type();
+  return base::error::Success();
+}
+
 void MatmulLayer::to_cuda() {
   LayerParam::to_cuda();
   cudaStream_t stream = cuda_config_ ? cuda_config_->stream : nullptr;
+  if (!awq_qweight_.is_empty()) {
+    awq_qweight_.to_cuda(stream);
+  }
+  if (!awq_qzeros_.is_empty()) {
+    awq_qzeros_.to_cuda(stream);
+  }
+  if (!awq_scales_.is_empty()) {
+    awq_scales_.to_cuda(stream);
+  }
   if (has_bias_) {
     for (auto& bias : bias_) {
       bias.to_cuda(stream);

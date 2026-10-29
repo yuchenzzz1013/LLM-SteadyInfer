@@ -135,8 +135,8 @@ base::Status LLamaModel::init(base::DeviceType device_type) {
     return read_status;
   }
   init_mem();
-  // All layers (including the fused projections) now own their dequantized
-  // weights; the packed AWQ payload can be released.
+  // All layers (including the fused projections) now own their packed AWQ
+  // weights on the device; the host payload can be released.
   release_quantization_payload();
   if (device_type_ == base::DeviceType::kDeviceCPU) {
     kernel::sin_cos_cache_calc_cpu(config_->head_size_, config_->seq_len_,
@@ -194,7 +194,7 @@ void LLamaModel::create_nonparam_layers() {
 void LLamaModel::create_param_layers() {
   CHECK(llama_layers_ != nullptr);
   // Linear projections are built through Model::create_linear_layer(); AWQ
-  // modules are dequantized there, so the result is always a dense layer.
+  // modules keep their int4 codes packed and dequantize inside the GEMM.
   // Weights are loaded from the HF safetensors checkpoint under the model's
   // compute dtype: BF16 raw bits on CUDA, FP32 (converted at load time,
   // see get_weight_data()) on the CPU path.

@@ -25,8 +25,9 @@ LLM-SteadyInfer 是一个基于 **C++ / CUDA C++** 实现的轻量级大语言�
   KV Cache / logits 均 BF16,Tensor Core 数学运算;CPU 设备自动回退 FP32,
   权重加载时转换）
 - AWQ W4A16 量化模型（读取 `quantization_config` 与
-  `qweight/qzeros/scales`，加载时反量化为模型计算 dtype，之后与非量化模型
-  走**完全相同**的算子图、融合投影与 GEMM kernel）
+  `qweight/qzeros/scales`；int4 权重**按原样打包常驻显存**，GEMM 内核在
+  计算时把 16×128 的权重 tile 反量化到共享内存后送入 BF16 Tensor Core，
+  不保留任何 dequant 后的全精度副本）
 - LLaMA3 / Qwen2 / Qwen3 模型架构
 
 ---
@@ -150,10 +151,13 @@ LLM-SteadyInfer 是一个基于 **C++ / CUDA C++** 实现的轻量级大语言�
 量化权重：
 
 - AWQ W4A16（`quant_method: "awq"`, group_size / zero_point 从
-  `config.json` 读取）。AWQ 的 `qweight/qzeros/scales` 在构建层时反量化为
-  计算 dtype（CUDA BF16 / CPU FP32），因此量化模型与非量化模型执行同一套
-  MatmulLayer、融合 QKV、融合 gate/up 与 cuBLAS GEMM，吞吐与延迟一致。
-  未量化的模块（`modules_to_not_convert` / 无 `qweight`）自动保持全精度。
+  `config.json` 读取）。`qweight/qzeros/scales` 加载后以 int4 打包形式常驻
+  显存（每 int32 存 8 个 4-bit code），不走“加载时反量化”的路径；融合
+  QKV / 融合 gate/up 把各模块的 packed 列拼接成一份共享权重，前向时
+  `MatmulLayer` 走专用的 W4A16 GEMM：每个 block 把 64 输出 × 128 输入的
+  权重 tile 反量化进共享内存，再用 BF16 Tensor Core + FP32 累加计算。
+  未量化的模块（`modules_to_not_convert` / 无 `qweight`）自动保持全精度，
+  与非量化层共用同一算子图。
 
 ---
 

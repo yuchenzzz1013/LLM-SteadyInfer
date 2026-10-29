@@ -510,126 +510,88 @@ base::DataType Model::get_weight_dtype(const std::string& name) const {
   return it->second.data_type;
 }
 
-namespace {
-// AWQ packs eight signed 4-bit codes into one int32; output-column offset i
-// selects the nibble at bit 4 * kAwqOrder[i]. This interleaved order was
-// verified against the full-precision counterpart of an AWQ checkpoint.
-constexpr int kAwqOrder[8] = {0, 4, 1, 5, 2, 6, 3, 7};
-
-template <typename T>
-struct AwqStore;
-template <>
-struct AwqStore<float> {
-  static float load_scale(const void* p, int64_t i) {
-    return static_cast<const float*>(p)[i];
+bool Model::is_awq_module(const std::string& prefix) const {
+  if (!config_ || config_->weight_quant_ != WeightQuantType::kAwqInt4) {
+    return false;
   }
-  static float store(float v) { return v; }
-};
-template <>
-struct AwqStore<base::bf16_t> {
-  static float load_scale(const void* p, int64_t i) {
-    return base::bf16_to_fp32(static_cast<const base::bf16_t*>(p)[i]);
+  if (weight_map_.count(prefix + ".qweight") == 0) {
+    return false;
   }
-  static base::bf16_t store(float v) { return base::fp32_to_bf16(v); }
-};
-
-// One packed column (eight output rows) is dequantized at a time, so each
-// qweight int32 is read once and its eight codes are stored contiguously along
-// K in the [N, K] destination rows.
-template <typename T>
-void awq_dequantize_impl(const int32_t* qweight, const int32_t* qzeros, const void* scales,
-                         int32_t in_features, int32_t out_features, int32_t group_size,
-                         bool zero_point, T* dst) {
-  const int32_t packed_cols = out_features / 8;
-  const int32_t groups = in_features / group_size;
-  using Store = AwqStore<T>;
-#pragma omp parallel for schedule(static)
-  for (int32_t c = 0; c < packed_cols; ++c) {
-    const int32_t n0 = c * 8;
-    for (int32_t g = 0; g < groups; ++g) {
-      const uint32_t zero_packed =
-          zero_point ? static_cast<uint32_t>(qzeros[static_cast<int64_t>(g) * packed_cols + c])
-                     : 0u;
-      int32_t zero[8];
-      float scale[8];
-      for (int i = 0; i < 8; ++i) {
-        const int shift = 4 * kAwqOrder[i];
-        zero[i] = zero_point ? static_cast<int>((zero_packed >> shift) & 0xFu) : 8;
-        scale[i] =
-            Store::load_scale(scales, static_cast<int64_t>(g) * out_features + n0 + i);
-      }
-      for (int32_t kk = 0; kk < group_size; ++kk) {
-        const int32_t k = g * group_size + kk;
-        const uint32_t packed =
-            static_cast<uint32_t>(qweight[static_cast<int64_t>(k) * packed_cols + c]);
-        for (int i = 0; i < 8; ++i) {
-          const int q = static_cast<int>((packed >> (4 * kAwqOrder[i])) & 0xFu);
-          dst[static_cast<int64_t>(n0 + i) * in_features + k] =
-              Store::store(static_cast<float>(q - zero[i]) * scale[i]);
-        }
-      }
-    }
-  }
+  return std::find(config_->weight_quant_exclude.begin(), config_->weight_quant_exclude.end(),
+                   prefix) == config_->weight_quant_exclude.end();
 }
-}  // namespace
 
-void Model::dequantize_awq_module(const std::string& prefix, int32_t out_features,
-                                  int32_t in_features, base::DataType dst_dtype,
-                                  void* dst) const {
+Model::AwqHostModule Model::get_awq_host_module(const std::string& prefix,
+                                                int32_t out_features,
+                                                int32_t in_features) const {
   CHECK(config_ && config_->weight_quant_ == WeightQuantType::kAwqInt4)
-      << "AWQ dequantization requested for a non-AWQ model";
-  const int32_t group_size = config_->weight_quant_group_size_;
-  CHECK_GT(group_size, 0);
-  CHECK_EQ(in_features % group_size, 0);
+      << "AWQ module requested for a non-AWQ model";
+  AwqHostModule module;
+  module.in_features = in_features;
+  module.out_features = out_features;
+  module.group_size = config_->weight_quant_group_size_;
+  module.zero_point = config_->weight_quant_zero_point_;
+  CHECK_GT(module.group_size, 0);
+  CHECK_EQ(in_features % module.group_size, 0);
   CHECK_EQ(out_features % 8, 0);
-  const bool zero_point = config_->weight_quant_zero_point_;
-  const int32_t packed_cols = out_features / 8;
-  const int32_t groups = in_features / group_size;
+  module.packed_cols = out_features / 8;
+  module.groups = in_features / module.group_size;
+
   const std::string qweight_name = prefix + ".qweight";
-  CHECK(weight_map_.count(qweight_name) > 0) << "AWQ module '" << prefix << "' misses "
-                                             << qweight_name;
-  CHECK_EQ(get_weight_numel(qweight_name),
-           static_cast<size_t>(in_features) * packed_cols)
+  CHECK(weight_map_.count(qweight_name) > 0)
+      << "AWQ module '" << prefix << "' misses " << qweight_name;
+  CHECK_EQ(get_weight_numel(qweight_name), static_cast<size_t>(in_features) * module.packed_cols)
       << "AWQ qweight shape mismatch for '" << prefix << "'";
-  const void* qweight = get_weight_data(qweight_name);
-  const void* qzeros = nullptr;
-  if (zero_point) {
+  module.qweight = static_cast<const int32_t*>(get_weight_data(qweight_name));
+
+  if (module.zero_point) {
     const std::string qzeros_name = prefix + ".qzeros";
     CHECK(weight_map_.count(qzeros_name) > 0)
         << "AWQ module '" << prefix << "' misses " << qzeros_name;
-    CHECK_EQ(get_weight_numel(qzeros_name), static_cast<size_t>(groups) * packed_cols)
+    CHECK_EQ(get_weight_numel(qzeros_name),
+             static_cast<size_t>(module.groups) * module.packed_cols)
         << "AWQ qzeros shape mismatch for '" << prefix << "'";
-    qzeros = get_weight_data(qzeros_name);
+    module.qzeros = static_cast<const int32_t*>(get_weight_data(qzeros_name));
   }
+
   const std::string scales_name = prefix + ".scales";
   CHECK(weight_map_.count(scales_name) > 0)
       << "AWQ module '" << prefix << "' misses " << scales_name;
-  CHECK_EQ(get_weight_numel(scales_name), static_cast<size_t>(groups) * out_features)
+  CHECK_EQ(get_weight_numel(scales_name), static_cast<size_t>(module.groups) * out_features)
       << "AWQ scales shape mismatch for '" << prefix << "'";
-  CHECK_EQ(static_cast<int>(get_weight_dtype(scales_name)), static_cast<int>(dst_dtype))
+  module.scales_dtype = get_weight_dtype(scales_name);
+  CHECK_EQ(static_cast<int>(module.scales_dtype), static_cast<int>(compute_dtype()))
       << "AWQ scales for '" << prefix << "' were not loaded in the compute dtype";
-  const void* scales = get_weight_data(scales_name);
+  module.scales = get_weight_data(scales_name);
+  return module;
+}
 
-  if (dst_dtype == base::DataType::kDataTypeBF16) {
-    awq_dequantize_impl<base::bf16_t>(static_cast<const int32_t*>(qweight),
-                                      static_cast<const int32_t*>(qzeros), scales, in_features,
-                                      out_features, group_size, zero_point,
-                                      static_cast<base::bf16_t*>(dst));
-  } else if (dst_dtype == base::DataType::kDataTypeFp32) {
-    awq_dequantize_impl<float>(static_cast<const int32_t*>(qweight),
-                               static_cast<const int32_t*>(qzeros), scales, in_features,
-                               out_features, group_size, zero_point, static_cast<float*>(dst));
+tensor::Tensor Model::stage_device_tensor(base::DataType dtype, int32_t dim0, int32_t dim1,
+                                          const void* host, size_t bytes) {
+  const bool cuda = device_type_ == base::DeviceType::kDeviceCUDA;
+  std::shared_ptr<base::DeviceAllocator> alloc =
+      cuda ? std::shared_ptr<base::DeviceAllocator>(
+                 base::CUDADeviceAllocatorFactory::get_instance())
+           : std::shared_ptr<base::DeviceAllocator>(
+                 base::CPUDeviceAllocatorFactory::get_instance());
+  tensor::Tensor tensor(dtype, dim0, dim1, true, alloc);
+  CHECK_EQ(tensor.byte_size(), bytes);
+  if (cuda) {
+    cudaStream_t stream = cuda_config_ ? cuda_config_->stream : nullptr;
+    CHECK_EQ(cudaMemcpyAsync(tensor.ptr<uint8_t>(), host, bytes, cudaMemcpyHostToDevice, stream),
+             cudaSuccess);
   } else {
-    LOG(FATAL) << "Unsupported AWQ dequantization target dtype";
+    std::memcpy(tensor.ptr<uint8_t>(), host, bytes);
   }
+  return tensor;
 }
 
 void Model::release_quantization_payload() {
-  // The packed AWQ tensors are only input to layer construction (each module is
-  // dequantized into its layer's storage). Drop the host copies once every
-  // layer exists so an AWQ checkpoint does not keep ~9 GB of qweight/qzeros
-  // resident for the model's lifetime. Full-precision modules keep their
-  // entries: their layers hold non-owning views into weight_map_.
+  // Every AWQ module has staged its packed tensors into device memory. Drop
+  // the host copies once every layer exists so an AWQ checkpoint does not keep
+  // ~7 GB of qweight/qzeros resident for the model's lifetime. Full-precision
+  // modules keep their entries: their layers hold non-owning views into
+  // weight_map_.
   if (!config_ || config_->weight_quant_ != WeightQuantType::kAwqInt4) {
     return;
   }
@@ -651,37 +613,33 @@ std::shared_ptr<op::Layer> Model::create_linear_layer(const std::string& prefix,
   const auto cpu_device_type = base::DeviceType::kDeviceCPU;
   const bool cuda = device_type_ == base::DeviceType::kDeviceCUDA;
   const base::DataType dtype = compute_dtype();
-  std::shared_ptr<base::DeviceAllocator> alloc =
-      cuda ? std::shared_ptr<base::DeviceAllocator>(
-                 base::CUDADeviceAllocatorFactory::get_instance())
-           : std::shared_ptr<base::DeviceAllocator>(
-                 base::CPUDeviceAllocatorFactory::get_instance());
 
-  const bool awq_module =
-      config_ && config_->weight_quant_ == WeightQuantType::kAwqInt4 &&
-      weight_map_.count(prefix + ".qweight") > 0 &&
-      std::find(config_->weight_quant_exclude.begin(), config_->weight_quant_exclude.end(),
-                prefix) == config_->weight_quant_exclude.end();
+  const bool awq_module = is_awq_module(prefix);
   auto layer = std::make_shared<op::MatmulLayer>(device_type_, out_features, in_features,
                                                  /*is_quant_layer=*/false, has_bias);
   if (awq_module) {
-    // Dequantize now: every downstream consumer (single projection, fused
-    // QKV/FFN, cuBLAS GEMM) then sees the same dense weight the full-precision
-    // checkpoint would have produced.
-    const size_t bytes = static_cast<size_t>(out_features) * in_features *
-                         base::DataTypeSize(dtype);
-    std::vector<uint8_t> host_weight(bytes);
-    dequantize_awq_module(prefix, out_features, in_features, dtype, host_weight.data());
-    tensor::Tensor weight(dtype, out_features, in_features, true, alloc);
+    // Stage the checkpoint's packed tensors on the device verbatim: the int4
+    // codes are never expanded, the GEMM dequantizes them as it consumes them.
+    const AwqHostModule module = get_awq_host_module(prefix, out_features, in_features);
+    tensor::Tensor qweight =
+        stage_device_tensor(base::DataType::kDataTypeInt32, in_features, module.packed_cols,
+                            module.qweight,
+                            static_cast<size_t>(in_features) * module.packed_cols * sizeof(int32_t));
+    tensor::Tensor qzeros;
+    if (module.zero_point) {
+      qzeros = stage_device_tensor(
+          base::DataType::kDataTypeInt32, module.groups, module.packed_cols, module.qzeros,
+          static_cast<size_t>(module.groups) * module.packed_cols * sizeof(int32_t));
+    }
+    tensor::Tensor scales = stage_device_tensor(
+        dtype, module.groups, out_features, module.scales,
+        static_cast<size_t>(module.groups) * out_features * base::DataTypeSize(dtype));
+    CHECK(layer->set_awq_weight(qweight, qzeros, scales, module.group_size, module.zero_point,
+                                /*out_offset=*/0, out_features));
     if (cuda) {
       cudaStream_t stream = cuda_config_ ? cuda_config_->stream : nullptr;
-      cudaMemcpyAsync(weight.ptr<uint8_t>(), host_weight.data(), bytes,
-                      cudaMemcpyHostToDevice, stream);
       if (stream) cudaStreamSynchronize(stream);
-    } else {
-      std::memcpy(weight.ptr<uint8_t>(), host_weight.data(), bytes);
     }
-    CHECK(layer->set_weight(0, weight));
   } else {
     const std::string weight_name = prefix + ".weight";
     CHECK(weight_map_.count(weight_name) > 0)
@@ -717,43 +675,106 @@ std::shared_ptr<op::MatmulLayer> Model::create_fused_linear_layer(
            : std::shared_ptr<base::DeviceAllocator>(
                  base::CPUDeviceAllocatorFactory::get_instance());
 
-  // Rows are concatenated in prefix order; the forward pass already expects
-  // that order (q|k|v and gate|up).
-  const size_t weight_bytes = static_cast<size_t>(total_out) * in_features * elem;
-  std::vector<uint8_t> host_weight(weight_bytes);
-  int32_t row_off = 0;
-  for (size_t i = 0; i < prefixes.size(); ++i) {
-    const std::string& prefix = prefixes[i];
-    const int32_t out_i = out_features[i];
-    uint8_t* dst = host_weight.data() + static_cast<int64_t>(row_off) * in_features * elem;
-    const bool awq_module =
-        config_ && config_->weight_quant_ == WeightQuantType::kAwqInt4 &&
-        weight_map_.count(prefix + ".qweight") > 0 &&
-        std::find(config_->weight_quant_exclude.begin(), config_->weight_quant_exclude.end(),
-                  prefix) == config_->weight_quant_exclude.end();
-    if (awq_module) {
-      dequantize_awq_module(prefix, out_i, in_features, dtype, dst);
-    } else {
+  size_t awq_prefixes = 0;
+  for (const std::string& prefix : prefixes) {
+    awq_prefixes += is_awq_module(prefix) ? 1 : 0;
+  }
+  if (awq_prefixes != 0 && awq_prefixes != prefixes.size()) {
+    // A mixed dense/quantized group cannot share one packed weight.
+    LOG(WARNING) << "[MODEL] projection group mixes AWQ and dense modules; keeping "
+                 << "the unfused layers";
+    return nullptr;
+  }
+
+  auto layer = std::make_shared<op::MatmulLayer>(device_type_, total_out, in_features,
+                                                 /*is_quant_layer=*/false, has_bias);
+  cudaStream_t stream = cuda_config_ ? cuda_config_->stream : nullptr;
+
+  if (awq_prefixes == prefixes.size()) {
+    // Stack the packed int4 payload: qweight/qzeros along the packed-column
+    // axis and scales along the output axis. Rows are concatenated in prefix
+    // order, matching the forward pass (q|k|v and gate|up).
+    const int32_t total_packed = total_out / 8;
+    const AwqHostModule first = get_awq_host_module(prefixes[0], out_features[0], in_features);
+    const int32_t group_size = first.group_size;
+    const bool zero_point = first.zero_point;
+    const int32_t groups = first.groups;
+    std::vector<int32_t> host_qweight(static_cast<size_t>(in_features) * total_packed);
+    std::vector<int32_t> host_qzeros(zero_point
+                                         ? static_cast<size_t>(groups) * total_packed
+                                         : 0);
+    std::vector<uint8_t> host_scales(static_cast<size_t>(groups) * total_out * elem);
+    int32_t col_off = 0;  // packed-column offset
+    int32_t n_off = 0;    // output feature (scale) offset
+    for (size_t i = 0; i < prefixes.size(); ++i) {
+      const AwqHostModule module =
+          get_awq_host_module(prefixes[i], out_features[i], in_features);
+      CHECK_EQ(module.group_size, group_size) << "Fused modules disagree on the AWQ group size";
+      CHECK_EQ(module.zero_point, zero_point);
+      for (int32_t k = 0; k < in_features; ++k) {
+        std::memcpy(host_qweight.data() + static_cast<int64_t>(k) * total_packed + col_off,
+                    module.qweight + static_cast<int64_t>(k) * module.packed_cols,
+                    static_cast<size_t>(module.packed_cols) * sizeof(int32_t));
+      }
+      if (zero_point) {
+        // qzeros is [groups, packed_cols]; copy each group row.
+        for (int32_t g = 0; g < groups; ++g) {
+          std::memcpy(host_qzeros.data() + static_cast<int64_t>(g) * total_packed + col_off,
+                      module.qzeros + static_cast<int64_t>(g) * module.packed_cols,
+                      static_cast<size_t>(module.packed_cols) * sizeof(int32_t));
+        }
+      }
+      for (int32_t g = 0; g < groups; ++g) {
+        std::memcpy(host_scales.data() + (static_cast<int64_t>(g) * total_out + n_off) * elem,
+                    static_cast<const uint8_t*>(module.scales) +
+                        static_cast<int64_t>(g) * module.out_features * elem,
+                    static_cast<size_t>(module.out_features) * elem);
+      }
+      col_off += module.packed_cols;
+      n_off += module.out_features;
+    }
+    CHECK_EQ(col_off, total_packed);
+    CHECK_EQ(n_off, total_out);
+
+    tensor::Tensor qweight = stage_device_tensor(
+        base::DataType::kDataTypeInt32, in_features, total_packed, host_qweight.data(),
+        host_qweight.size() * sizeof(int32_t));
+    tensor::Tensor qzeros;
+    if (zero_point) {
+      qzeros = stage_device_tensor(base::DataType::kDataTypeInt32, groups, total_packed,
+                                   host_qzeros.data(),
+                                   host_qzeros.size() * sizeof(int32_t));
+    }
+    tensor::Tensor scales = stage_device_tensor(
+        dtype, groups, total_out, host_scales.data(), host_scales.size());
+    CHECK(layer->set_awq_weight(qweight, qzeros, scales, group_size, zero_point,
+                                /*out_offset=*/0, total_out));
+  } else {
+    // All-dense group: stack the weights row-major.
+    const size_t weight_bytes = static_cast<size_t>(total_out) * in_features * elem;
+    std::vector<uint8_t> host_weight(weight_bytes);
+    int32_t row_off = 0;
+    for (size_t i = 0; i < prefixes.size(); ++i) {
+      const std::string& prefix = prefixes[i];
+      const int32_t out_i = out_features[i];
+      uint8_t* dst = host_weight.data() + static_cast<int64_t>(row_off) * in_features * elem;
       const std::string weight_name = prefix + ".weight";
       CHECK(weight_map_.count(weight_name) > 0)
           << "Checkpoint misses the weight tensor '" << weight_name << "'";
       std::memcpy(dst, get_weight_data(weight_name),
                   static_cast<size_t>(out_i) * in_features * elem);
+      row_off += out_i;
     }
-    row_off += out_i;
-  }
 
-  auto layer = std::make_shared<op::MatmulLayer>(device_type_, total_out, in_features,
-                                                 /*is_quant_layer=*/false, has_bias);
-  tensor::Tensor weight(dtype, total_out, in_features, true, alloc);
-  cudaStream_t stream = cuda_config_ ? cuda_config_->stream : nullptr;
-  if (cuda) {
-    cudaMemcpyAsync(weight.ptr<uint8_t>(), host_weight.data(), weight_bytes,
-                    cudaMemcpyHostToDevice, stream);
-  } else {
-    std::memcpy(weight.ptr<uint8_t>(), host_weight.data(), weight_bytes);
+    tensor::Tensor weight(dtype, total_out, in_features, true, alloc);
+    if (cuda) {
+      cudaMemcpyAsync(weight.ptr<uint8_t>(), host_weight.data(), weight_bytes,
+                      cudaMemcpyHostToDevice, stream);
+    } else {
+      std::memcpy(weight.ptr<uint8_t>(), host_weight.data(), weight_bytes);
+    }
+    CHECK(layer->set_weight(0, weight));
   }
-  CHECK(layer->set_weight(0, weight));
 
   if (has_bias) {
     std::vector<uint8_t> host_bias(static_cast<size_t>(total_out) * elem);
@@ -789,11 +810,40 @@ void Model::repoint_layers_to_fused(
     const std::vector<int32_t>& out_features) {
   CHECK(fused != nullptr);
   CHECK_EQ(layers.size(), out_features.size());
+
+  const auto repoint_bias = [&](const std::shared_ptr<op::MatmulLayer>& target, int32_t out_i,
+                                int32_t bias_off) {
+    if (fused->has_bias() && target->has_bias()) {
+      const tensor::Tensor& bias = fused->get_bias(0);
+      const size_t bias_elem = base::DataTypeSize(bias.data_type());
+      tensor::Tensor bias_view(
+          bias.data_type(), out_i, false, nullptr,
+          const_cast<uint8_t*>(bias.ptr<uint8_t>(static_cast<int64_t>(bias_off) * bias_elem)));
+      bias_view.set_device_type(device_type_);
+      CHECK(target->set_bias(0, bias_view));
+    }
+  };
+
+  int32_t out_off = 0;
+  if (fused->is_awq()) {
+    // Packed int4 payload: the fused layer owns it and the per-projection
+    // layers read a column window of the same tensors (no second copy).
+    for (size_t i = 0; i < layers.size(); ++i) {
+      const int32_t out_i = out_features[i];
+      auto target = std::dynamic_pointer_cast<op::MatmulLayer>(layers[i]);
+      CHECK(target != nullptr) << "A fused projection can only re-point MatmulLayers.";
+      CHECK(target->set_awq_weight(fused->awq_qweight(), fused->awq_qzeros(),
+                                   fused->awq_scales(), fused->awq_group_size(),
+                                   fused->awq_zero_point(), out_off, out_i));
+      repoint_bias(target, out_i, out_off);
+      out_off += out_i;
+    }
+    return;
+  }
+
   const int32_t in_features = fused->in_features();
   const tensor::Tensor& weight = fused->get_weight(0);
   const size_t elem = base::DataTypeSize(weight.data_type());
-
-  int32_t out_off = 0;
   for (size_t i = 0; i < layers.size(); ++i) {
     const int32_t out_i = out_features[i];
     auto target = std::dynamic_pointer_cast<op::MatmulLayer>(layers[i]);
@@ -806,15 +856,7 @@ void Model::repoint_layers_to_fused(
     view.set_device_type(device_type_);
     CHECK(target->set_weight(0, view));
 
-    if (fused->has_bias() && target->has_bias()) {
-      const tensor::Tensor& bias = fused->get_bias(0);
-      const size_t bias_elem = base::DataTypeSize(bias.data_type());
-      tensor::Tensor bias_view(
-          bias.data_type(), out_i, false, nullptr,
-          const_cast<uint8_t*>(bias.ptr<uint8_t>(static_cast<int64_t>(out_off) * bias_elem)));
-      bias_view.set_device_type(device_type_);
-      CHECK(target->set_bias(0, bias_view));
-    }
+    repoint_bias(target, out_i, out_off);
     out_off += out_i;
   }
 }

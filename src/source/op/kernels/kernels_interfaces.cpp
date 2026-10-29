@@ -1,5 +1,6 @@
 #include <base/base.h>
 #include "cpu/add_kernel.h"
+#include "cpu/awq_matmul_kernel.h"
 #include "cpu/emb_kernel.h"
 #include "cpu/matmul_kernel.h"
 #include "cpu/mha_kernel.h"
@@ -9,6 +10,7 @@
 #include "cpu/softmax_kernel.h"
 #include "cpu/swiglu_kernel.h"
 #include "cuda/add_kernel.cuh"
+#include "cuda/awq_matmul_kernel.cuh"
 #include "cuda/emb_kernel.cuh"
 #include "cuda/matmul_kernel.cuh"
 #include "cuda/mha_kernel.cuh"
@@ -67,6 +69,17 @@ MatmulKernelQuant get_matmul_kernel_quant8(base::DeviceType device_type) {
   UNUSED(device_type);
   LOG(FATAL) << "INT8 quantization is not supported after the BF16 migration.";
   return nullptr;
+}
+
+MatmulKernelAwq get_matmul_kernel_awq(base::DeviceType device_type) {
+  if (device_type == base::DeviceType::kDeviceCPU) {
+    return awq_matmul_kernel_cpu;
+  } else if (device_type == base::DeviceType::kDeviceCUDA) {
+    return awq_matmul_kernel_cu;
+  } else {
+    LOG(FATAL) << "Unknown device type for get an AWQ matmul kernel.";
+    return nullptr;
+  }
 }
 
 MHAKernel get_mha_kernel(base::DeviceType device_type) {

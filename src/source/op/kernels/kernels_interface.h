@@ -17,6 +17,29 @@ typedef void (*MatmulKernelQuant)(const tensor::Tensor& input, const tensor::Ten
                                   const tensor::Tensor& output, int32_t group_size,
                                   const tensor::Tensor& scale, const CudaConfig* config);
 
+// AWQ W4A16 GEMM parameters. The packed tensors may be shared by several
+// layers (a fused projection owns one stacked copy and the per-projection
+// layers reuse it); `out_offset` selects the output rows a layer owns.
+struct AwqMatmulParams {
+  int32_t group_size = 0;
+  bool zero_point = true;
+  // First output row of this layer inside scales / the packed-column axis of
+  // qweight and qzeros. Always a multiple of 8 (one int32 holds 8 rows).
+  int32_t out_offset = 0;
+  // Number of output rows this GEMM produces.
+  int32_t out_features = 0;
+};
+
+// AWQ W4A16 GEMM: out[batch, N] = input[batch, K] * dequant(qweight)^T.
+//   qweight int32 [K, packed_cols_total]  (checkpoint "gemm" layout)
+//   qzeros  int32 [K/group_size, packed_cols_total] (empty when !zero_point)
+//   scales  compute dtype [K/group_size, N_total]
+// The weights stay int4 in memory; dequantization happens inside the GEMM.
+typedef void (*MatmulKernelAwq)(const tensor::Tensor& input, const tensor::Tensor& qweight,
+                                const tensor::Tensor& qzeros, const tensor::Tensor& scales,
+                                const tensor::Tensor& output, const AwqMatmulParams& params,
+                                const CudaConfig* config);
+
 typedef void (*EmbeddingKernel)(const tensor::Tensor& input, const tensor::Tensor& weight,
                                 const tensor::Tensor& output, int32_t vocab_size, void* stream);
 
@@ -57,6 +80,8 @@ EmbeddingKernel get_emb_kernel(base::DeviceType device_type);
 MatmulKernel get_matmul_kernel(base::DeviceType device_type);
 
 MatmulKernelQuant get_matmul_kernel_quant8(base::DeviceType device_type);
+
+MatmulKernelAwq get_matmul_kernel_awq(base::DeviceType device_type);
 
 MHAKernel get_mha_kernel(base::DeviceType device_type);
 

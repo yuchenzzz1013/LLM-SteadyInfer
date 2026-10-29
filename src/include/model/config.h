@@ -60,9 +60,8 @@ struct TransformerConfig {
   int32_t immediate_dim_ = 0;  // Qwen3 intermediate FFN dimension (always present for ABI stability)
   float rope_theta_ = 1000000.0f;  // RoPE base frequency (1e6 for Qwen, 5e5 for Llama)
 
-  // Resolution of the checkpoint's weight storage. AWQ modules are
-  // dequantized to the compute dtype while the layers are built, so the
-  // executed operator graph is identical to a full-precision checkpoint.
+  // Resolution of the checkpoint's weight storage. AWQ modules keep their
+  // int4 codes packed on the device and dequantize inside the GEMM kernel.
   WeightQuantType weight_quant_ = WeightQuantType::kNone;
   int32_t weight_quant_group_size_ = 0;
   bool weight_quant_zero_point_ = true;

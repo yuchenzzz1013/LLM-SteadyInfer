@@ -164,8 +164,8 @@ base::Status Qwen3Model::init(base::DeviceType device_type) {
     return read_status;
   }
   init_mem();
-  // All layers (including the fused projections) now own their dequantized
-  // weights; the packed AWQ payload can be released.
+  // All layers (including the fused projections) now own their packed AWQ
+  // weights on the device; the host payload can be released.
   release_quantization_payload();
   if (device_type_ == base::DeviceType::kDeviceCPU) {
     kernel::sin_cos_cache_calc_cpu(config_->head_size_, config_->seq_len_,
@@ -534,7 +534,7 @@ base::Status Qwen3Model::create_layers() {
 
   // One builder handles both full-precision and AWQ checkpoints: whether a
   // module is quantized is a property of the loaded tensor set, not of a
-  // model-wide mode switch (AWQ weights are dequantized while building).
+  // model-wide mode switch (AWQ modules keep their int4 codes packed).
   create_param_layers();
   create_nonparam_layers();
 

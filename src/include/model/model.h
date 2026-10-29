@@ -517,13 +517,11 @@ class Model {
   // safetensors, see safetensors_reader.h) into weight_map_.
   virtual base::Status load_hf_model();
 
-  // Build one linear projection from the host weight map. AWQ modules are
-  // dequantized into the model's compute dtype at load time, so the result is
-  // always a dense op::MatmulLayer: the quantized and full-precision models
-  // execute the exact same operator graph and kernels (and therefore have the
-  // same throughput/latency). Modules without a "<prefix>.qweight" tensor keep
-  // their full-precision weights, so mixed checkpoints (modules_to_not_convert)
-  // work unchanged.
+  // Build one linear projection from the host weight map. AWQ modules keep
+  // their int4 codes packed on the device and are dequantized inside the GEMM
+  // kernel (see MatmulLayer::set_awq_weight); modules without a
+  // "<prefix>.qweight" tensor keep their full-precision weights, so mixed
+  // checkpoints (modules_to_not_convert) work unchanged.
   //
   // `prefix` is the HF module name without a tensor suffix, e.g.
   // "model.layers.0.self_attn.q_proj". dims are [out_features, in_features].
@@ -533,9 +531,10 @@ class Model {
                                                  bool has_bias = false);
 
   // Build one projection whose output rows are the concatenation of the given
-  // modules (fused QKV: q|k|v; fused FFN: gate|up). AWQ modules are
-  // dequantized first, so the fused layer is a plain dense MatmulLayer and the
-  // fused operator sequence is identical for both checkpoint kinds.
+  // modules (fused QKV: q|k|v; fused FFN: gate|up). Fully quantized groups
+  // stack their packed AWQ tensors (one int4 copy in device memory); fully
+  // dense groups stack the dense weights. A mixed group returns nullptr so the
+  // caller keeps the unfused projections.
   std::shared_ptr<op::MatmulLayer> create_fused_linear_layer(
       const std::vector<std::string>& prefixes, const std::vector<int32_t>& out_features,
       int32_t in_features, bool has_bias = false);
@@ -547,12 +546,34 @@ class Model {
                                const std::vector<std::shared_ptr<op::Layer>>& layers,
                                const std::vector<int32_t>& out_features);
 
-  // Dequantize one AWQ module into `dst`, laid out as [N, K] row-major in
-  // `dst_dtype` (BF16 on CUDA models, FP32 on CPU models). The host weight map
-  // supplies qweight/qzeros (int32) and scales (already in dst_dtype).
-  void dequantize_awq_module(const std::string& prefix, int32_t out_features,
-                             int32_t in_features, base::DataType dst_dtype,
-                             void* dst) const;
+  // Host-side description of one AWQ module (see get_awq_host_module).
+  struct AwqHostModule {
+    const int32_t* qweight = nullptr;  // [in_features, out_features / 8]
+    const int32_t* qzeros = nullptr;   // [groups, out_features / 8], null if symmetric
+    const void* scales = nullptr;      // [groups, out_features], compute dtype
+    int32_t in_features = 0;
+    int32_t out_features = 0;
+    int32_t group_size = 0;
+    int32_t packed_cols = 0;
+    int32_t groups = 0;
+    bool zero_point = true;
+    base::DataType scales_dtype = base::DataType::kDataTypeUnknown;
+  };
+
+  // True when the checkpoint declares `prefix` quantized (has a packed
+  // "<prefix>.qweight" and is not listed in modules_to_not_convert).
+  bool is_awq_module(const std::string& prefix) const;
+
+  // Validate one AWQ module's packed tensors in weight_map_ and return their
+  // host locations. CHECK-fails on a malformed module.
+  AwqHostModule get_awq_host_module(const std::string& prefix, int32_t out_features,
+                                    int32_t in_features) const;
+
+  // Allocate a [dim0, dim1] tensor on the model's device and copy `bytes` of
+  // host data into it. The copy is stream-ordered; callers sync once after
+  // staging a layer's tensors (init-time only).
+  tensor::Tensor stage_device_tensor(base::DataType dtype, int32_t dim0, int32_t dim1,
+                                     const void* host, size_t bytes);
 
   // Free the host-side packed AWQ tensors once all layers have been built
   // (call after init_mem(), which also builds the fused projections).
@@ -581,7 +602,7 @@ class Model {
   int32_t group_size_ = 1;
   // True when the checkpoint declares quantized weights. Purely descriptive:
   // quantization is resolved per module while the layers are built, and AWQ
-  // modules are dequantized there, so forward execution is format-agnostic.
+  // modules keep their int4 codes packed on the device.
   bool is_quant_model_ = false;
   std::unique_ptr<TransformerConfig> config_;
 
@@ -602,9 +623,10 @@ class Model {
   // HF tensor name -> host copy of the weights, already in the model's
   // compute dtype (BF16 bits on CUDA models, FP32 on CPU models): the
   // checkpoint dtype is converted at load time only when it differs, so an
-  // FP32 run never round-trips weights through BF16. Layers hold non-owning
-  // views into these buffers (they outlive the views: the map lives as long
-  // as the Model). Populated by load_hf_model().
+  // FP32 run never round-trips weights through BF16. Dense layers hold
+  // non-owning views into these buffers; AWQ modules are staged into their
+  // own packed device tensors and the host copies are released after init.
+  // Populated by load_hf_model().
   struct HostWeight {
     std::shared_ptr<std::vector<uint8_t>> bytes;  // base::DataTypeSize(dtype) * numel
     int64_t numel = 0;
