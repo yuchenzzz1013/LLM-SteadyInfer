@@ -212,6 +212,42 @@ make -j$(nproc)
 * Output Token Throughput / Total Token Throughput / Completed RPS
 * `skipped_prefill_ratio`
 
+### Weight Quantization Eval（eval.md）
+在 WikiText-2（`wikitext-2-raw-v1`, split=`test`）上评估未量化参考模型与量化
+模型的保真度。按 eval.md 协议：保留空行、行间以 `\n` 拼接、切成**非重叠
+512-token 块**，每个块对位置 `0..510` 做 teacher forcing（最后一位没有
+target），四项指标来自同一批 token 位置：
+
+* **Mean KLD**：`KL(参考 || 量化)` 的平均值
+* **99.9% KLD**：KL 散度的 99.9 百分位
+* **Same Top-1**：两模型 argmax token 一致的比例
+* **PPL Change**：量化模型 PPL 相对参考模型的变化
+
+由于 14B BF16 参考模型（约 29.5 GB）与 AWQ 模型（约 10 GB）无法在 40 GB
+卡上同时驻留，评估分两遍：第一遍把参考模型逐位置的 logits 以 bf16 缓存到
+磁盘，第二遍加载量化模型并与缓存逐位置比较。KV Cache 始终为 BF16，因此
+度量只反映权重量化。
+
+```bash
+# 全量 WikiText-2（584 个 512-token 块，Qwen 分词）
+./build/benchmark/weight_quantization_eval \
+    Qwen3-14B Qwen3-14B-AWQ wikitext-2-raw-v1-test.raw \
+    --batch 16 --csv results/weight-quantization-eval-wikitext2.csv
+
+# 快速冒烟（只取前 8 个块）
+./build/benchmark/weight_quantization_eval \
+    Qwen3-14B Qwen3-14B-AWQ wikitext-2-raw-v1-test.raw \
+    --max-chunks 8 --batch 8
+
+# 显存无法在同进程内重载时，拆成两个进程（共用同一 --cache）
+./build/benchmark/weight_quantization_eval Qwen3-14B Qwen3-14B-AWQ --stage ref
+./build/benchmark/weight_quantization_eval Qwen3-14B Qwen3-14B-AWQ --stage quant
+```
+
+`--stage all`（默认）依次跑两遍；`--stage ref` / `--stage quant` 可分开执行。
+缓存大小约为 `块数 × 511 × vocab × 2` 字节（全量约 91 GB），用
+`--max-chunks` 可缩小规模。
+
 ---
 
 ## Demo
@@ -237,6 +273,10 @@ LLM-SteadyInfer/
 │   ├── offline_batch_benchmark.cpp  # 离线吞吐测试
 │   ├── online_serving_benchmark.cpp # 在线 Serving 测试
 │   ├── prefix_caching_benchmark.cpp # Prefix Caching A/B 收益测试
+│   ├── ppl_benchmark.cpp            # KV 量化 PPL 门禁
+│   ├── weight-quantization-eval/    # 权重量化保真度评估 (WikiText-2 KLD/PPL)
+│   │   ├── weight_quantization_eval.cpp
+│   │   └── wq_eval_kernel.cu
 │   └── verify_tokens.cpp            # Token 一致性验证
 ├── demo/                            # 示例
 │   └── chat_demo.cpp                # 命令行实时连续对话

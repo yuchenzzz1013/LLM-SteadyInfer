@@ -200,11 +200,28 @@ if (PPL_BENCHMARK AND NOT BENCH_STANDALONE AND CMAKE_CUDA_COMPILER)
     set_target_properties(ppl_benchmark PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 endif()
 
+# 权重量化保真度评估 (eval.md: WikiText-2 上的 Mean KLD / 99.9% KLD /
+# Same Top-1 / PPL Change,参考 BF16 模型 vs AWQ W4A16 模型)。
+# 需要一个 .cu 编译单元(设备端 KLD 归约),因此与 ppl_benchmark 一样只在
+# 根项目子目录模式(已开启 CUDA 语言)下构建。
+option(WEIGHT_QUANTIZATION_EVAL
+       "Build the weight-quantization fidelity eval (WikiText-2 KLD/PPL)" ON)
+if (WEIGHT_QUANTIZATION_EVAL AND NOT BENCH_STANDALONE AND CMAKE_CUDA_COMPILER)
+    message(STATUS "Building weight_quantization_eval (BF16 vs AWQ fidelity)")
+    add_executable(weight_quantization_eval
+        weight-quantization-eval/weight_quantization_eval.cpp
+        weight-quantization-eval/wq_eval_kernel.cu)
+    target_link_libraries(weight_quantization_eval PRIVATE bench_deps)
+    set_target_properties(weight_quantization_eval PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON)
+endif()
+
 # ---------- 独立模式:运行时库搜索路径(作用于全部目标) ----------
 if(BENCH_STANDALONE)
   list(REMOVE_DUPLICATES RPATH_DIRS)
   foreach(tgt offline_batch_benchmark online_serving_benchmark
-              prefix_caching_benchmark verify_tokens ppl_benchmark)
+              prefix_caching_benchmark verify_tokens ppl_benchmark
+              weight_quantization_eval)
     if(TARGET ${tgt})
       set_target_properties(${tgt} PROPERTIES
         BUILD_RPATH "${RPATH_DIRS}"
