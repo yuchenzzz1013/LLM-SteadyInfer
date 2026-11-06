@@ -5,7 +5,7 @@
 //
 // The checkpoint keeps the weights packed (`qweight` int32, eight 4-bit codes
 // per word); nothing is dequantized at load time. The GEMM dequantizes a
-// [64 outputs, 128 inputs] weight tile into shared memory per K chunk and
+// [64 outputs, K chunk] weight tile into shared memory per K chunk and
 // feeds it to BF16 Tensor Core MMAs with FP32 accumulation, so the resident
 // weight footprint stays at the checkpoint's int4 size while the dequantized
 // tile is reused by every batch row in the block.
@@ -17,9 +17,9 @@
 // activates as many 16-row batch tiles as it can fill (1/2/4 warps); the other
 // warps keep helping with the dequantization, which is shared by the block.
 //
-// The K chunk is 128 (eight 16-wide MMA steps) rather than 16: a decode step
+// The K chunk is 64 (four 16-wide MMA steps) rather than 16: a decode step
 // is latency-bound on the weight stream, so one shared-memory fill (two
-// barriers) per 128 inputs keeps the 14B-parameter stream moving instead of
+// barriers) per 64 inputs keeps the 14B-parameter stream moving instead of
 // stalling every 16. The dequantized B tile is row-major [k][n] with a padded
 // leading dimension so the eight bf16 values of one packed word go out as one
 // 16B shared store instead of eight bank-conflicting scalar stores.
@@ -46,7 +46,7 @@ constexpr int kWarps = 4;                 // one warp per 16-row batch tile
 constexpr int kBatchPerBlock = kWarps * 16;
 constexpr int kOutPerBlock = 64;          // 8 packed int32 columns per block
 constexpr int kOutGroups = kOutPerBlock / 16;
-constexpr int kKChunk = 128;              // 8 MMA k-steps per shared-memory fill
+constexpr int kKChunk = 64;               // 4 MMA k-steps per shared-memory fill
 constexpr int kMmaSteps = kKChunk / 16;
 // B is row-major [k][n] with a 24-element leading dimension. The 8 padding
 // halves make the dequantizer's 16B stores land on distinct shared banks (a
@@ -90,20 +90,17 @@ __global__ void awq_matmul_bf16_wmma(const bf16* __restrict__ input,
     wmma::fill_fragment(acc[g], 0.0f);
   }
 
-  const int row0 = m0 + warp * 16;
-  // Only the batch tiles this step can fill run the MMA path; the remaining
-  // warps still help with dequantization. At batch 1 this shrinks the padded
-  // batch tile from 64 rows to 16 (4x less MMA and A staging).
-  const bool compute_warp = warp < warps_m;
+  static_assert(kWarps == kOutGroups, "warp <-> output-group mapping assumes 4 warps");
+  const int g_out = warp;
 
-  // The host only selects this kernel when the whole 128-wide chunk sits in
-  // one AWQ group, so the zero point and the eight scales of a packed column
-  // are loaded once per chunk instead of once per weight word.
+  // The host only selects this kernel when the whole kKChunk-wide chunk sits
+  // in one AWQ group, so the zero point and the eight scales of a packed
+  // column are loaded once per chunk instead of once per weight word.
   const int c_local = tid & 7;  // fixed for this thread across the chunk
   const int n_local = c_local * 8;
 
   for (int k0 = k_begin; k0 < k_end; k0 += kKChunk) {
-    // Dequantize the [64 outputs, 128 k] weight tile. One thread owns eight
+    // Dequantize the [64 outputs, kKChunk k] weight tile. One thread owns four
     // packed words: the loads are issued back to back into registers first
     // (decode is latency-bound on this stream, so per-thread MLP matters more
     // than the arithmetic), then unpacked into shared memory. Consecutive
@@ -121,7 +118,7 @@ __global__ void awq_matmul_bf16_wmma(const bf16* __restrict__ input,
       packed[r] = qweight[kc * packed_total + cc];
     }
 
-    // The chunk's group: uniform_group guarantees every k in [k0, k0+128) has
+    // The chunk's group: uniform_group guarantees every k in [k0, k0+kKChunk) has
     // the same group index (the split points are kChunk aligned).
     const int g = k0 / group_size;
     uint32_t zpacked = 0u;
@@ -187,8 +184,8 @@ __global__ void awq_matmul_bf16_wmma(const bf16* __restrict__ input,
     {
       const int rows = warps_m * 16;
       for (int idx = tid; idx < rows * kKChunk; idx += blockDim.x) {
-        const int mm = idx >> 7;     // batch row inside the block
-        const int kk = idx & 127;    // k position inside the chunk
+        const int mm = idx / kKChunk;  // batch row inside the block
+        const int kk = idx % kKChunk;  // k position inside the chunk
         const int m = m0 + mm;
         const int k = k0 + kk;
         sA[mm >> 4][mm & 15][kk] =
@@ -198,40 +195,36 @@ __global__ void awq_matmul_bf16_wmma(const bf16* __restrict__ input,
     }
     __syncthreads();
 
-    // Eight 16-wide k steps, each reusing the same shared weight/input tiles.
-    if (compute_warp) {
+    // 每个 warp 负责一个 16 列输出 group,遍历本步所有 batch tile。
 #pragma unroll
-      for (int step = 0; step < kMmaSteps; ++step) {
-        wmma::load_matrix_sync(a_frag, &sA[warp][0][step * 16], kKChunk);
+    for (int step = 0; step < kMmaSteps; ++step) {
+      wmma::load_matrix_sync(b_frag, &sB[g_out][step * 16][0], kBLd);
 #pragma unroll
-        for (int g = 0; g < kOutGroups; ++g) {
-          wmma::load_matrix_sync(b_frag, &sB[g][step * 16][0], kBLd);
-          wmma::mma_sync(acc[g], a_frag, b_frag, acc[g]);
-        }
+      for (int mt = 0; mt < kWarps; ++mt) {
+        if (mt >= warps_m) continue;
+        wmma::load_matrix_sync(a_frag, &sA[mt][0][step * 16], kKChunk);
+        wmma::mma_sync(acc[mt], a_frag, b_frag, acc[mt]);
       }
     }
     __syncthreads();
   }
 
-  // The FP32 accumulator can only be stored as float, so every tile is staged
-  // through shared memory and converted to bf16 on the guarded copy out (rows
-  // past the batch and columns past N are dropped).
+  const int col_base = n0 + g_out * 16;
 #pragma unroll
-  for (int g = 0; g < (compute_warp ? kOutGroups : 0); ++g) {
-    const int n = n0 + g * 16;
+  for (int mt = 0; mt < kWarps; ++mt) {
+    if (mt >= warps_m) continue;
+    const int row_base = m0 + mt * 16;
     __syncwarp();
-    wmma::store_matrix_sync(&sC[warp][0][0], acc[g], 16, wmma::mem_row_major);
+    wmma::store_matrix_sync(&sC[warp][0][0], acc[mt], 16, wmma::mem_row_major);
     __syncwarp();
     for (int idx = lane; idx < 256; idx += 32) {
       const int mm = idx >> 4;
       const int nn = idx & 15;
-      const int m = row0 + mm;
-      const int col = n + nn;
+      const int m = row_base + mm;
+      const int col = col_base + nn;
       if (m < batch && col < N) {
         bf16* dst = output + static_cast<int64_t>(m) * N + col;
         const bf16 value = __float2bfloat16(sC[warp][mm][nn]);
-        // A single K slice owns the output element outright; only split-K
-        // blocks have to accumulate (host zeroes the buffer for that case).
         if (gridDim.z == 1) {
           *dst = value;
         } else {
@@ -322,7 +315,7 @@ void awq_matmul_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& qwe
     cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, dev);
   }
 
-  // The tiled kernel hoists one group's scales/zero point per 128-wide chunk.
+  // The tiled kernel hoists one group's scales/zero point per kKChunk-wide chunk.
   if (cc_major >= 8 && group_size % kKChunk == 0) {
     const int gx = (N + kOutPerBlock - 1) / kOutPerBlock;
     const int gy = (batch + kBatchPerBlock - 1) / kBatchPerBlock;
