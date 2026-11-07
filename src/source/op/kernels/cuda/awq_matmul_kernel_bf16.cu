@@ -100,14 +100,6 @@ __global__ void awq_matmul_bf16_wmma(const bf16* __restrict__ input,
   const int n_local = c_local * 8;
 
   for (int k0 = k_begin; k0 < k_end; k0 += kKChunk) {
-    // Dequantize the [64 outputs, kKChunk k] weight tile. One thread owns four
-    // packed words: the loads are issued back to back into registers first
-    // (decode is latency-bound on this stream, so per-thread MLP matters more
-    // than the arithmetic), then unpacked into shared memory. Consecutive
-    // threads cover consecutive packed columns, so each k row is one
-    // contiguous 32B read. Out-of-range k is clamped: the affected B rows are
-    // multiplied by zero-padded A, and the store-out guard drops the padded
-    // output columns.
     constexpr int kWords = kKChunk * (kOutPerBlock / 8) / (kWarps * 32);
     const int cc = (c_base + c_local) < packed_total ? (c_base + c_local) : packed_total - 1;
     int32_t packed[kWords];
@@ -324,6 +316,8 @@ void awq_matmul_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& qwe
     const int chunks = (K + kKChunk - 1) / kKChunk;
     int split = (4 * sm_count + gx * gy - 1) / (gx * gy);
     split = split < 1 ? 1 : split;
+    const int min_split = batch <= 64 ? 8 : 4;
+    split = split < min_split ? min_split : split;
     split = split > chunks ? chunks : split;
     split = split > 16 ? 16 : split;
     if (split > 1) {
