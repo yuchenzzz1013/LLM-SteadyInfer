@@ -18,15 +18,21 @@
 // warps keep helping with the dequantization, which is shared by the block.
 //
 // The K chunk is 64 (four 16-wide MMA steps) rather than 16: a decode step
-// is latency-bound on the weight stream, so one shared-memory fill (two
-// barriers) per 64 inputs keeps the 14B-parameter stream moving instead of
-// stalling every 16. The dequantized B tile is row-major [k][n] with a padded
-// leading dimension so the eight bf16 values of one packed word go out as one
-// 16B shared store instead of eight bank-conflicting scalar stores.
+// is latency-bound on the weight stream, so one shared-memory fill per 64
+// inputs keeps the 14B-parameter stream moving instead of stalling every 16.
+// The dequantized B tile is row-major [k][n] with a padded leading dimension
+// so the eight bf16 values of one packed word go out as one 16B shared store
+// instead of eight bank-conflicting scalar stores.
+//
+// The pipelined kernel prefetches the next chunk's raw qwords and the current
+// chunk's input tile with cp.async, so the global weight latency is covered by
+// the current chunk's dequant + MMA and the block only waits on shared-memory
+// visibility.
 #include <base/cuda_check.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime_api.h>
 #include <mma.h>
+#include <type_traits>
 #include "../kernels_interface.h"
 #include "awq_matmul_kernel.cuh"
 
@@ -52,104 +58,172 @@ constexpr int kMmaSteps = kKChunk / 16;
 // halves make the dequantizer's 16B stores land on distinct shared banks (a
 // 16-wide leading dimension maps all eight packed columns onto one bank).
 constexpr int kBLd = 24;
+constexpr int kThreads = kWarps * 32;
+constexpr int kWordsPerChunk = kKChunk * (kOutPerBlock / 8);  // 512 int32 = 2 KB
 
-__global__ void awq_matmul_bf16_wmma(const bf16* __restrict__ input,
-                                     const int32_t* __restrict__ qweight,
-                                     const int32_t* __restrict__ qzeros,
-                                     const bf16* __restrict__ scales, bf16* __restrict__ output,
-                                     int K, int N, int packed_total, int total_out,
-                                     int out_offset, int group_size, int batch,
-                                     int warps_m) {
+__device__ __forceinline__ void cp_async16(void* dst, const void* src) {
+  const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(addr), "l"(src));
+}
+
+__device__ __forceinline__ void cp_async4(void* dst, const void* src) {
+  const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(addr), "l"(src));
+}
+
+__device__ __forceinline__ void cp_async_commit() {
+  asm volatile("cp.async.commit_group;\n" ::);
+}
+
+template <int kPending>
+__device__ __forceinline__ void cp_async_wait() {
+  asm volatile("cp.async.wait_group %0;\n" ::"n"(kPending));
+}
+
+// The qword chunk and the input tile are staged asynchronously one chunk ahead,
+// so no thread stalls on a global load before a barrier. kMTiles is the number
+// of 16-row batch tiles the block owns.
+template <int kMTiles>
+__global__ __launch_bounds__(kThreads, 6) void awq_matmul_bf16_pipelined(const bf16* __restrict__ input,
+                                          const int32_t* __restrict__ qweight,
+                                          const int32_t* __restrict__ qzeros,
+                                          const bf16* __restrict__ scales, bf16* __restrict__ output,
+                                          int K, int N, int packed_total, int total_out,
+                                          int out_offset, int group_size, int batch) {
   const int n0 = blockIdx.x * kOutPerBlock;
   const int m0 = blockIdx.y * kBatchPerBlock;
   const int c_base = out_offset / 8 + blockIdx.x * (kOutPerBlock / 8);
-  // Split-K: blockIdx.z selects one K slice; each slice accumulates into the
-  // (pre-zeroed) output with atomics. Decode GEMMs produce far fewer blocks
-  // than the GPU has SMs otherwise, and the int4 weight stream is
-  // latency-bound, so more independent blocks in flight is what buys
-  // bandwidth here. Slice boundaries are chunk aligned so every shared-memory
-  // chunk sits in exactly one AWQ group (see the scale hoisting below).
   const int chunk_count = (K + kKChunk - 1) / kKChunk;
   const int chunks_per_split = (chunk_count + gridDim.z - 1) / gridDim.z;
   const int k_begin = blockIdx.z * chunks_per_split * kKChunk;
   const int k_end = min(k_begin + chunks_per_split * kKChunk, K);
 
-  __align__(16) __shared__ bf16 sB[kOutGroups][kKChunk][kBLd];  // sB[group][k][n]
-  __shared__ bf16 sA[kWarps][16][kKChunk];      // sA[warp][m][k], row-major A tiles
-  __shared__ float sC[kWarps][16][16];           // guarded store staging, one tile per warp
+  // The qword buffers are dead in the epilogue, so the store staging tile
+  // shares their space.
+  union Scratch {
+    int32_t qw[2][kWordsPerChunk];
+    float st[kWarps][16][16];
+  };
+  __align__(16) __shared__ Scratch scratch;
+  __align__(16) __shared__ bf16 sB[kOutGroups][kKChunk][kBLd];
+  __align__(16) __shared__ bf16 sA[kMTiles][16][kKChunk];
+  __align__(16) __shared__ bf16 sScale[2][8][8];  // next chunk's scales, one row per packed column
+  __shared__ int32_t sZero[2][8];
+  int32_t(*sQw)[kWordsPerChunk] = scratch.qw;
+  float(*sC)[16][16] = scratch.st;
 
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
   const int lane = tid & 31;
+  const int g_out = warp;
+  const int c_local = tid & 7;
 
-  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[kOutGroups];
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[kMTiles];
   wmma::fragment<wmma::matrix_a, 16, 16, 16, bf16, wmma::row_major> a_frag;
   wmma::fragment<wmma::matrix_b, 16, 16, 16, bf16, wmma::row_major> b_frag;
 #pragma unroll
-  for (int g = 0; g < kOutGroups; ++g) {
+  for (int g = 0; g < kMTiles; ++g) {
     wmma::fill_fragment(acc[g], 0.0f);
   }
 
-  static_assert(kWarps == kOutGroups, "warp <-> output-group mapping assumes 4 warps");
-  const int g_out = warp;
-
-  // The host only selects this kernel when the whole kKChunk-wide chunk sits
-  // in one AWQ group, so the zero point and the eight scales of a packed
-  // column are loaded once per chunk instead of once per weight word.
-  const int c_local = tid & 7;  // fixed for this thread across the chunk
-  const int n_local = c_local * 8;
-
-  for (int k0 = k_begin; k0 < k_end; k0 += kKChunk) {
-    constexpr int kWords = kKChunk * (kOutPerBlock / 8) / (kWarps * 32);
-    const int cc = (c_base + c_local) < packed_total ? (c_base + c_local) : packed_total - 1;
-    int32_t packed[kWords];
-#pragma unroll
-    for (int r = 0; r < kWords; ++r) {
-      const int k = k0 + (tid >> 3) + r * 16;
-      const int kc = k < K ? k : K - 1;
-      packed[r] = qweight[kc * packed_total + cc];
+  // One 16B qword copy per thread per chunk: thread pairs own one k row and
+  // one 4-packed-column half.
+  const bool row_aligned = (packed_total & 3) == 0;
+  const bool col_full = c_base + 8 <= packed_total;
+  const int pw_k = tid >> 1;
+  const int pw_h = tid & 1;
+  auto prefetch_weights = [&](int buf, int k0) {
+    const int k = k0 + pw_k;
+    int32_t* dst = &sQw[buf][pw_k * 8 + pw_h * 4];
+    if (k >= K) {
+      *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+    } else if (row_aligned && col_full) {
+      cp_async16(dst, qweight + static_cast<int64_t>(k) * packed_total + c_base + pw_h * 4);
+    } else {
+      const int64_t row = static_cast<int64_t>(k) * packed_total;
+      for (int i = 0; i < 4; ++i) {
+        const int c = c_base + pw_h * 4 + i;
+        cp_async4(dst + i, &qweight[row + (c < packed_total ? c : packed_total - 1)]);
+      }
     }
+  };
 
-    // The chunk's group: uniform_group guarantees every k in [k0, k0+kKChunk) has
-    // the same group index (the split points are kChunk aligned).
-    const int g = k0 / group_size;
-    uint32_t zpacked = 0u;
-    if (qzeros != nullptr) {
-      zpacked = static_cast<uint32_t>(qzeros[g * packed_total + cc]);
-    }
-    const bf16* scale_row = scales + static_cast<int64_t>(g) * total_out + out_offset + n0;
-    bf16 scale[8];
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      scale[i] = __float2bfloat16(0.f);
-    }
-    if (n0 + n_local < N) {
-      if (n0 + n_local + 8 <= N) {
-        // Eight bf16 scales = one 16B vector load (alignment is guaranteed:
-        // total_out / out_offset / n0 are multiples of 8).
-        const uint4 v = *reinterpret_cast<const uint4*>(scale_row + n_local);
-        scale[0] = __ushort_as_bfloat16(static_cast<uint16_t>(v.x & 0xffffu));
-        scale[1] = __ushort_as_bfloat16(static_cast<uint16_t>(v.x >> 16));
-        scale[2] = __ushort_as_bfloat16(static_cast<uint16_t>(v.y & 0xffffu));
-        scale[3] = __ushort_as_bfloat16(static_cast<uint16_t>(v.y >> 16));
-        scale[4] = __ushort_as_bfloat16(static_cast<uint16_t>(v.z & 0xffffu));
-        scale[5] = __ushort_as_bfloat16(static_cast<uint16_t>(v.z >> 16));
-        scale[6] = __ushort_as_bfloat16(static_cast<uint16_t>(v.w & 0xffffu));
-        scale[7] = __ushort_as_bfloat16(static_cast<uint16_t>(v.w >> 16));
+  // Scales and zero points travel with the weight prefetch so the dequant loop
+  // never waits on them.
+  auto prefetch_meta = [&](int buf, int k0) {
+    if (tid < 8) {
+      const int g = k0 / group_size;
+      const int cc = (c_base + tid) < packed_total ? (c_base + tid) : packed_total - 1;
+      const int col = n0 + tid * 8;
+      bf16* dst = &sScale[buf][tid][0];
+      const bf16* src = scales + static_cast<int64_t>(g) * total_out + out_offset + col;
+      if (col + 8 <= N) {
+        cp_async16(dst, src);
       } else {
-#pragma unroll
         for (int i = 0; i < 8; ++i) {
-          if (n0 + n_local + i < N) {
-            scale[i] = scale_row[n_local + i];
-          }
+          dst[i] = (col + i < N) ? src[i] : __float2bfloat16(0.f);
+        }
+      }
+      if (qzeros != nullptr) {
+        cp_async4(&sZero[buf][tid], &qzeros[g * packed_total + cc]);
+      }
+    }
+  };
+
+  const int rows = kMTiles * 16;
+  const int a_vecs = rows * (kKChunk / 8);  // 16B = eight bf16 along k
+  const bool a_aligned = (K & 7) == 0;
+  auto prefetch_input = [&](int k0) {
+    for (int v = tid; v < a_vecs; v += kThreads) {
+      const int row = v >> 3;
+      const int seg = v & 7;
+      bf16* dst = &sA[row >> 4][row & 15][seg * 8];
+      const int m = m0 + row;
+      const int k = k0 + seg * 8;
+      const bf16* src = m < batch ? input + static_cast<int64_t>(m) * K + k : nullptr;
+      if (src != nullptr && k + 8 <= k_end && a_aligned) {
+        cp_async16(dst, src);
+      } else {
+        for (int i = 0; i < 8; ++i) {
+          dst[i] = (src != nullptr && k + i < k_end) ? src[i] : __float2bfloat16(0.f);
         }
       }
     }
+  };
 
+  const int num_chunks = (k_end - k_begin + kKChunk - 1) / kKChunk;
+  if (num_chunks > 0) {
+    prefetch_weights(0, k_begin);
+    prefetch_meta(0, k_begin);
+    cp_async_commit();
+  }
+
+  for (int ci = 0; ci < num_chunks; ++ci) {
+    const int k0 = k_begin + ci * kKChunk;
+    const int buf = ci & 1;
+    // Entering the iteration the only in-flight group is this chunk's weights.
+    cp_async_wait<0>();
+    __syncthreads();
+
+    // Two groups: this chunk's input tile (waited on just before the MMA
+    // barrier) first, then the next chunk's weights/scales, which stay pending
+    // until the top of the next iteration.
+    prefetch_input(k0);
+    cp_async_commit();
+    if (ci + 1 < num_chunks) {
+      prefetch_weights(buf ^ 1, k0 + kKChunk);
+      prefetch_meta(buf ^ 1, k0 + kKChunk);
+      cp_async_commit();
+    }
+
+    const bf16* scale = sScale[buf][c_local];
+    const uint32_t zpacked = static_cast<uint32_t>(sZero[buf][c_local]);
+
+    const int32_t* raw = sQw[buf];
 #pragma unroll
-    for (int r = 0; r < kWords; ++r) {
-      const int kk = (tid >> 3) + r * 16;  // k position inside the chunk
-      const uint32_t word = static_cast<uint32_t>(packed[r]);
+    for (int r = 0; r < kWordsPerChunk / kThreads; ++r) {
+      const int kk = (tid >> 3) + r * 16;
+      const uint32_t word = static_cast<uint32_t>(raw[kk * 8 + c_local]);
       float f[8];
 #pragma unroll
       for (int i = 0; i < 8; ++i) {
@@ -166,45 +240,34 @@ __global__ void awq_matmul_bf16_wmma(const bf16* __restrict__ input,
       p1.v = __floats2bfloat162_rn(f[2], f[3]);
       p2.v = __floats2bfloat162_rn(f[4], f[5]);
       p3.v = __floats2bfloat162_rn(f[6], f[7]);
-      // One 16B store per packed word (eight output rows), conflict free.
       *reinterpret_cast<uint4*>(&sB[c_local >> 1][kk][(c_local & 1) * 8]) =
           make_uint4(p0.u, p1.u, p2.u, p3.u);
     }
 
-    // Stage the input chunk for the batch tiles this step actually has; rows
-    // past the batch are zero padded.
-    {
-      const int rows = warps_m * 16;
-      for (int idx = tid; idx < rows * kKChunk; idx += blockDim.x) {
-        const int mm = idx / kKChunk;  // batch row inside the block
-        const int kk = idx % kKChunk;  // k position inside the chunk
-        const int m = m0 + mm;
-        const int k = k0 + kk;
-        sA[mm >> 4][mm & 15][kk] =
-            (m < batch && k < k_end) ? input[static_cast<int64_t>(m) * K + k]
-                                     : __float2bfloat16(0.f);
-      }
+    if (ci + 1 < num_chunks) {
+      cp_async_wait<1>();
+    } else {
+      cp_async_wait<0>();
     }
     __syncthreads();
 
-    // 每个 warp 负责一个 16 列输出 group,遍历本步所有 batch tile。
 #pragma unroll
     for (int step = 0; step < kMmaSteps; ++step) {
       wmma::load_matrix_sync(b_frag, &sB[g_out][step * 16][0], kBLd);
 #pragma unroll
-      for (int mt = 0; mt < kWarps; ++mt) {
-        if (mt >= warps_m) continue;
+      for (int mt = 0; mt < kMTiles; ++mt) {
         wmma::load_matrix_sync(a_frag, &sA[mt][0][step * 16], kKChunk);
         wmma::mma_sync(acc[mt], a_frag, b_frag, acc[mt]);
       }
     }
-    __syncthreads();
   }
+  // scratch is reused as the store staging tile: every warp must be done
+  // reading the raw qwords before the first warp overwrites them.
+  __syncthreads();
 
   const int col_base = n0 + g_out * 16;
 #pragma unroll
-  for (int mt = 0; mt < kWarps; ++mt) {
-    if (mt >= warps_m) continue;
+  for (int mt = 0; mt < kMTiles; ++mt) {
     const int row_base = m0 + mt * 16;
     __syncwarp();
     wmma::store_matrix_sync(&sC[warp][0][0], acc[mt], 16, wmma::mem_row_major);
@@ -332,14 +395,24 @@ void awq_matmul_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& qwe
     }
     const int warps_m = batch <= 16 ? 1 : (batch <= 32 ? 2 : kWarps);
     const dim3 grid(gx, gy, split);
-    if (stream) {
-      awq_matmul_bf16_wmma<<<grid, kWarps * 32, 0, stream>>>(
-          input_ptr, qweight_ptr, qzeros_ptr, scales_ptr, output_ptr, K, N, packed_total,
-          total_out, params.out_offset, group_size, batch, warps_m);
+    auto launch = [&](auto mt) {
+      using Mt = decltype(mt);
+      if (stream) {
+        awq_matmul_bf16_pipelined<Mt::value><<<grid, kThreads, 0, stream>>>(
+            input_ptr, qweight_ptr, qzeros_ptr, scales_ptr, output_ptr, K, N, packed_total,
+            total_out, params.out_offset, group_size, batch);
+      } else {
+        awq_matmul_bf16_pipelined<Mt::value><<<grid, kThreads>>>(
+            input_ptr, qweight_ptr, qzeros_ptr, scales_ptr, output_ptr, K, N, packed_total,
+            total_out, params.out_offset, group_size, batch);
+      }
+    };
+    if (warps_m == 1) {
+      launch(std::integral_constant<int, 1>{});
+    } else if (warps_m == 2) {
+      launch(std::integral_constant<int, 2>{});
     } else {
-      awq_matmul_bf16_wmma<<<grid, kWarps * 32>>>(
-          input_ptr, qweight_ptr, qzeros_ptr, scales_ptr, output_ptr, K, N, packed_total,
-          total_out, params.out_offset, group_size, batch, warps_m);
+      launch(std::integral_constant<int, 4>{});
     }
   } else {
     const int64_t total = static_cast<int64_t>(batch) * N;
