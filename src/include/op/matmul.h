@@ -34,9 +34,12 @@ class MatmulLayer : public LayerParam {
   // rows, so no second weight copy is made for the fused case.
   base::Status set_awq_weight(const tensor::Tensor& qweight, const tensor::Tensor& qzeros,
                               const tensor::Tensor& scales, int32_t group_size,
-                              bool zero_point, int32_t out_offset, int32_t out_features);
+                              bool zero_point, int32_t out_offset, int32_t out_features,
+                              bool marlin = false);
 
   bool is_awq() const { return awq_; }
+
+  bool awq_marlin() const { return awq_marlin_; }
 
   const tensor::Tensor& awq_qweight() const { return awq_qweight_; }
 
@@ -69,6 +72,7 @@ class MatmulLayer : public LayerParam {
 
   // Packed AWQ weight state (see set_awq_weight).
   bool awq_ = false;
+  bool awq_marlin_ = false;
   int32_t awq_group_size_ = 0;
   bool awq_zero_point_ = true;
   int32_t awq_out_offset_ = 0;

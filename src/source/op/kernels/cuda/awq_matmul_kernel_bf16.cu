@@ -34,6 +34,7 @@
 #include <mma.h>
 #include <type_traits>
 #include "../kernels_interface.h"
+#include "awq_marlin_kernel.cuh"
 #include "awq_matmul_kernel.cuh"
 
 namespace kernel {
@@ -331,6 +332,10 @@ void awq_matmul_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& qwe
                           const tensor::Tensor& output, const AwqMatmulParams& params,
                           const CudaConfig* config) {
   CHECK(!input.is_empty() && !qweight.is_empty() && !scales.is_empty() && !output.is_empty());
+  if (params.marlin) {
+    awq_marlin_kernel_cu(input, qweight, qzeros, scales, output, params, config);
+    return;
+  }
   CHECK(input.device_type() == base::DeviceType::kDeviceCUDA);
   CHECK(qweight.device_type() == base::DeviceType::kDeviceCUDA);
   CHECK(output.device_type() == base::DeviceType::kDeviceCUDA);

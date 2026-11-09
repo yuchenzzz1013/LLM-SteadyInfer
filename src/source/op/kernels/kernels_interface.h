@@ -28,6 +28,9 @@ struct AwqMatmulParams {
   int32_t out_offset = 0;
   // Number of output rows this GEMM produces.
   int32_t out_features = 0;
+  // qweight was repacked into the Marlin layout [K/16, N_total, 2] at load
+  // time (see awq_marlin_kernel.cuh).
+  bool marlin = false;
 };
 
 // AWQ W4A16 GEMM: out[batch, N] = input[batch, K] * dequant(qweight)^T.

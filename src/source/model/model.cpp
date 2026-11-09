@@ -12,6 +12,7 @@
 #include "base/bf16_utils.h"
 #include "model/safetensors_reader.h"
 #include "op/matmul.h"
+#include "../op/kernels/cuda/awq_marlin_kernel.cuh"
 #include "../op/kernels/cuda/mha_kernel.cuh"
 #include "../op/kernels/cuda/paged_kernels.cuh"  // paged_decode_geometry_ok (partials sizing)
 namespace model {
@@ -634,8 +635,20 @@ std::shared_ptr<op::Layer> Model::create_linear_layer(const std::string& prefix,
     tensor::Tensor scales = stage_device_tensor(
         dtype, module.groups, out_features, module.scales,
         static_cast<size_t>(module.groups) * out_features * base::DataTypeSize(dtype));
+    bool marlin = false;
+    if (cuda && dtype == base::DataType::kDataTypeBF16 &&
+        kernel::awq_marlin_supported(in_features, out_features, /*out_offset=*/0,
+                                     module.group_size)) {
+      tensor::Tensor packed = kernel::awq_marlin_pack(
+          qweight, in_features, out_features,
+          cuda_config_ ? cuda_config_->stream : nullptr);
+      if (!packed.is_empty()) {
+        qweight = packed;
+        marlin = true;
+      }
+    }
     CHECK(layer->set_awq_weight(qweight, qzeros, scales, module.group_size, module.zero_point,
-                                /*out_offset=*/0, out_features));
+                                /*out_offset=*/0, out_features, marlin));
     if (cuda) {
       cudaStream_t stream = cuda_config_ ? cuda_config_->stream : nullptr;
       if (stream) cudaStreamSynchronize(stream);
@@ -747,8 +760,18 @@ std::shared_ptr<op::MatmulLayer> Model::create_fused_linear_layer(
     }
     tensor::Tensor scales = stage_device_tensor(
         dtype, groups, total_out, host_scales.data(), host_scales.size());
+    bool marlin = false;
+    if (cuda && dtype == base::DataType::kDataTypeBF16 &&
+        kernel::awq_marlin_supported(in_features, total_out, /*out_offset=*/0, group_size)) {
+      tensor::Tensor packed =
+          kernel::awq_marlin_pack(qweight, in_features, total_out, stream);
+      if (!packed.is_empty()) {
+        qweight = packed;
+        marlin = true;
+      }
+    }
     CHECK(layer->set_awq_weight(qweight, qzeros, scales, group_size, zero_point,
-                                /*out_offset=*/0, total_out));
+                                /*out_offset=*/0, total_out, marlin));
   } else {
     // All-dense group: stack the weights row-major.
     const size_t weight_bytes = static_cast<size_t>(total_out) * in_features * elem;
@@ -834,7 +857,8 @@ void Model::repoint_layers_to_fused(
       CHECK(target != nullptr) << "A fused projection can only re-point MatmulLayers.";
       CHECK(target->set_awq_weight(fused->awq_qweight(), fused->awq_qzeros(),
                                    fused->awq_scales(), fused->awq_group_size(),
-                                   fused->awq_zero_point(), out_off, out_i));
+                                   fused->awq_zero_point(), out_off, out_i,
+                                   fused->awq_marlin()));
       repoint_bias(target, out_i, out_off);
       out_off += out_i;
     }

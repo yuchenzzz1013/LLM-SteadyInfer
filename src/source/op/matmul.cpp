@@ -141,6 +141,7 @@ base::Status MatmulLayer::forward() {
     params.zero_point = awq_zero_point_;
     params.out_offset = awq_out_offset_;
     params.out_features = dim0_;
+    params.marlin = awq_marlin_;
     kernel::get_matmul_kernel_awq(device_type_)(
         input_flat, awq_qweight_, awq_qzeros_, awq_scales_, output_flat, params,
         cuda_config_ ? cuda_config_.get() : nullptr);
@@ -230,7 +231,7 @@ base::Status MatmulLayer::set_awq_weight(const tensor::Tensor& qweight,
                                          const tensor::Tensor& qzeros,
                                          const tensor::Tensor& scales, int32_t group_size,
                                          bool zero_point, int32_t out_offset,
-                                         int32_t out_features) {
+                                         int32_t out_features, bool marlin) {
   CHECK(!qweight.is_empty()) << "AWQ qweight tensor is empty.";
   CHECK(!scales.is_empty()) << "AWQ scales tensor is empty.";
   CHECK_EQ(static_cast<int>(qweight.data_type()),
@@ -244,6 +245,7 @@ base::Status MatmulLayer::set_awq_weight(const tensor::Tensor& qweight,
   CHECK_EQ(static_cast<int>(scales.device_type()), static_cast<int>(device_type_));
 
   awq_ = true;
+  awq_marlin_ = marlin;
   awq_group_size_ = group_size;
   awq_zero_point_ = zero_point;
   awq_out_offset_ = out_offset;
