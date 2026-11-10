@@ -2,13 +2,25 @@
 //
 // The checkpoint's qweight [K, N/8] packs eight output columns per int32 in
 // AWQ's interleaved nibble order. Loading repacks each output column's 16-bit
-// k slice into one int32 pair, so a thread's B fragment for a 16x8x16 MMA is a
-// single 8-byte load and is dequantized in registers. Activations stay in
-// shared memory, staged with cp.async in a two-deep pipeline.
+// k slice into one int32 pair (a uint2 = one 16x8x16 B fragment). The packed B
+// tile is streamed into shared memory with cp.async, one k unit ahead of the
+// MMA loop, and dequantized in registers straight out of shared. Initially the
+// B fragment was loaded directly from global inside the step loop; that left
+// only two 8-byte loads in flight per warp and ran the GEMM at ~200 GB/s
+// regardless of batch size (latency-bound). Staging the tile moves the weight
+// stream onto the async copy engine and is worth ~1.8x.
 //
 // Tiling: 256 threads, block 64x128 (or 32/16 rows for small batches) x 128 k.
 // Each warp owns 16 output columns (two 8-column MMA fragments) and all of the
-// block's 16-row m tiles, so one dequantized B fragment feeds MT MMAs.
+// block's 16-row m tiles, so one dequantized B fragment feeds MT MMAs. The
+// scale/zero-point handling is specialized at compile time on whether one
+// group spans the whole k block, which keeps a runtime division and two
+// metadata loads out of the hot loop for the common group_size == 128.
+//
+// Split-K is chosen to fill the SMs: the un-split o/down/qkv grids are only
+// 40-56 blocks at decode batch sizes, well short of the 4-blocks/SM residency
+// limit, so the kernel multiplies the block count with split-K and accumulates
+// the partials in a workspace slab.
 #include <base/cuda_check.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime_api.h>
@@ -28,8 +40,7 @@ constexpr int kBlockK = kAwqMarlinBlockK;
 constexpr int kMmaSteps = kBlockK / 16;
 constexpr int kAPad = kBlockK + 8;
 constexpr int kPackThreads = 256;
-constexpr int kMaxSplit = 16;
-constexpr int kDefaultSplit = 4;
+constexpr int kMaxSplit = 8;  // past this the partial-sum traffic outweighs the fill
 
 __host__ __device__ __forceinline__ int awq_unpack(uint32_t packed, int i) {
   return static_cast<int>((packed >> (4 * (i >> 1) + 16 * (i & 1))) & 0xFu);
@@ -134,7 +145,12 @@ __global__ __launch_bounds__(kThreads, 4) void awq_marlin_gemm_kernel(const bf16
   static_assert(BLOCK_N % (kWarps * 8) == 0, "block N must split into 8-column fragments");
   constexpr int kAVecs = BLOCK_M * (kBlockK / 8);
 
-  __shared__ bf16 sA[STAGES][BLOCK_M * kAPad];
+  __align__(16) __shared__ bf16 sA[STAGES][BLOCK_M * kAPad];
+  // Packed int4 B tiles, staged asynchronously one k unit ahead. Keeping the
+  // weights in shared memory turns the GEMM's weight stream from a chain of
+  // dependent 8-byte global loads (one per MMA step, ~200 GB/s) into a deep
+  // cp.async pipeline; the inner loop then dequantizes straight out of shared.
+  __align__(16) __shared__ uint2 sB[STAGES][kMmaSteps * BLOCK_N];
 
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
@@ -187,11 +203,35 @@ __global__ __launch_bounds__(kThreads, 4) void awq_marlin_gemm_kernel(const bf16
     }
   };
 
+  // One 16B cp.async per two packed output columns. Each staged row is the
+  // block's 128-column slice of one k16 group in the Marlin layout.
+  constexpr int kBChunks = kMmaSteps * (BLOCK_N / 2);
+  auto copy_weights = [&](int stage, int k0) {
+    uint2* dstb = sB[stage];
+    const int64_t krow = static_cast<int64_t>(k0 / 16) * N_total;
+    for (int v = tid; v < kBChunks; v += kThreads) {
+      const int step = v / (BLOCK_N / 2);
+      const int c2 = (v % (BLOCK_N / 2)) * 2;
+      const int ncol = n0 + c2;
+      uint2* dst = &dstb[step * BLOCK_N + c2];
+      if (ncol + 2 <= N_total) {
+        cp_async16(dst, qweight + krow + static_cast<int64_t>(step) * N_total + ncol);
+      } else {
+        for (int j = 0; j < 2; ++j) {
+          const int c = ncol + j;
+          dst[j] = qweight[krow + static_cast<int64_t>(step) * N_total +
+                           (c < N_total ? c : N_total - 1)];
+        }
+      }
+    }
+  };
+
   if (k_units > 0) {
 #pragma unroll
     for (int s = 0; s < STAGES - 1; ++s) {
       if (s < k_units) {
         copy_input(s, k_begin + s * kBlockK);
+        copy_weights(s, k_begin + s * kBlockK);
       }
       cp_commit();
     }
@@ -205,10 +245,12 @@ __global__ __launch_bounds__(kThreads, 4) void awq_marlin_gemm_kernel(const bf16
       const int pf = i + STAGES - 1;
       if (pf < k_units) {
         copy_input(pf % STAGES, k_begin + pf * kBlockK);
+        copy_weights(pf % STAGES, k_begin + pf * kBlockK);
       }
       cp_commit();
 
       const bf16* sAb = sA[i % STAGES];
+      const uint2* sBb = sB[i % STAGES];
       const int k0 = k_begin + i * kBlockK;
       // A group that spans the whole k block lets the scale/zero loads move
       // out of the unrolled MMA steps.
@@ -228,40 +270,55 @@ __global__ __launch_bounds__(kThreads, 4) void awq_marlin_gemm_kernel(const bf16
                          : 8;
         }
       }
+      // Specialize on whether one scale/zero group spans the whole k block.
+      // The generic branch needs a runtime division and a scale/zero load per
+      // MMA step; folding `one_group` into a compile-time flag keeps all of
+      // that out of the common (group_size == kBlockK) hot loop instead of
+      // merely predicating it off.
+      auto run_steps = [&](auto one_group_tag) {
+        constexpr bool ONE_GROUP = decltype(one_group_tag)::value;
+        const int gb = k0 / group_size;
 #pragma unroll
-      for (int step = 0; step < kMmaSteps; ++step) {
-        const int kk = k0 + step * 16;
-        const int g = one_group ? (k0 / group_size) : (kk / group_size);
-        const int64_t brow = static_cast<int64_t>(kk >> 4) * N_total;
-        uint32_t bf[kFrags][2];
-#pragma unroll
-        for (int f = 0; f < kFrags; ++f) {
-          const uint2 w = qweight[brow + ns[f]];
-          const float sf =
-              one_group ? hscale[f]
-                        : __bfloat162float(scales[static_cast<int64_t>(g) * N_total + ns[f]]);
-          const int zf =
-              one_group ? hzero[f]
-                        : (zero_point ? awq_unpack(
-                                            static_cast<uint32_t>(
-                                                qzeros[static_cast<int64_t>(g) * packed_total +
-                                                       (ns[f] >> 3)]),
-                                            ns[f] & 7)
-                                      : 8);
-          bf[f][0] = dequant_pair(w.x, sh, sf, -zf * sf);
-          bf[f][1] = dequant_pair(w.y, sh, sf, -zf * sf);
-        }
-#pragma unroll
-        for (int mt = 0; mt < MT; ++mt) {
-          uint32_t a0, a1, a2, a3;
-          ldmatrix_x4(smem_addr(&sAb[(mt * 16 + a_row_off) * kAPad + step * 16 + a_col_off]), a0,
-                      a1, a2, a3);
+        for (int step = 0; step < kMmaSteps; ++step) {
+          const int kk = k0 + step * 16;
+          const int g = ONE_GROUP ? gb : (kk / group_size);
+          uint32_t bf[kFrags][2];
 #pragma unroll
           for (int f = 0; f < kFrags; ++f) {
-            mma_m16n8k16(acc[mt][f][0], acc[mt][f][1], acc[mt][f][2], acc[mt][f][3], a0, a1, a2,
-                         a3, bf[f][0], bf[f][1]);
+            const uint2 w = sBb[step * BLOCK_N + warp * kColsPerWarp + f * 8 + group];
+            const float sf =
+                ONE_GROUP
+                    ? hscale[f]
+                    : __bfloat162float(scales[static_cast<int64_t>(g) * N_total + ns[f]]);
+            const int zf =
+                ONE_GROUP
+                    ? hzero[f]
+                    : (zero_point ? awq_unpack(static_cast<uint32_t>(
+                                                    qzeros[static_cast<int64_t>(g) *
+                                                               packed_total +
+                                                           (ns[f] >> 3)]),
+                                               ns[f] & 7)
+                                  : 8);
+            bf[f][0] = dequant_pair(w.x, sh, sf, -zf * sf);
+            bf[f][1] = dequant_pair(w.y, sh, sf, -zf * sf);
+          }
+#pragma unroll
+          for (int mt = 0; mt < MT; ++mt) {
+            uint32_t a0, a1, a2, a3;
+            ldmatrix_x4(smem_addr(&sAb[(mt * 16 + a_row_off) * kAPad + step * 16 + a_col_off]),
+                        a0, a1, a2, a3);
+#pragma unroll
+            for (int f = 0; f < kFrags; ++f) {
+              mma_m16n8k16(acc[mt][f][0], acc[mt][f][1], acc[mt][f][2], acc[mt][f][3], a0, a1,
+                           a2, a3, bf[f][0], bf[f][1]);
+            }
           }
         }
+      };
+      if (one_group) {
+        run_steps(std::integral_constant<bool, true>{});
+      } else {
+        run_steps(std::integral_constant<bool, false>{});
       }
     }
   }
@@ -408,9 +465,15 @@ void awq_marlin_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& qwe
     }
     const int gx = (N + BN - 1) / BN;
     const int base_gy = (M + BM - 1) / BM;
-    int split = std::min(kDefaultSplit, std::min(k_units / 2, kMaxSplit));
+    // Fill the GPU with blocks: the un-split grid is often only 40-56 blocks
+    // for the o/down/qkv projections at decode batch sizes, far below the
+    // 4-blocks/SM x 108-SM residency. Split-K multiplicatively raises the block
+    // count; past the fill point it only adds partial-sum traffic, so cap it.
+    const int base_blocks = gx * base_gy;
+    int split = (8 * device_sm_count() + base_blocks - 1) / base_blocks;
+    split = std::min(split, kMaxSplit);
+    split = std::min(split, std::max(1, k_units));
     split = std::max(1, split);
-    (void)gx;
     const int64_t plane = static_cast<int64_t>(M) * N;
     if (partial == nullptr || plane > kPartialElems) {
       split = 1;
@@ -420,7 +483,11 @@ void awq_marlin_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& qwe
     split = std::max(1, split);
     const int k_units_per_split = (k_units + split - 1) / split;
     const dim3 grid(gx, base_gy, split);
-    launch_marlin<BM, (BM == 64 ? 2 : 3), BN>(grid, stream, input_ptr, qweight_ptr, qzeros_ptr,
+    // Shared memory budget: the staged B tile adds 8 KB per stage for
+    // BLOCK_N=128. 16-row blocks keep three stages (37 KB); 32-row blocks drop
+    // to two (34 KB) so four blocks still fit per SM; 64-row blocks use the
+    // narrower 64-column tile (43 KB) to stay under the 48 KB static limit.
+    launch_marlin<BM, (BM == 16 ? 3 : 2), BN>(grid, stream, input_ptr, qweight_ptr, qzeros_ptr,
                                               scales_ptr, output_ptr, partial, M, K, N_total, N,
                                               out_offset, packed_total, group_size, zero_point,
                                               k_units_per_split);
@@ -436,7 +503,7 @@ void awq_marlin_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& qwe
   } else if (M <= 32) {
     launch(std::integral_constant<int, 32>{}, std::integral_constant<int, 128>{});
   } else {
-    launch(std::integral_constant<int, 64>{}, std::integral_constant<int, 128>{});
+    launch(std::integral_constant<int, 64>{}, std::integral_constant<int, 64>{});
   }
   CUDA_KERNEL_CHECK();
 }

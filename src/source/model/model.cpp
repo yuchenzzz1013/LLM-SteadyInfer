@@ -16,6 +16,17 @@
 #include "../op/kernels/cuda/mha_kernel.cuh"
 #include "../op/kernels/cuda/paged_kernels.cuh"  // paged_decode_geometry_ok (partials sizing)
 namespace model {
+namespace {
+// Escape hatch for A/B testing the Marlin weight layout without rebuilding.
+bool awq_marlin_enabled() {
+  static const bool enabled = []() {
+    const char* v = std::getenv("LLAMA_AWQ_MARLIN");
+    return !(v && std::string(v) == "0");
+  }();
+  return enabled;
+}
+}  // namespace
+
 Model::Model(base::TokenizerType tokenizer_type, base::ModelType model_type, std::string token_path,
              std::string model_path, bool is_quant_model)
     : is_quant_model_(is_quant_model),
@@ -636,7 +647,7 @@ std::shared_ptr<op::Layer> Model::create_linear_layer(const std::string& prefix,
         dtype, module.groups, out_features, module.scales,
         static_cast<size_t>(module.groups) * out_features * base::DataTypeSize(dtype));
     bool marlin = false;
-    if (cuda && dtype == base::DataType::kDataTypeBF16 &&
+    if (cuda && dtype == base::DataType::kDataTypeBF16 && awq_marlin_enabled() &&
         kernel::awq_marlin_supported(in_features, out_features, /*out_offset=*/0,
                                      module.group_size)) {
       tensor::Tensor packed = kernel::awq_marlin_pack(
@@ -761,7 +772,7 @@ std::shared_ptr<op::MatmulLayer> Model::create_fused_linear_layer(
     tensor::Tensor scales = stage_device_tensor(
         dtype, groups, total_out, host_scales.data(), host_scales.size());
     bool marlin = false;
-    if (cuda && dtype == base::DataType::kDataTypeBF16 &&
+    if (cuda && dtype == base::DataType::kDataTypeBF16 && awq_marlin_enabled() &&
         kernel::awq_marlin_supported(in_features, total_out, /*out_offset=*/0, group_size)) {
       tensor::Tensor packed =
           kernel::awq_marlin_pack(qweight, in_features, total_out, stream);
