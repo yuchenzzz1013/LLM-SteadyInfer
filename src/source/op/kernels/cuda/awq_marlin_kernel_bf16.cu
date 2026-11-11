@@ -131,8 +131,8 @@ __global__ void awq_marlin_pack_kernel(const int32_t* __restrict__ qweight,
   packed[n] = make_uint2(lo, hi);
 }
 
-template <int BLOCK_M, int STAGES, int BLOCK_N>
-__global__ __launch_bounds__(kThreads, 4) void awq_marlin_gemm_kernel(const bf16* __restrict__ input,
+template <int BLOCK_M, int STAGES, int BLOCK_N, int MIN_BLOCKS>
+__global__ __launch_bounds__(kThreads, MIN_BLOCKS) void awq_marlin_gemm_kernel(const bf16* __restrict__ input,
                                        const uint2* __restrict__ qweight,
                                        const int32_t* __restrict__ qzeros,
                                        const bf16* __restrict__ scales, bf16* __restrict__ output,
@@ -145,12 +145,12 @@ __global__ __launch_bounds__(kThreads, 4) void awq_marlin_gemm_kernel(const bf16
   static_assert(BLOCK_N % (kWarps * 8) == 0, "block N must split into 8-column fragments");
   constexpr int kAVecs = BLOCK_M * (kBlockK / 8);
 
-  __align__(16) __shared__ bf16 sA[STAGES][BLOCK_M * kAPad];
-  // Packed int4 B tiles, staged asynchronously one k unit ahead. Keeping the
-  // weights in shared memory turns the GEMM's weight stream from a chain of
-  // dependent 8-byte global loads (one per MMA step, ~200 GB/s) into a deep
-  // cp.async pipeline; the inner loop then dequantizes straight out of shared.
-  __align__(16) __shared__ uint2 sB[STAGES][kMmaSteps * BLOCK_N];
+  // BLOCK_N=128 needs >48 KB, so staged buffers live in dynamic shared memory.
+  extern __shared__ __align__(16) unsigned char smem_raw[];
+  constexpr int kASz = BLOCK_M * kAPad;
+  constexpr int kBSz = kMmaSteps * BLOCK_N;
+  bf16* const sA = reinterpret_cast<bf16*>(smem_raw);
+  uint2* const sB = reinterpret_cast<uint2*>(smem_raw + sizeof(bf16) * STAGES * kASz);
 
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
@@ -189,7 +189,7 @@ __global__ __launch_bounds__(kThreads, 4) void awq_marlin_gemm_kernel(const bf16
   const int k_units = min(k_units_per_split, K / kBlockK - z * k_units_per_split);
 
   auto copy_input = [&](int stage, int k0) {
-    bf16* dst = sA[stage];
+    bf16* dst = sA + stage * kASz;
     for (int idx = tid; idx < kAVecs; idx += kThreads) {
       const int row = idx >> 4;
       const int seg = idx & 15;
@@ -207,7 +207,7 @@ __global__ __launch_bounds__(kThreads, 4) void awq_marlin_gemm_kernel(const bf16
   // block's 128-column slice of one k16 group in the Marlin layout.
   constexpr int kBChunks = kMmaSteps * (BLOCK_N / 2);
   auto copy_weights = [&](int stage, int k0) {
-    uint2* dstb = sB[stage];
+    uint2* dstb = sB + stage * kBSz;
     const int64_t krow = static_cast<int64_t>(k0 / 16) * N_total;
     for (int v = tid; v < kBChunks; v += kThreads) {
       const int step = v / (BLOCK_N / 2);
@@ -249,8 +249,8 @@ __global__ __launch_bounds__(kThreads, 4) void awq_marlin_gemm_kernel(const bf16
       }
       cp_commit();
 
-      const bf16* sAb = sA[i % STAGES];
-      const uint2* sBb = sB[i % STAGES];
+      const bf16* sAb = sA + (i % STAGES) * kASz;
+      const uint2* sBb = sB + (i % STAGES) * kBSz;
       const int k0 = k_begin + i * kBlockK;
       // A group that spans the whole k block lets the scale/zero loads move
       // out of the unrolled MMA steps.
@@ -355,9 +355,19 @@ __global__ __launch_bounds__(kThreads, 4) void awq_marlin_gemm_kernel(const bf16
   }
 }
 
-template <int BM, int STAGES, int BN, typename... A>
+template <int BM, int STAGES, int BN, int MIN_BLOCKS, typename... A>
 void launch_marlin(const dim3& grid, cudaStream_t stream, A... args) {
-  awq_marlin_gemm_kernel<BM, STAGES, BN><<<grid, kThreads, 0, stream>>>(args...);
+  constexpr int kSmem = sizeof(bf16) * STAGES * (BM * kAPad) +
+                        sizeof(uint2) * STAGES * (kMmaSteps * BN);
+  auto fn = awq_marlin_gemm_kernel<BM, STAGES, BN, MIN_BLOCKS>;
+  if (kSmem > 48 * 1024) {
+    static const bool configured = [&] {
+      cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
+      return true;
+    }();
+    (void)configured;
+  }
+  fn<<<grid, kThreads, kSmem, stream>>>(args...);
 }
 
 __global__ void awq_marlin_reduce_kernel(const bf16* __restrict__ partial,
@@ -483,14 +493,10 @@ void awq_marlin_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& qwe
     split = std::max(1, split);
     const int k_units_per_split = (k_units + split - 1) / split;
     const dim3 grid(gx, base_gy, split);
-    // Shared memory budget: the staged B tile adds 8 KB per stage for
-    // BLOCK_N=128. 16-row blocks keep three stages (37 KB); 32-row blocks drop
-    // to two (34 KB) so four blocks still fit per SM; 64-row blocks use the
-    // narrower 64-column tile (43 KB) to stay under the 48 KB static limit.
-    launch_marlin<BM, (BM == 16 ? 3 : 2), BN>(grid, stream, input_ptr, qweight_ptr, qzeros_ptr,
-                                              scales_ptr, output_ptr, partial, M, K, N_total, N,
-                                              out_offset, packed_total, group_size, zero_point,
-                                              k_units_per_split);
+    constexpr int kMinBlocks = BM >= 64 ? 2 : 4;
+    launch_marlin<BM, (BM == 16 ? 3 : 2), BN, kMinBlocks>(
+        grid, stream, input_ptr, qweight_ptr, qzeros_ptr, scales_ptr, output_ptr, partial, M, K,
+        N_total, N, out_offset, packed_total, group_size, zero_point, k_units_per_split);
     if (split > 1) {
       const int total = M * N;
       const int blocks = std::min((total + 255) / 256, 65535);
@@ -503,7 +509,7 @@ void awq_marlin_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& qwe
   } else if (M <= 32) {
     launch(std::integral_constant<int, 32>{}, std::integral_constant<int, 128>{});
   } else {
-    launch(std::integral_constant<int, 64>{}, std::integral_constant<int, 64>{});
+    launch(std::integral_constant<int, 64>{}, std::integral_constant<int, 128>{});
   }
   CUDA_KERNEL_CHECK();
 }
