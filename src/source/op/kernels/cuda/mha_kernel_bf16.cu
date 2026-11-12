@@ -1979,6 +1979,7 @@ static void launch_paged_attn_split(int32_t heads_per_warp, int32_t chunks, bool
       case 1: LAUNCH_PAGED_SPLIT(1, 1, F); break;                                               \
       case 2: LAUNCH_PAGED_SPLIT(2, 1, F); break;                                               \
       case 4: LAUNCH_PAGED_SPLIT(4, 1, F); break;                                               \
+      case 5: LAUNCH_PAGED_SPLIT(5, 1, F); break;                                               \
       default: LAUNCH_PAGED_SPLIT(8, 1, F); break;                                              \
     }                                                                                           \
   } else {                                                                                      \
@@ -2027,21 +2028,10 @@ void paged_attention_cu_batch(int32_t head_num, int32_t layer_idx, int32_t num_b
       << "block table (table_stride > 0) and a power-of-two block_size >= 4; got head_size="
       << head_size << " table_stride=" << table_stride << " block_size=" << block_size;
 
-  // One warp per (row, kv head, split, head sub-group), each walking its split
-  // for up to `heads_per_warp` q heads of the group — see
-  // paged_attn_split_kernel_bf16. num_splits already folds in the GQA group
-  // size, so the warp count comes out at batch * head_num *
-  // flash_decoding_num_splits(capacity): the parallelism of the per-q-head
-  // split it replaces, with each K/V row loaded once per warp. Splitting is
-  // also what fills the device at batch 1 (32 warps over 108 SMs without it)
-  // and what keeps a mixed batch from costing max(seq) instead of mean(seq).
-  const int32_t num_splits = paged_decode_num_splits(max_seq_len, head_num, kv_head_num);
   const int32_t chunks = (head_size + 127) / 128;
   const int32_t head_group = (head_num + kv_head_num - 1) / kv_head_num;
   // A warp holds at most 8 q heads — 4 once the row needs two 128-dim chunks,
-  // which doubles the per-head register footprint. Wider head groups (an
-  // extreme GQA ratio) are covered by several warps over the same split, so
-  // the K/V row they share is still loaded once per warp.
+  // which doubles the per-head register footprint.
   const int32_t warp_cap = chunks == 1 ? 8 : 4;
   // Every lane is live only when head_size spans the whole CHUNKS*128 tile;
   // otherwise the kernel must predicate the tail lanes.
@@ -2050,7 +2040,32 @@ void paged_attention_cu_batch(int32_t head_num, int32_t layer_idx, int32_t num_b
   while (heads_per_warp * 2 <= head_group && heads_per_warp * 2 <= warp_cap) {
     heads_per_warp *= 2;
   }
+  // LLAMA_ATTN_LEGACY=1 restores the pre-P1 split/head grouping for A/B.
+  static const bool legacy_attn = [] {
+    const char* e = std::getenv("LLAMA_ATTN_LEGACY");
+    return e && e[0] == '1';
+  }();
+  if (!legacy_attn && chunks == 1 && head_group == 5) {
+    heads_per_warp = 5;  // Qwen3-14B GQA ratio: one warp per kv head, K/V read once
+  }
   const int32_t head_groups = (head_group + heads_per_warp - 1) / heads_per_warp;
+
+  // Smallest split count that fills the SM warp slots; batch-only, so graphs stay valid.
+  const int32_t max_splits = paged_decode_num_splits(max_seq_len, head_num, kv_head_num);
+  static const int32_t sm_count = [] {
+    int dev = 0, n = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev);
+    return n > 0 ? n : 108;
+  }();
+  const int32_t target_warps = sm_count * (heads_per_warp >= 8 ? 16 : 32);
+  const int64_t warps_per_split = static_cast<int64_t>(batch) * kv_head_num * head_groups;
+  const int32_t num_splits =
+      legacy_attn ? max_splits
+                  : static_cast<int32_t>(std::max<int64_t>(
+                        1, std::min<int64_t>(max_splits,
+                                             (target_warps + warps_per_split - 1) /
+                                                 warps_per_split)));
 
   // Partials are fp32 rows of (head_size + 4) floats: a bf16 (o | m | l) row
   // would round each split's running acc before the combine. Callers size
