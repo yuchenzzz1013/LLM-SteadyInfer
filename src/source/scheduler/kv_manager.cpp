@@ -2,6 +2,7 @@
 
 #include <cctype>
 #include <cstdlib>
+#include <cuda_runtime_api.h>
 #include <string>
 
 namespace scheduler {
@@ -106,20 +107,11 @@ KVManager::KVManager(int num_layers, int max_batch, int max_seq_len, int kv_dim,
         << "set by the Scheduler block_size argument or LLAMA_BLOCK_SIZE";
     block_size_ = block_size;
     max_blocks_per_seq_ = (max_seq_len_ + block_size_ - 1) / block_size_;
-    num_blocks_ = max_batch_ * max_blocks_per_seq_;
-    block_allocator_ = std::make_unique<BlockAllocator>(num_blocks_, max_batch_,
-                                                        max_blocks_per_seq_, block_size_);
   } else {
     // Continuous layout: [num_layers, max_batch, kv_dim, max_seq_len].
     block_size_ = max_seq_len_;
     max_blocks_per_seq_ = 1;
     slot_busy_.assign(max_batch_, false);
-#ifdef USE_PAGED_ATTENTION
-    // CPU device (or paging disabled): degenerate slot-mode pool so the
-    // scheduler's block-table code path stays uniform — one block == one
-    // whole slot, block table width 1.
-    block_allocator_ = std::make_unique<BlockAllocator>(max_batch_, max_batch_, 1, max_seq_len_);
-#endif
   }
 
   // Resolve the S4 grouping. The defaults are chosen so that a default
@@ -154,6 +146,53 @@ KVManager::KVManager(int num_layers, int max_batch, int max_seq_len, int kv_dim,
     CHECK(kv_dim_ % 2 == 0) << "4-bit K/V need an even kv_dim, got " << kv_dim_;
     groups_per_block_ = block_size_ / group_size_;
     channel_groups_ = kv_dim_ / channel_group_;
+  }
+
+  if (paged_) {
+    // Legacy reservation: one full-length row per sequence. Cap it by the
+    // memory left after the model load (LLAMA_KV_POOL=min keeps the legacy
+    // size): blocks are allocated lazily and the allocator preempts on
+    // exhaustion, so the pool need not hold max_batch x max_seq_len up front.
+    num_blocks_ = max_batch_ * max_blocks_per_seq_;
+    const char* pool_env = std::getenv("LLAMA_KV_POOL");
+    if (!(pool_env != nullptr && std::string(pool_env) == "min")) {
+      base::CUDADeviceAllocatorFactory::get_instance()->free_idle();
+      size_t free_b = 0, total_b = 0;
+      if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+        const int64_t row_bytes = quantized() ? kv_dim_ / 2 : kv_dim_ * 2;
+        int64_t per_block = 2 * static_cast<int64_t>(num_layers_) * block_size_ * row_bytes;
+        int64_t fixed_bytes = 0;
+        if (quantized()) {
+          per_block += 2 * static_cast<int64_t>(num_layers_) * groups_per_block_ *
+                       channel_groups_ * 4;
+          per_block += 2 * static_cast<int64_t>(num_layers_) * kv_head_num_ * block_size_ * 4;
+          fixed_bytes =
+              static_cast<int64_t>(num_layers_) * max_batch_ * group_size_ * kv_dim_ * 2;
+        }
+        const int64_t reserve = std::max<int64_t>(total_b / 8, int64_t{2} << 30);
+        const int64_t avail = static_cast<int64_t>(free_b) - reserve - fixed_bytes;
+        const int64_t fit = avail > 0 ? avail / per_block : 0;
+        CHECK_GE(fit, max_batch_)
+            << "KV pool cannot hold one block per sequence: free=" << (free_b >> 20)
+            << "MB reserve=" << (reserve >> 20) << "MB per_block=" << per_block
+            << "B; lower max_batch / max_seq_len";
+        if (fit < num_blocks_) {
+          LOG(WARNING) << "[KV] pool capped by free memory: " << num_blocks_ << " -> " << fit
+                       << " blocks (" << (avail >> 20)
+                       << "MB); sequences share the pool and may be preempted";
+          num_blocks_ = static_cast<int>(fit);
+        }
+      }
+    }
+    block_allocator_ = std::make_unique<BlockAllocator>(num_blocks_, max_batch_,
+                                                        max_blocks_per_seq_, block_size_);
+  } else {
+#ifdef USE_PAGED_ATTENTION
+    // CPU device (or paging disabled): degenerate slot-mode pool so the
+    // scheduler's block-table code path stays uniform — one block == one
+    // whole slot, block table width 1.
+    block_allocator_ = std::make_unique<BlockAllocator>(max_batch_, max_batch_, 1, max_seq_len_);
+#endif
   }
 
   // All CUDA kernels (scatter / attention / decode) address the cache as
