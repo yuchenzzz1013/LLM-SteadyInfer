@@ -248,6 +248,30 @@ target），四项指标来自同一批 token 位置：
 缓存大小约为 `块数 × 511 × vocab × 2` 字节（全量约 91 GB），用
 `--max-chunks` 可缩小规模。
 
+### KV Quantization Eval
+在同一模型、同一批 WikiText-2 块上对比 **BF16 KV cache** 与 **S4 KV cache**
+（K int4 分组 + BF16 残差窗口，V int4），指标与权重量化 eval 相同
+（Mean KLD / 99.9% KLD / Same Top-1 / PPL Change），另附按位置分桶的 KLD
+和 KV 池压缩比。两个 KV 池在进程内 lockstep 推进，不需要参考 logits 磁盘缓存。
+
+```bash
+# 全量（Qwen3-14B，BF16 KV vs S4）
+./build/benchmark/kv_quantization_eval Qwen3-14B wikitext-2-raw-v1-test.raw \
+    --batch 16 --csv results/kv-quantization-eval-wikitext2.csv
+
+# 快速冒烟
+./build/benchmark/kv_quantization_eval Qwen3-14B wikitext-2-raw-v1-test.raw \
+    --max-chunks 8 --batch 8
+
+# 自检：两个 bf16 池，应得到 KLD=0 / Same Top-1=100%
+./build/benchmark/kv_quantization_eval Qwen3-14B wikitext-2-raw-v1-test.raw \
+    --kv-quant 0 --max-chunks 1 --batch 2
+
+# 调整 S4 分组（默认 group_size=block_size, channel_group=8）
+./build/benchmark/kv_quantization_eval Qwen3-14B wikitext-2-raw-v1-test.raw \
+    --group-size 16 --channel-group 8
+```
+
 ---
 
 ## Demo
@@ -273,7 +297,9 @@ LLM-SteadyInfer/
 │   ├── offline_batch_benchmark.cpp  # 离线吞吐测试
 │   ├── online_serving_benchmark.cpp # 在线 Serving 测试
 │   ├── prefix_caching_benchmark.cpp # Prefix Caching A/B 收益测试
-│   ├── ppl_benchmark.cpp            # KV 量化 PPL 门禁
+│   ├── kv-quantization-eval/        # KV 量化保真度评估 (BF16 KV vs S4)
+│   │   ├── kv_quantization_eval.cpp
+│   │   └── kv_eval_kernel.cu
 │   ├── weight-quantization-eval/    # 权重量化保真度评估 (WikiText-2 KLD/PPL)
 │   │   ├── weight_quantization_eval.cpp
 │   │   └── wq_eval_kernel.cu

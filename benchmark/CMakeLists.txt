@@ -189,21 +189,24 @@ if (VERIFY_TOKENS)
     set_target_properties(verify_tokens PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 endif()
 
-# KV 量化 PPL 门禁 (bf16 基线 vs int8 臂,见 ppl_benchmark.cpp 头注释)
-# 直接驱动 model->decode_step 并把 NLL 归约放在设备端,所以需要一个 .cu
-# 编译单元 —— 即仅在根项目子目录模式(开启了 CUDA 语言)下构建。
-option(PPL_BENCHMARK "Build the KV-quantization PPL gate" ON)
-if (PPL_BENCHMARK AND NOT BENCH_STANDALONE AND CMAKE_CUDA_COMPILER)
-    message(STATUS "Building ppl_benchmark (KV-quant PPL gate)")
-    add_executable(ppl_benchmark ppl_benchmark.cpp ppl_nll_kernel.cu)
-    target_link_libraries(ppl_benchmark PRIVATE bench_deps)
-    set_target_properties(ppl_benchmark PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+# KV 量化保真度评估 (WikiText-2;同一模型、两个 KV 池 lockstep:
+# BF16 KV vs S4)。需要设备端指标归约 .cu。
+option(KV_QUANTIZATION_EVAL
+       "Build the KV-quantization fidelity eval (WikiText-2 KLD/PPL)" ON)
+if (KV_QUANTIZATION_EVAL AND NOT BENCH_STANDALONE AND CMAKE_CUDA_COMPILER)
+    message(STATUS "Building kv_quantization_eval (BF16 KV vs S4 fidelity)")
+    add_executable(kv_quantization_eval
+        kv-quantization-eval/kv_quantization_eval.cpp
+        kv-quantization-eval/kv_eval_kernel.cu)
+    target_link_libraries(kv_quantization_eval PRIVATE bench_deps)
+    set_target_properties(kv_quantization_eval PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON)
 endif()
 
 # 权重量化保真度评估 (eval.md: WikiText-2 上的 Mean KLD / 99.9% KLD /
 # Same Top-1 / PPL Change,参考 BF16 模型 vs AWQ W4A16 模型)。
-# 需要一个 .cu 编译单元(设备端 KLD 归约),因此与 ppl_benchmark 一样只在
-# 根项目子目录模式(已开启 CUDA 语言)下构建。
+# 需要一个 .cu 编译单元(设备端 KLD 归约),因此只在根项目子目录模式
+# (已开启 CUDA 语言)下构建。
 option(WEIGHT_QUANTIZATION_EVAL
        "Build the weight-quantization fidelity eval (WikiText-2 KLD/PPL)" ON)
 if (WEIGHT_QUANTIZATION_EVAL AND NOT BENCH_STANDALONE AND CMAKE_CUDA_COMPILER)
@@ -220,8 +223,8 @@ endif()
 if(BENCH_STANDALONE)
   list(REMOVE_DUPLICATES RPATH_DIRS)
   foreach(tgt offline_batch_benchmark online_serving_benchmark
-              prefix_caching_benchmark verify_tokens ppl_benchmark
-              weight_quantization_eval)
+              prefix_caching_benchmark verify_tokens
+              kv_quantization_eval weight_quantization_eval)
     if(TARGET ${tgt})
       set_target_properties(${tgt} PROPERTIES
         BUILD_RPATH "${RPATH_DIRS}"
