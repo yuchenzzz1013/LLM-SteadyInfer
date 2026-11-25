@@ -45,6 +45,9 @@ LLM-SteadyInfer 是一个基于 **C++ / CUDA C++** 实现的轻量级大语言�
   - 支持 GQA（Grouped Query Attention）
   - 采用 Flash Decoding 风格 Split-KV 并行与 Online Softmax
   - 支持 Partial Attention Merge 优化长序列 Decode
+  - 实测 split-KV 加速（4K 上下文 attention kernel）：batch 1/8/32/128 为
+    29.1×/12.2×/3.5×/1.35×；端到端单请求 TPOT 提升 3.3–5.1×。详见
+    Benchmark 的「Flash Decoding 加速实测」
 
 - **KV 量化（S4：K int4 分组 + BF16 残差窗口, V int4 非对称）**
   - 只有一个量化形态，开关是 `LLAMA_KV_QUANT=0`（off）或 `1`（S4）。
@@ -211,6 +214,49 @@ make -j$(nproc)
 * TTFT / TPOT / ITL / E2E
 * Output Token Throughput / Total Token Throughput / Completed RPS
 * `skipped_prefill_ratio`
+
+### Flash Decoding（Split-KV）
+
+在 A100-PCIE-40GB、Qwen3-14B 几何（40 q heads / 8 kv heads / head_dim 128）
+上对 decode 路径的 split-KV 做了 A/B。对照组把 split 固定为 1：同一个 kernel，
+一个 warp 串行扫完整条 KV，等价于关闭 Flash Decoding。A/B 开关：
+
+**Attention kernel 微基准**（单层单步 decode；固定 batch / 序列长度、随机
+K/V、工作集大于 L2，计时前 burn-in 锁频；乘以层数即整模型一步 decode 的
+attention 时间）。4K 上下文：
+
+| batch | 自适应 splits | `splits=1` (ms) | 自适应 (ms) | 加速比 |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 40 | 1.961 | 0.067 | **29.1×** |
+| 2 | 40 | 1.968 | 0.073 | 27.1× |
+| 4 | 40 | 2.009 | 0.094 | 21.3× |
+| 8 | 40 | 2.016 | 0.165 | 12.2× |
+| 16 | 27 | 2.030 | 0.274 | 7.4× |
+| 32 | 14 | 2.041 | 0.587 | 3.5× |
+| 64 | 7 | 2.063 | 1.138 | 1.8× |
+| 128 | 4 | 2.687 | 1.989 | 1.35× |
+| 256 | 2 | 4.713 | 3.904 | 1.21× |
+
+16K 上下文下 B=1/2/4/8/16/32 的加速比为
+35.6×/34.8×/25.4×/14.5×/8.1×/3.7×。短上下文同样没有回退：
+128 token 时 B=1/8/32/128 为 2.94×/2.99×/2.17×/1.05×，
+512 token 时为 9.1×/7.3×/2.5×/1.24×。
+
+**端到端**（Qwen3-14B-AWQ，`offline_batch_benchmark`，长 prompt 数据集）：
+
+| 场景 | 指标 | 自适应 | `splits=1` | 加速比 |
+| --- | --- | ---: | ---: | ---: |
+| ~1.9K prompt, gen 256, BF16 KV | TPOT (ms) | 16.28 | 54.22 | **3.33×** |
+| | output_tps | 51.34 | 17.41 | 2.95× |
+| | E2E (s) | 4.99 | 14.70 | 2.95× |
+| ~3.8K prompt, gen 64, BF16 KV | TPOT (ms) | 17.17 | 88.22 | **5.14×** |
+| | E2E (s) | 3.11 | 7.66 | 2.46× |
+| ~1.9K prompt, gen 256, S4 KV | TPOT (ms) | 16.67 | 60.80 | **3.65×** |
+| | E2E (s) | 5.12 | 16.41 | 3.21× |
+| 32 并发 ~2K prompt, gen 64 | TPOT (ms) | 172.3 | 208.4 | 1.21× |
+| | output_tps | 69.34 | 56.80 | 1.22× |
+| | wall (s) | 29.54 | 36.06 | 1.22× |
+```
 
 ### Weight Quantization Eval（eval.md）
 在 WikiText-2（`wikitext-2-raw-v1`, split=`test`）上评估未量化参考模型与量化
